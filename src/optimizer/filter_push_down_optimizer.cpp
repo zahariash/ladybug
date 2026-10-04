@@ -13,6 +13,7 @@
 #include "catalog/catalog_entry/index_catalog_entry.h"
 #include "catalog/catalog_entry/table_catalog_entry.h"
 #include "common/string_utils.h"
+#include "function/list/vector_list_functions.h"
 #include "main/attached_database.h"
 #include "main/client_context.h"
 #include "main/database_manager.h"
@@ -209,13 +210,42 @@ static bool isNodeProperty(const Expression& expression, const Expression& nodeI
     return property.getVariableName() == nodeID.constCast<PropertyExpression>().getVariableName();
 }
 
-static std::optional<std::pair<std::shared_ptr<Expression>, std::string>>
-popSecondaryARTEqualityComparison(PredicateSet& predicateSet, const Expression& nodeID,
-    table_id_t tableID, main::ClientContext* context, const std::string& dbName = {}) {
+// Returns the name of a secondary ART index on the property, or an empty string if none exists.
+static std::string getSecondaryARTIndexName(const PropertyExpression& property, table_id_t tableID,
+    main::ClientContext* context, const std::string& dbName) {
+    if (property.isPrimaryKey(tableID) || !property.hasProperty(tableID)) {
+        return {};
+    }
     auto [cat, sm] = main::DatabaseManager::resolveTableStorage(*context, tableID, dbName);
     auto transaction = transaction::Transaction::Get(*context);
     auto tableEntry = cat->getTableCatalogEntry(transaction, tableID);
+    // Bind-time property presence (hasProperty) can disagree with the catalog entry
+    // resolved here (e.g. ANY-graph tables share IDs with main-catalog tables and
+    // resolveTableStorage with an empty dbName prefers the main catalog). Never throw
+    // from the optimizer on that mismatch; skip the rewrite and keep scan + filter.
+    if (!tableEntry->containsProperty(property.getPropertyName())) {
+        return {};
+    }
+    const auto propertyID = tableEntry->getPropertyID(property.getPropertyName());
     auto* table = sm->getTable(tableID)->ptrCast<NodeTable>();
+    for (auto* indexEntry : cat->getIndexEntries(transaction, tableID)) {
+        if (!indexEntry->containsPropertyID(propertyID) ||
+            !StringUtils::caseInsensitiveEquals(indexEntry->getIndexType(),
+                ArtPrimaryKeyIndex::getIndexType().typeName)) {
+            continue;
+        }
+        auto index = table->getIndex(indexEntry->getIndexName());
+        if (!index.has_value() || index.value()->isPrimary()) {
+            continue;
+        }
+        return indexEntry->getIndexName();
+    }
+    return {};
+}
+
+static std::optional<std::pair<std::shared_ptr<Expression>, std::string>>
+popSecondaryARTEqualityComparison(PredicateSet& predicateSet, const Expression& nodeID,
+    table_id_t tableID, main::ClientContext* context, const std::string& dbName) {
     for (auto i = 0u; i < predicateSet.equalityPredicates.size(); ++i) {
         auto predicate = predicateSet.equalityPredicates[i];
         auto lhs = predicate->getChild(0);
@@ -226,33 +256,46 @@ popSecondaryARTEqualityComparison(PredicateSet& predicateSet, const Expression& 
         if (!isNodeProperty(*lhs, nodeID) || !isConstantExpression(rhs)) {
             continue;
         }
-        auto& property = lhs->constCast<PropertyExpression>();
-        if (property.isPrimaryKey(tableID) || !property.hasProperty(tableID)) {
+        auto indexName = getSecondaryARTIndexName(lhs->constCast<PropertyExpression>(), tableID,
+            context, dbName);
+        if (indexName.empty()) {
             continue;
         }
-        // Bind-time property presence (hasProperty) can disagree with the catalog entry
-        // resolved here (e.g. ANY-graph tables share IDs with main-catalog tables and
-        // resolveTableStorage with an empty dbName prefers the main catalog). Never throw
-        // from the optimizer on that mismatch; skip the rewrite and keep scan + filter.
-        if (!tableEntry->containsProperty(property.getPropertyName())) {
-            continue;
-        }
-        const auto propertyID = tableEntry->getPropertyID(property.getPropertyName());
-        for (auto* indexEntry : cat->getIndexEntries(transaction, tableID)) {
-            if (!indexEntry->containsPropertyID(propertyID) ||
-                !StringUtils::caseInsensitiveEquals(indexEntry->getIndexType(),
-                    ArtPrimaryKeyIndex::getIndexType().typeName)) {
-                continue;
-            }
-            auto index = table->getIndex(indexEntry->getIndexName());
-            if (!index.has_value() || index.value()->isPrimary()) {
-                continue;
-            }
-            predicateSet.equalityPredicates.erase(predicateSet.equalityPredicates.begin() + i);
-            return std::make_pair(rhs, indexEntry->getIndexName());
-        }
+        predicateSet.equalityPredicates.erase(predicateSet.equalityPredicates.begin() + i);
+        return std::make_pair(rhs, indexName);
     }
     return std::nullopt;
+}
+
+static bool isListContains(const Expression& expression) {
+    if (expression.expressionType != ExpressionType::FUNCTION) {
+        return false;
+    }
+    auto& name = expression.constCast<ScalarFunctionExpression>().getFunction().name;
+    return name == function::ListContainsFunction::name || name == function::ListHasFunction::name;
+}
+
+// Pops `n.property IN <constant list>` for a property accepted by canUseIndex and returns the
+// list. The list must already have the property's type, so its elements are usable as index keys.
+static std::shared_ptr<Expression> popInListComparison(PredicateSet& predicateSet,
+    const Expression& nodeID, const std::function<bool(const PropertyExpression&)>& canUseIndex) {
+    auto& predicates = predicateSet.nonEqualityPredicates;
+    for (auto i = 0u; i < predicates.size(); ++i) {
+        if (!isListContains(*predicates[i])) {
+            continue;
+        }
+        auto list = predicates[i]->getChild(0);
+        auto element = predicates[i]->getChild(1);
+        if (!isNodeProperty(*element, nodeID) || !isConstantExpression(list) ||
+            list->getDataType().getLogicalTypeID() != LogicalTypeID::LIST ||
+            ListType::getChildType(list->getDataType()) != element->getDataType() ||
+            !canUseIndex(element->constCast<PropertyExpression>())) {
+            continue;
+        }
+        predicates.erase(predicates.begin() + i);
+        return list;
+    }
+    return nullptr;
 }
 
 std::shared_ptr<LogicalOperator> FilterPushDownOptimizer::visitScanNodeTableReplace(
@@ -296,8 +339,19 @@ std::shared_ptr<LogicalOperator> FilterPushDownOptimizer::visitScanNodeTableRepl
     } else if (tableIDs.size() == 1) {
         auto* table = getResolvedTable(tableIDs[0]);
         auto* pkIndex = table->tryGetPrimaryKeyIndex();
-        if (pkIndex != nullptr && pkIndex->getIndexInfo().indexType ==
-                                      storage::ArtPrimaryKeyIndex::getIndexType().typeName) {
+        std::shared_ptr<Expression> primaryKeyList = nullptr;
+        if (pkIndex != nullptr && dynamic_cast<storage::ColumnarNodeTableBase*>(table) == nullptr) {
+            primaryKeyList =
+                popInListComparison(predicateSet, *nodeID, [&](const PropertyExpression& property) {
+                    return property.isPrimaryKey(tableIDs[0]);
+                });
+        }
+        if (primaryKeyList != nullptr) {
+            scan.setScanType(LogicalScanNodeTableType::PRIMARY_KEY_SCAN);
+            scan.setExtraInfo(PrimaryKeyScanInfo::createKeyList(std::move(primaryKeyList)));
+            scan.computeFlatSchema();
+        } else if (pkIndex != nullptr && pkIndex->getIndexInfo().indexType ==
+                                             storage::ArtPrimaryKeyIndex::getIndexType().typeName) {
             auto primaryKeyRangeComparison = predicateSet.popNodePKRangeComparison(*nodeID);
             if (primaryKeyRangeComparison.hasBound()) {
                 auto extraInfo = std::make_unique<PrimaryKeyScanInfo>(
@@ -319,6 +373,19 @@ std::shared_ptr<LogicalOperator> FilterPushDownOptimizer::visitScanNodeTableRepl
             scan.setExtraInfo(std::make_unique<SecondaryIndexScanInfo>(
                 secondaryIndexComparison->second, secondaryIndexComparison->first));
             scan.computeFlatSchema();
+        } else {
+            std::string indexName;
+            auto keyList =
+                popInListComparison(predicateSet, *nodeID, [&](const PropertyExpression& property) {
+                    indexName = getSecondaryARTIndexName(property, tableIDs[0], context, dbName);
+                    return !indexName.empty();
+                });
+            if (keyList != nullptr) {
+                scan.setScanType(LogicalScanNodeTableType::SECONDARY_INDEX_SCAN);
+                scan.setExtraInfo(std::make_unique<SecondaryIndexScanInfo>(indexName,
+                    std::move(keyList), true /* isKeyList */));
+                scan.computeFlatSchema();
+            }
         }
     }
     return finishPushDown(op);

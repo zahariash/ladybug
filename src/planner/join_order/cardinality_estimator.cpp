@@ -1,5 +1,6 @@
 #include "planner/join_order/cardinality_estimator.h"
 
+#include "binder/expression/literal_expression.h"
 #include "binder/expression/property_expression.h"
 #include "binder/expression/scalar_function_expression.h"
 #include "catalog/catalog.h"
@@ -167,9 +168,16 @@ uint64_t CardinalityEstimator::estimateScanNode(const LogicalOperator& op) const
     switch (scan.getScanType()) {
     case LogicalScanNodeTableType::PRIMARY_KEY_SCAN: {
         auto& primaryKeyScanInfo = scan.getExtraInfo()->constCast<PrimaryKeyScanInfo>();
-        return primaryKeyScanInfo.isRange ?
-                   atLeastOne(getNodeIDDom(scan.getNodeID()->getUniqueName())) :
-                   1;
+        if (primaryKeyScanInfo.isSingleKey()) {
+            return 1;
+        }
+        auto dom = atLeastOne(getNodeIDDom(scan.getNodeID()->getUniqueName()));
+        auto& keyList = primaryKeyScanInfo.keyList;
+        if (keyList != nullptr && keyList->expressionType == ExpressionType::LITERAL) {
+            auto numKeys = keyList->constCast<LiteralExpression>().getValue().getChildrenSize();
+            return atLeastOne(std::min<uint64_t>(numKeys, dom));
+        }
+        return dom;
     }
     case LogicalScanNodeTableType::SECONDARY_INDEX_SCAN:
         return atLeastOne(getNodeIDDom(scan.getNodeID()->getUniqueName()));

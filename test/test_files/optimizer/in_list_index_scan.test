@@ -1,0 +1,102 @@
+-DATASET CSV empty
+
+--
+
+-CASE InListArtPrimaryKey
+-STATEMENT CALL enable_default_hash_index=false;
+---- ok
+-STATEMENT CREATE NODE TABLE P (ID INT64, name STRING, rank INT64, PRIMARY KEY(ID));
+---- ok
+-STATEMENT UNWIND range(1, 20) AS i CREATE (:P {ID: i, name: 'n' + cast(i % 5 AS STRING), rank: i % 3});
+---- ok
+-STATEMENT CREATE ART INDEX p_pk FOR (p:P) ON (p.ID);
+---- ok
+-STATEMENT MATCH (p:P) WHERE p.ID IN [5, 2, 9, 2] RETURN p.ID, p.name ORDER BY p.ID;
+---- 3
+2|n2
+5|n0
+9|n4
+-STATEMENT MATCH (p:P) WHERE p.ID IN [100, 3, NULL] RETURN p.ID;
+---- 1
+3
+-STATEMENT MATCH (p:P) WHERE p.ID IN [] RETURN count(*);
+---- 1
+0
+-STATEMENT MATCH (p:P) WHERE p.ID IN [1, 2, 3, 4] AND p.rank = 1 RETURN p.ID ORDER BY p.ID;
+---- 2
+1
+4
+-STATEMENT MATCH (p:P) WHERE p.ID IN [1] OR p.ID = 2 RETURN p.ID ORDER BY p.ID;
+---- 2
+1
+2
+-STATEMENT MATCH (p:P) WHERE NOT p.ID IN [1, 2] RETURN count(*);
+---- 1
+18
+-STATEMENT MATCH (p:P) WHERE list_has([7, 8], p.ID) RETURN p.ID ORDER BY p.ID;
+---- 2
+7
+8
+-STATEMENT MATCH (p:P) WHERE p.ID IN cast([3, 4] AS INT32[]) RETURN p.ID ORDER BY p.ID;
+---- 2
+3
+4
+
+-CASE InListHashPrimaryKey
+-STATEMENT CREATE NODE TABLE P (ID STRING, v INT64, PRIMARY KEY(ID));
+---- ok
+-STATEMENT UNWIND range(1, 20) AS i CREATE (:P {ID: 'k' + cast(i AS STRING), v: i});
+---- ok
+-STATEMENT MATCH (p:P) WHERE p.ID IN ['k3', 'k30', 'k17', 'k3'] RETURN p.v ORDER BY p.v;
+---- 2
+3
+17
+-STATEMENT BEGIN TRANSACTION;
+---- ok
+-STATEMENT CREATE (:P {ID: 'k100', v: 100});
+---- ok
+-STATEMENT MATCH (p:P) WHERE p.ID IN ['k100', 'k1'] RETURN p.v ORDER BY p.v;
+---- 2
+1
+100
+-STATEMENT COMMIT;
+---- ok
+-STATEMENT MATCH (p:P) WHERE p.ID IN ['k100', 'k1'] RETURN p.v ORDER BY p.v;
+---- 2
+1
+100
+
+-CASE InListSecondaryArtIndex
+-STATEMENT CREATE NODE TABLE P (ID INT64, name STRING, PRIMARY KEY(ID));
+---- ok
+-STATEMENT UNWIND range(1, 20) AS i CREATE (:P {ID: i, name: 'n' + cast(i % 5 AS STRING)});
+---- ok
+-STATEMENT CREATE ART INDEX p_name FOR (p:P) ON (p.name);
+---- ok
+-STATEMENT MATCH (p:P) WHERE p.name IN ['n1', 'n3', 'n1', 'x'] RETURN p.ID ORDER BY p.ID;
+---- 8
+1
+3
+6
+8
+11
+13
+16
+18
+-STATEMENT MATCH (p:P) WHERE p.name IN ['n2'] AND p.ID > 10 RETURN p.ID ORDER BY p.ID;
+---- 2
+12
+17
+-STATEMENT MATCH (p:P) WHERE p.name IN ['x', NULL] RETURN count(*);
+---- 1
+0
+
+-CASE InListNarrowPrimaryKeyFallsBackToScan
+-STATEMENT CREATE NODE TABLE P (ID INT32, PRIMARY KEY(ID));
+---- ok
+-STATEMENT UNWIND range(1, 5) AS i CREATE (:P {ID: cast(i AS INT32)});
+---- ok
+-STATEMENT MATCH (p:P) WHERE p.ID IN [2, 4, 6] RETURN p.ID ORDER BY p.ID;
+---- 2
+2
+4

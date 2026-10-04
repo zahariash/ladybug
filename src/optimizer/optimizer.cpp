@@ -195,7 +195,9 @@ void dumpLogicalTree(const planner::LogicalOperator* op, int depth,
             info += " PK_SCAN";
             if (scan.getExtraInfo() != nullptr) {
                 auto& pkInfo = scan.getExtraInfo()->constCast<planner::PrimaryKeyScanInfo>();
-                info += pkInfo.isRange ? " range" : (" key=" + pkInfo.key->toString());
+                info += pkInfo.isRange       ? " range" :
+                        pkInfo.isSingleKey() ? " key=" + pkInfo.key->toString() :
+                                               " keys=" + pkInfo.keyList->toString();
             }
         } else if (scan.getScanType() == planner::LogicalScanNodeTableType::SECONDARY_INDEX_SCAN) {
             info += " IDX_SCAN";

@@ -284,6 +284,40 @@ TEST_F(OptimizerTest, IndexScanTest) {
     ASSERT_STREQ(getEncodedPlan(q1).c_str(), "Filter()IndexScan(a)");
 }
 
+TEST_F(OptimizerTest, InListIndexScanTest) {
+    ASSERT_STREQ(getEncodedPlan("MATCH (a:person) WHERE a.ID IN [0, 2] RETURN a.fName;").c_str(),
+        "IndexScan(a)");
+    ASSERT_STREQ(
+        getEncodedPlan("MATCH (a:person) WHERE a.ID IN [0, 2] OR a.age = 1 RETURN a.fName;")
+            .c_str(),
+        "Filter()S(a)");
+    ASSERT_STREQ(
+        getEncodedPlan("MATCH (a:person) WHERE a.fName IN ['Alice', 'Bob'] RETURN a.ID;").c_str(),
+        "Filter()S(a)");
+    ASSERT_TRUE(
+        conn->query("CREATE ART INDEX person_fname FOR (a:person) ON (a.fName);")->isSuccess());
+    ASSERT_STREQ(
+        getEncodedPlan("MATCH (a:person) WHERE a.fName IN ['Alice', 'Bob'] RETURN a.ID;").c_str(),
+        "IndexScan(a)");
+
+    auto prepared = conn->prepare("MATCH (a:person) WHERE a.ID IN $ids RETURN count(*);");
+    auto idsParam = [](std::vector<int64_t> ids) {
+        std::vector<std::unique_ptr<common::Value>> children;
+        for (auto id : ids) {
+            children.push_back(std::make_unique<common::Value>(id));
+        }
+        return common::Value(common::LogicalType::LIST(common::LogicalType::INT64()),
+            std::move(children));
+    };
+    auto result = conn->execute(prepared.get(),
+        std::make_pair(std::string("ids"), idsParam({0, 2, 3, 1000})));
+    ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+    ASSERT_EQ(result->getNext()->getValue(0)->getValue<int64_t>(), 3);
+    result = conn->execute(prepared.get(), std::make_pair(std::string("ids"), idsParam({5})));
+    ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+    ASSERT_EQ(result->getNext()->getValue(0)->getValue<int64_t>(), 1);
+}
+
 TEST_F(OptimizerTest, RemoveUnnecessaryJoinTest) {
     auto q1 = "MATCH (a:person)-[e:knows]->(b:person) "
               "HINT (a JOIN e) JOIN b "
