@@ -6,6 +6,9 @@ namespace lbug {
 namespace main {
 class ClientContext;
 }
+namespace binder {
+class PropertyExpression;
+} // namespace binder
 namespace planner {
 class CardinalityEstimator;
 } // namespace planner
@@ -99,6 +102,12 @@ private:
 
     std::shared_ptr<planner::LogicalOperator> visitChildren(
         const std::shared_ptr<planner::LogicalOperator>& op);
+
+    // Whether looking up numKeys keys in an index is estimated to be cheaper than scanning the
+    // table. A null nonUniqueProperty means each key matches at most one row.
+    bool isIndexLookupCheaper(common::table_id_t tableID, const std::string& dbName,
+        uint64_t numKeys, const binder::PropertyExpression* nonUniqueProperty,
+        bool isHashIndex) const;
 
 private:
     PredicateSet predicateSet;

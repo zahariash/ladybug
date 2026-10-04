@@ -336,6 +336,27 @@ TEST_F(OptimizerTest, PlanAfterDropColumnWithUncommittedRows) {
     ASSERT_TRUE(conn->query("ROLLBACK;")->isSuccess());
 }
 
+TEST_F(OptimizerTest, IndexScanCostGuard) {
+    ASSERT_TRUE(
+        conn->query("CREATE NODE TABLE guard(id INT64, u INT64, flag INT64, PRIMARY KEY(id));")
+            ->isSuccess());
+    ASSERT_TRUE(conn->query("COPY guard FROM (UNWIND range(0, 99999) AS i RETURN i, "
+                            "(i * 7919) % 100000, i % 2);")
+                    ->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE ART INDEX guard_u FOR (g:guard) ON (g.u);")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE ART INDEX guard_flag FOR (g:guard) ON (g.flag);")->isSuccess());
+    auto plan = [&](const std::string& predicate) {
+        return getEncodedPlan("MATCH (g:guard) WHERE " + predicate + " RETURN g.id;");
+    };
+    ASSERT_STREQ(plan("g.id IN [1, 2, 3]").c_str(), "IndexScan(g)");
+    ASSERT_STREQ(plan("g.u = 5").c_str(), "IndexScan(g)");
+    ASSERT_STREQ(plan("g.u IN [5, 6]").c_str(), "IndexScan(g)");
+    // Half the table matches, or too many keys: scanning is cheaper.
+    ASSERT_STREQ(plan("g.flag = 1").c_str(), "Filter()S(g)");
+    ASSERT_STREQ(plan("g.flag IN [1]").c_str(), "Filter()S(g)");
+    ASSERT_STREQ(plan("g.id IN range(1, 5000)").c_str(), "Filter()S(g)");
+}
+
 TEST_F(OptimizerTest, RemoveUnnecessaryJoinTest) {
     auto q1 = "MATCH (a:person)-[e:knows]->(b:person) "
               "HINT (a JOIN e) JOIN b "

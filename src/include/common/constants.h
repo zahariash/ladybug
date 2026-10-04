@@ -177,6 +177,14 @@ struct PlannerKnobs {
     // Recursive extend runs one graph search per bound source node. Measured per-source setup
     // cost vs per-output-pair cost is ~1000:1, so seed cardinality dominates direction choice.
     static constexpr uint64_t RECURSIVE_EXTEND_SOURCE_COST = 1000;
+    // Estimated costs (nanoseconds) for choosing between index lookups and a node table scan.
+    // Index lookups run on one thread and fetch matching rows one at a time; a scan pays a startup
+    // cost and then reads rows on all threads.
+    static constexpr double HASH_INDEX_KEY_LOOKUP_COST = 3000;
+    static constexpr double ART_INDEX_KEY_LOOKUP_COST = 20000;
+    static constexpr double INDEX_ROW_FETCH_COST = 250;
+    static constexpr double SCAN_STARTUP_COST = 1000000;
+    static constexpr double SCAN_ROW_COST = 20;
 };
 
 struct OrderByConstants {
