@@ -1,0 +1,64 @@
+-DATASET CSV empty
+
+--
+
+-CASE IndexScansSeeUncommittedRows
+-STATEMENT CALL enable_default_hash_index=false;
+---- ok
+-STATEMENT CREATE NODE TABLE P (ID INT64, name STRING, PRIMARY KEY(ID));
+---- ok
+-STATEMENT UNWIND range(1, 20) AS i CREATE (:P {ID: i, name: 'n' + cast(i % 5 AS STRING)});
+---- ok
+-STATEMENT CREATE ART INDEX p_pk FOR (p:P) ON (p.ID);
+---- ok
+-STATEMENT CREATE ART INDEX p_name FOR (p:P) ON (p.name);
+---- ok
+-STATEMENT BEGIN TRANSACTION;
+---- ok
+-STATEMENT CREATE (:P {ID: 100, name: 'n1'});
+---- ok
+-STATEMENT CREATE (:P {ID: 101, name: 'n1'});
+---- ok
+-STATEMENT MATCH (p:P) WHERE p.ID = 101 DELETE p;
+---- ok
+-STATEMENT MATCH (p:P) WHERE p.ID = 6 DELETE p;
+---- ok
+-STATEMENT MATCH (p:P) WHERE p.name = 'n1' RETURN p.ID ORDER BY p.ID;
+---- 4
+1
+11
+16
+100
+-STATEMENT MATCH (p:P) WHERE p.name IN ['n1', 'n2'] RETURN count(*);
+---- 1
+8
+-STATEMENT MATCH (p:P) WHERE p.ID >= 16 RETURN p.ID ORDER BY p.ID;
+---- 6
+16
+17
+18
+19
+20
+100
+-STATEMENT MATCH (p:P) WHERE p.ID > 99 AND p.ID < 101 RETURN p.name;
+---- 1
+n1
+-STATEMENT COMMIT;
+---- ok
+-STATEMENT MATCH (p:P) WHERE p.name = 'n1' RETURN p.ID ORDER BY p.ID;
+---- 4
+1
+11
+16
+100
+-STATEMENT MATCH (p:P) WHERE p.name IN ['n1', 'n2'] RETURN count(*);
+---- 1
+8
+-STATEMENT MATCH (p:P) WHERE p.ID >= 16 RETURN p.ID ORDER BY p.ID;
+---- 6
+16
+17
+18
+19
+20
+100

@@ -259,6 +259,12 @@ private:
         const std::vector<common::column_id_t>& columnIDs) const;
     bool scanPKColumn(const transaction::Transaction* transaction, const common::Value& keyToLookup,
         std::vector<ColumnPredicateSet> columnPredicateSets, common::offset_t& result) const;
+    // Appends the transaction's uncommitted rows whose index key lies within the bounds. A null
+    // bound vector leaves that side open.
+    void lookupUncommittedRows(const transaction::Transaction* transaction, const Index& index,
+        common::ValueVector* lowerBoundVector, uint64_t lowerBoundPos, bool lowerInclusive,
+        common::ValueVector* upperBoundVector, uint64_t upperBoundPos, bool upperInclusive,
+        std::vector<common::offset_t>& results) const;
     void scanIndexColumns(main::ClientContext* context, IndexScanHelper& scanHelper,
         const NodeGroupCollection& nodeGroups_,
         std::optional<uint64_t> queryID = std::nullopt) const;

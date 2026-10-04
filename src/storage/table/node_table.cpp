@@ -1,6 +1,7 @@
 #include "storage/table/node_table.h"
 
 #include <algorithm>
+#include <optional>
 
 #include "catalog/catalog.h"
 #include "catalog/catalog_entry/node_table_catalog_entry.h"
@@ -11,6 +12,7 @@
 #include "common/type_utils.h"
 #include "common/types/types.h"
 #include "main/client_context.h"
+#include "storage/index/art_index.h"
 #include "storage/local_storage/local_node_table.h"
 #include "storage/local_storage/local_storage.h"
 #include "storage/local_storage/local_table.h"
@@ -974,9 +976,12 @@ bool NodeTable::lookupPKRange(const Transaction* transaction, ValueVector* lower
     if (pkIndex == nullptr) {
         return false;
     }
-    return pkIndex->scanPrimaryKeyRange(lowerBoundVector, lowerBoundPos, lowerInclusive,
-        upperBoundVector, upperBoundPos, upperInclusive, maxResults, results,
+    pkIndex->scanPrimaryKeyRange(lowerBoundVector, lowerBoundPos, lowerInclusive, upperBoundVector,
+        upperBoundPos, upperInclusive, maxResults, results,
         [&](offset_t offset) { return isVisibleNoLock(transaction, offset); });
+    lookupUncommittedRows(transaction, *pkIndex, lowerBoundVector, lowerBoundPos, lowerInclusive,
+        upperBoundVector, upperBoundPos, upperInclusive, results);
+    return !results.empty();
 }
 
 bool NodeTable::lookupIndexRange(const Transaction* transaction, const std::string& indexName,
@@ -987,9 +992,12 @@ bool NodeTable::lookupIndexRange(const Transaction* transaction, const std::stri
     if (!index.has_value()) {
         return false;
     }
-    return index.value()->scanPrimaryKeyRange(lowerBoundVector, lowerBoundPos, lowerInclusive,
+    index.value()->scanPrimaryKeyRange(lowerBoundVector, lowerBoundPos, lowerInclusive,
         upperBoundVector, upperBoundPos, upperInclusive, maxResults, results,
         [&](offset_t offset) { return isVisibleNoLock(transaction, offset); });
+    lookupUncommittedRows(transaction, *index.value(), lowerBoundVector, lowerBoundPos,
+        lowerInclusive, upperBoundVector, upperBoundPos, upperInclusive, results);
+    return !results.empty();
 }
 
 bool NodeTable::lookupIndex(const Transaction* transaction, const std::string& indexName,
@@ -998,8 +1006,91 @@ bool NodeTable::lookupIndex(const Transaction* transaction, const std::string& i
     if (!index.has_value()) {
         return false;
     }
-    return index.value()->lookupAll(transaction, keyVector, keyPos, results,
+    index.value()->lookupAll(transaction, keyVector, keyPos, results,
         [&](offset_t offset) { return isVisibleNoLock(transaction, offset); });
+    lookupUncommittedRows(transaction, *index.value(), keyVector, keyPos, true, keyVector, keyPos,
+        true, results);
+    return !results.empty();
+}
+
+static bool isWithinBounds(const ArtKey& key, const ArtKey* lowerBound, bool lowerInclusive,
+    const ArtKey* upperBound, bool upperInclusive) {
+    if (lowerBound != nullptr) {
+        const auto order = key.getBytes() <=> lowerBound->getBytes();
+        if (order < 0 || (order == 0 && !lowerInclusive)) {
+            return false;
+        }
+    }
+    if (upperBound != nullptr) {
+        const auto order = key.getBytes() <=> upperBound->getBytes();
+        if (order > 0 || (order == 0 && !upperInclusive)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void NodeTable::lookupUncommittedRows(const Transaction* transaction, const Index& index,
+    ValueVector* lowerBoundVector, uint64_t lowerBoundPos, bool lowerInclusive,
+    ValueVector* upperBoundVector, uint64_t upperBoundPos, bool upperInclusive,
+    std::vector<offset_t>& results) const {
+    // Only indexes that defer inserts to commit lack this transaction's new rows.
+    if (!index.needCommitInsert() || transaction->getLocalStorage() == nullptr) {
+        return;
+    }
+    auto* localTable = transaction->getLocalStorage()->getLocalTable(tableID);
+    if (localTable == nullptr) {
+        return;
+    }
+    // Compare encoded keys so that local rows match exactly what the index would return.
+    std::optional<ArtKey> lowerBound, upperBound;
+    if (lowerBoundVector != nullptr) {
+        lowerBound = ArtKey::encode(lowerBoundVector, lowerBoundPos);
+    }
+    if (upperBoundVector != nullptr) {
+        upperBound = ArtKey::encode(upperBoundVector, upperBoundPos);
+    }
+    DASSERT(index.getIndexInfo().columnIDs.size() == 1);
+    const auto columnID = index.getIndexInfo().columnIDs[0];
+    auto& localNodeGroups = localTable->cast<LocalNodeTable>().getNodeGroups();
+    auto dataChunk = constructDataChunkForColumns({columnID});
+    std::vector<ValueVector*> outVectors = {&dataChunk.getValueVectorMutable(0)};
+    auto scanState =
+        std::make_unique<NodeTableScanState>(nullptr, std::move(outVectors), dataChunk.state);
+    scanState->source = TableScanSource::UNCOMMITTED;
+    scanState->setToTable(transaction, const_cast<NodeTable*>(this), {columnID}, {});
+    for (node_group_idx_t nodeGroupIdx = 0; nodeGroupIdx < localNodeGroups.getNumNodeGroups();
+         ++nodeGroupIdx) {
+        auto* nodeGroup = localNodeGroups.getNodeGroupNoLock(nodeGroupIdx);
+        if (nodeGroup->getNumChunkedGroups() == 0) {
+            continue;
+        }
+        scanState->nodeGroup = nodeGroup;
+        scanState->nodeGroupIdx = nodeGroupIdx;
+        nodeGroup->initializeScanState(transaction, *scanState);
+        while (true) {
+            const auto scanResult = nodeGroup->scan(transaction, *scanState);
+            if (scanResult == NODE_GROUP_SCAN_EMPTY_RESULT) {
+                break;
+            }
+            auto* scannedVector = scanState->outputVectors[0];
+            for (idx_t i = 0; i < scannedVector->state->getSelSize(); ++i) {
+                const auto pos = scannedVector->state->getSelVector()[i];
+                if (scannedVector->isNull(pos) ||
+                    !isWithinBounds(ArtKey::encode(scannedVector, pos),
+                        lowerBound ? &*lowerBound : nullptr, lowerInclusive,
+                        upperBound ? &*upperBound : nullptr, upperInclusive)) {
+                    continue;
+                }
+                const auto offset = transaction->getUncommittedOffset(tableID,
+                    StorageUtils::getStartOffsetOfNodeGroup(nodeGroupIdx) + scanResult.startRow +
+                        pos);
+                if (isVisibleNoLock(transaction, offset)) {
+                    results.push_back(offset);
+                }
+            }
+        }
+    }
 }
 
 bool NodeTable::scanPKColumn(const Transaction* transaction, const Value& keyToLookup,
