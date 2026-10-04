@@ -146,19 +146,17 @@ std::unique_ptr<PhysicalOperator> PlanMapper::mapScanNodeTable(
     case LogicalScanNodeTableType::PRIMARY_KEY_SCAN: {
         auto& primaryKeyScanInfo = scan.getExtraInfo()->constCast<PrimaryKeyScanInfo>();
         auto exprMapper = ExpressionMapper(outSchema);
-        auto evaluator =
-            primaryKeyScanInfo.isRange && primaryKeyScanInfo.lowerBound == nullptr ?
-                nullptr :
-                exprMapper.getEvaluator(primaryKeyScanInfo.isRange ? primaryKeyScanInfo.lowerBound :
-                                                                     primaryKeyScanInfo.key);
+        auto isKeyList = primaryKeyScanInfo.keyList != nullptr;
+        auto keyExpr = primaryKeyScanInfo.isRange ? primaryKeyScanInfo.lowerBound :
+                       isKeyList                  ? primaryKeyScanInfo.keyList :
+                                                    primaryKeyScanInfo.key;
+        auto evaluator = keyExpr == nullptr ? nullptr : exprMapper.getEvaluator(keyExpr);
         auto upperBoundEvaluator = primaryKeyScanInfo.upperBound == nullptr ?
                                        nullptr :
                                        exprMapper.getEvaluator(primaryKeyScanInfo.upperBound);
         auto sharedState = std::make_shared<PrimaryKeyScanSharedState>(tableInfos.size());
         auto keyString =
-            primaryKeyScanInfo.key != nullptr        ? primaryKeyScanInfo.key->toString() :
-            primaryKeyScanInfo.lowerBound != nullptr ? primaryKeyScanInfo.lowerBound->toString() :
-                                                       primaryKeyScanInfo.upperBound->toString();
+            keyExpr != nullptr ? keyExpr->toString() : primaryKeyScanInfo.upperBound->toString();
         std::string indexType = "NONE";
         if (tableInfos.size() == 1) {
             auto& nodeTable = tableInfos[0].table->cast<storage::NodeTable>();
@@ -170,7 +168,7 @@ std::unique_ptr<PhysicalOperator> PlanMapper::mapScanNodeTable(
             alias, indexType);
         return std::make_unique<PrimaryKeyScanNodeTable>(std::move(scanInfo), std::move(tableInfos),
             std::move(evaluator), std::move(upperBoundEvaluator), primaryKeyScanInfo.isRange,
-            false /* isIndexEquality */, primaryKeyScanInfo.lowerInclusive,
+            false /* isIndexEquality */, isKeyList, primaryKeyScanInfo.lowerInclusive,
             primaryKeyScanInfo.upperInclusive, "", std::move(sharedState), getOperatorID(),
             std::move(printInfo));
     }
@@ -183,8 +181,9 @@ std::unique_ptr<PhysicalOperator> PlanMapper::mapScanNodeTable(
             secondaryIndexScanInfo.key->toString(), alias, "ART");
         return std::make_unique<PrimaryKeyScanNodeTable>(std::move(scanInfo), std::move(tableInfos),
             std::move(evaluator), nullptr /* upperBoundEvaluator */, true /* isRange */,
-            true /* isIndexEquality */, true, true, secondaryIndexScanInfo.indexName,
-            std::move(sharedState), getOperatorID(), std::move(printInfo));
+            true /* isIndexEquality */, secondaryIndexScanInfo.isKeyList, true, true,
+            secondaryIndexScanInfo.indexName, std::move(sharedState), getOperatorID(),
+            std::move(printInfo));
     }
     default:
         UNREACHABLE_CODE;
