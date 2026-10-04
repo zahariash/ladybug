@@ -183,6 +183,8 @@ struct PlannerKnobs {
     static constexpr double HASH_INDEX_KEY_LOOKUP_COST = 3000;
     static constexpr double ART_INDEX_KEY_LOOKUP_COST = 20000;
     static constexpr double INDEX_ROW_FETCH_COST = 250;
+    // A secondary ART lookup also checks every uncommitted row of the transaction.
+    static constexpr double UNCOMMITTED_ROW_MATCH_COST = 75;
     static constexpr double SCAN_STARTUP_COST = 1000000;
     static constexpr double SCAN_ROW_COST = 20;
 };

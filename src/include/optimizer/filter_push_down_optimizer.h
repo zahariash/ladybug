@@ -104,10 +104,12 @@ private:
         const std::shared_ptr<planner::LogicalOperator>& op);
 
     // Whether looking up numKeys keys in an index is estimated to be cheaper than scanning the
-    // table. A null nonUniqueProperty means each key matches at most one row.
-    bool isIndexLookupCheaper(common::table_id_t tableID, const std::string& dbName,
-        uint64_t numKeys, const binder::PropertyExpression* nonUniqueProperty,
+    // table. Without statistics the index is assumed cheaper.
+    bool isPrimaryKeyLookupCheaper(common::table_id_t tableID, uint64_t numKeys,
         bool isHashIndex) const;
+    bool isSecondaryARTLookupCheaper(common::table_id_t tableID, const std::string& dbName,
+        uint64_t numKeys, const binder::PropertyExpression& property) const;
+    double estimateScanCost(double numRows) const;
 
 private:
     PredicateSet predicateSet;

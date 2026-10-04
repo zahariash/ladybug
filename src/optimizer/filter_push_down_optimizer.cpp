@@ -26,6 +26,8 @@
 #include "planner/operator/logical_table_function_call.h"
 #include "planner/operator/scan/logical_scan_node_table.h"
 #include "storage/index/art_index.h"
+#include "storage/local_storage/local_storage.h"
+#include "storage/local_storage/local_table.h"
 #include "storage/storage_manager.h"
 #include "storage/table/columnar_node_table_base.h"
 #include "storage/table/node_table.h"
@@ -244,42 +246,69 @@ static std::string getSecondaryARTIndexName(const PropertyExpression& property, 
     return {};
 }
 
-bool FilterPushDownOptimizer::isIndexLookupCheaper(table_id_t tableID, const std::string& dbName,
-    uint64_t numKeys, const PropertyExpression* nonUniqueProperty, bool isHashIndex) const {
-    // Without statistics, keep preferring the index.
+static const TableStats* getStorageStats(const CardinalityEstimator* cardinalityEstimator,
+    table_id_t tableID) {
     if (cardinalityEstimator == nullptr) {
-        return true;
+        return nullptr;
     }
     auto* stats = cardinalityEstimator->getTableStats(tableID);
-    if (stats == nullptr || !stats->storageStats.has_value()) {
+    return stats != nullptr && stats->storageStats.has_value() ? &*stats->storageStats : nullptr;
+}
+
+double FilterPushDownOptimizer::estimateScanCost(double numRows) const {
+    const auto numThreads = std::max<uint64_t>(1, context->getClientConfig()->numThreads);
+    return PlannerKnobs::SCAN_STARTUP_COST + numRows * PlannerKnobs::SCAN_ROW_COST / numThreads;
+}
+
+bool FilterPushDownOptimizer::isPrimaryKeyLookupCheaper(table_id_t tableID, uint64_t numKeys,
+    bool isHashIndex) const {
+    // Without statistics, keep preferring the index.
+    auto* stats = getStorageStats(cardinalityEstimator, tableID);
+    if (stats == nullptr) {
         return true;
     }
-    const auto numRows = static_cast<double>(stats->storageStats->getTableCard());
-    auto rowsPerKey = 1.0;
-    if (nonUniqueProperty != nullptr) {
-        auto [cat, sm] = main::DatabaseManager::resolveTableStorage(*context, tableID, dbName);
-        auto entry = cat->getTableCatalogEntry(transaction::Transaction::Get(*context), tableID);
-        if (!entry->containsProperty(nonUniqueProperty->getPropertyName())) {
-            return true;
-        }
-        const auto columnID = entry->getColumnID(nonUniqueProperty->getPropertyName());
-        if (columnID == INVALID_COLUMN_ID || columnID == ROW_IDX_COLUMN_ID) {
-            return true;
-        }
-        const auto numDistinct = stats->storageStats->getNumDistinctValues(columnID);
-        if (numDistinct == 0) {
-            return true;
-        }
-        rowsPerKey = std::max(1.0, numRows / static_cast<double>(numDistinct));
-    }
-    const auto numMatchedRows = std::min(numRows, numKeys * rowsPerKey);
     const auto keyCost = isHashIndex ? PlannerKnobs::HASH_INDEX_KEY_LOOKUP_COST :
                                        PlannerKnobs::ART_INDEX_KEY_LOOKUP_COST;
-    const auto indexCost = numKeys * keyCost + numMatchedRows * PlannerKnobs::INDEX_ROW_FETCH_COST;
-    const auto numThreads = std::max<uint64_t>(1, context->getClientConfig()->numThreads);
-    const auto scanCost =
-        PlannerKnobs::SCAN_STARTUP_COST + numRows * PlannerKnobs::SCAN_ROW_COST / numThreads;
-    return indexCost < scanCost;
+    const auto indexCost = numKeys * (keyCost + PlannerKnobs::INDEX_ROW_FETCH_COST);
+    return indexCost < estimateScanCost(static_cast<double>(stats->getTableCard()));
+}
+
+bool FilterPushDownOptimizer::isSecondaryARTLookupCheaper(table_id_t tableID,
+    const std::string& dbName, uint64_t numKeys, const PropertyExpression& property) const {
+    // Without statistics, keep preferring the index.
+    auto* stats = getStorageStats(cardinalityEstimator, tableID);
+    if (stats == nullptr) {
+        return true;
+    }
+    auto transaction = transaction::Transaction::Get(*context);
+    auto [cat, sm] = main::DatabaseManager::resolveTableStorage(*context, tableID, dbName);
+    auto entry = cat->getTableCatalogEntry(transaction, tableID);
+    if (!entry->containsProperty(property.getPropertyName())) {
+        return true;
+    }
+    const auto columnID = entry->getColumnID(property.getPropertyName());
+    if (columnID == INVALID_COLUMN_ID || columnID == ROW_IDX_COLUMN_ID) {
+        return true;
+    }
+    const auto numDistinct = stats->getNumDistinctValues(columnID);
+    if (numDistinct == 0) {
+        return true;
+    }
+    const auto numRows = static_cast<double>(stats->getTableCard());
+    const auto rowsPerKey = std::max(1.0, numRows / static_cast<double>(numDistinct));
+    const auto numMatchedRows = std::min(numRows, numKeys * rowsPerKey);
+    // The ART index lacks this transaction's inserts, so each lookup also checks all of the
+    // transaction's uncommitted rows.
+    double numUncommittedRows = 0;
+    if (auto* localStorage = transaction->getLocalStorage()) {
+        if (auto* localTable = localStorage->getLocalTable(tableID)) {
+            numUncommittedRows = static_cast<double>(localTable->getNumTotalRows());
+        }
+    }
+    const auto indexCost = numKeys * PlannerKnobs::ART_INDEX_KEY_LOOKUP_COST +
+                           numMatchedRows * PlannerKnobs::INDEX_ROW_FETCH_COST +
+                           numUncommittedRows * PlannerKnobs::UNCOMMITTED_ROW_MATCH_COST;
+    return indexCost < estimateScanCost(numRows);
 }
 
 // Number of keys in a constant key list: a literal, a parameter, or a cast of either.
@@ -416,8 +445,7 @@ std::shared_ptr<LogicalOperator> FilterPushDownOptimizer::visitScanNodeTableRepl
             primaryKeyList = popInListComparison(predicateSet, *nodeID,
                 [&](const PropertyExpression& property, const Expression& list) {
                     return property.isPrimaryKey(tableIDs[0]) &&
-                           isIndexLookupCheaper(tableIDs[0], dbName, getNumKeys(list),
-                               nullptr /* nonUniqueProperty */, isHashIndex);
+                           isPrimaryKeyLookupCheaper(tableIDs[0], getNumKeys(list), isHashIndex);
                 });
         }
         if (primaryKeyList != nullptr) {
@@ -440,8 +468,7 @@ std::shared_ptr<LogicalOperator> FilterPushDownOptimizer::visitScanNodeTableRepl
     if (scan.getScanType() == LogicalScanNodeTableType::SCAN && tableIDs.size() == 1) {
         auto secondaryIndexComparison = popSecondaryARTEqualityComparison(predicateSet, *nodeID,
             tableIDs[0], context, dbName, [&](const PropertyExpression& property) {
-                return isIndexLookupCheaper(tableIDs[0], dbName, 1 /* numKeys */, &property,
-                    false /* isHashIndex */);
+                return isSecondaryARTLookupCheaper(tableIDs[0], dbName, 1 /* numKeys */, property);
             });
         if (secondaryIndexComparison.has_value()) {
             scan.setScanType(LogicalScanNodeTableType::SECONDARY_INDEX_SCAN);
@@ -453,9 +480,8 @@ std::shared_ptr<LogicalOperator> FilterPushDownOptimizer::visitScanNodeTableRepl
             auto keyList = popInListComparison(predicateSet, *nodeID,
                 [&](const PropertyExpression& property, const Expression& list) {
                     indexName = getSecondaryARTIndexName(property, tableIDs[0], context, dbName);
-                    return !indexName.empty() &&
-                           isIndexLookupCheaper(tableIDs[0], dbName, getNumKeys(list), &property,
-                               false /* isHashIndex */);
+                    return !indexName.empty() && isSecondaryARTLookupCheaper(tableIDs[0], dbName,
+                                                     getNumKeys(list), property);
                 });
             if (keyList != nullptr) {
                 scan.setScanType(LogicalScanNodeTableType::SECONDARY_INDEX_SCAN);

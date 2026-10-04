@@ -357,6 +357,25 @@ TEST_F(OptimizerTest, IndexScanCostGuard) {
     ASSERT_STREQ(plan("g.id IN range(1, 5000)").c_str(), "Filter()S(g)");
 }
 
+TEST_F(OptimizerTest, IndexScanCostGuardCountsUncommittedRows) {
+    ASSERT_TRUE(
+        conn->query("CREATE NODE TABLE pending(id INT64, u INT64, PRIMARY KEY(id));")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE ART INDEX pending_u FOR (p:pending) ON (p.u);")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE (:pending {id: 0, u: 0});")->isSuccess());
+    auto equality = "MATCH (p:pending) WHERE p.u = 5 RETURN p.id;";
+    auto inList = "MATCH (p:pending) WHERE p.u IN [5, 6] RETURN p.id;";
+    ASSERT_STREQ(getEncodedPlan(equality).c_str(), "IndexScan(p)");
+    ASSERT_TRUE(conn->query("BEGIN TRANSACTION;")->isSuccess());
+    ASSERT_TRUE(
+        conn->query("UNWIND range(1, 100000) AS i CREATE (:pending {id: i, u: i});")->isSuccess());
+    // Each ART lookup would also check all 100000 uncommitted rows.
+    ASSERT_STREQ(getEncodedPlan(equality).c_str(), "Filter()S(p)");
+    ASSERT_STREQ(getEncodedPlan(inList).c_str(), "Filter()S(p)");
+    ASSERT_TRUE(conn->query("ROLLBACK;")->isSuccess());
+    ASSERT_STREQ(getEncodedPlan(equality).c_str(), "IndexScan(p)");
+    ASSERT_STREQ(getEncodedPlan(inList).c_str(), "IndexScan(p)");
+}
+
 TEST_F(OptimizerTest, IndexScanCostGuardAfterDropColumn) {
     ASSERT_TRUE(
         conn->query("CREATE NODE TABLE dropped(id INT64, a STRING, name STRING, PRIMARY KEY(id));")
