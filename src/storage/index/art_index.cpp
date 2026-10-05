@@ -17,6 +17,7 @@
 #include "common/types/value/value.h"
 #include "common/vector/value_vector.h"
 #include "storage/index/art_index_disk_utils.h"
+#include "transaction/transaction.h"
 #include <concepts>
 
 using namespace lbug::common;
@@ -629,7 +630,7 @@ void ArtPrimaryKeyIndex::appendVisibleOffsets(const Node& node, std::vector<offs
     }
 }
 
-void ArtPrimaryKeyIndex::eraseOffsetFromLeaf(Node& node, offset_t offset) {
+bool ArtPrimaryKeyIndex::eraseOffsetFromLeaf(Node& node, offset_t offset) {
     if (node.offset.has_value() && node.offset.value() == offset) {
         if (node.overflowOffsets && !node.overflowOffsets->empty()) {
             node.offset = node.overflowOffsets->back();
@@ -637,19 +638,39 @@ void ArtPrimaryKeyIndex::eraseOffsetFromLeaf(Node& node, offset_t offset) {
             if (node.overflowOffsets->empty()) {
                 node.overflowOffsets.reset();
             }
-            return;
+            return true;
         }
         node.offset.reset();
-        return;
+        return true;
     }
     if (!node.overflowOffsets) {
-        return;
+        return false;
     }
     auto it = std::find(node.overflowOffsets->begin(), node.overflowOffsets->end(), offset);
-    if (it != node.overflowOffsets->end()) {
+    const auto found = it != node.overflowOffsets->end();
+    if (found) {
         node.overflowOffsets->erase(it);
     }
     if (node.overflowOffsets->empty()) {
+        node.overflowOffsets.reset();
+    }
+    return found;
+}
+
+void ArtPrimaryKeyIndex::eraseOffsetRangeFromLeaf(Node& node, offset_t startOffset,
+    offset_t endOffset) {
+    auto inRange = [&](offset_t offset) { return offset >= startOffset && offset < endOffset; };
+    if (node.overflowOffsets) {
+        std::erase_if(*node.overflowOffsets, inRange);
+    }
+    if (node.offset.has_value() && inRange(node.offset.value())) {
+        node.offset.reset();
+    }
+    if (!node.offset.has_value() && node.overflowOffsets && !node.overflowOffsets->empty()) {
+        node.offset = node.overflowOffsets->back();
+        node.overflowOffsets->pop_back();
+    }
+    if (node.overflowOffsets && node.overflowOffsets->empty()) {
         node.overflowOffsets.reset();
     }
 }
@@ -683,13 +704,22 @@ void ArtPrimaryKeyIndex::erase(const ArtKey& key) {
     }
 }
 
-bool ArtPrimaryKeyIndex::eraseOffsetInternal(Node& node, offset_t offset) {
-    eraseOffsetFromLeaf(node, offset);
+bool ArtPrimaryKeyIndex::pruneTree(Node& node, std::vector<uint8_t>& key,
+    const std::function<void(Node&, const std::vector<uint8_t>&)>& visitLeaf) {
+    const auto keySize = key.size();
+    key.insert(key.end(), node.prefix.begin(), node.prefix.end());
+    visitLeaf(node, key);
+    auto pruneChild = [&](uint8_t byte, Node& child) {
+        key.push_back(byte);
+        const auto isEmpty = pruneTree(child, key, visitLeaf);
+        key.pop_back();
+        return isEmpty;
+    };
     switch (node.kind) {
     case Node::Kind::NODE4:
     case Node::Kind::NODE16: {
         for (auto i = 0u; i < node.count;) {
-            if (eraseOffsetInternal(*node.small.children[i], offset)) {
+            if (pruneChild(node.small.keys[i], *node.small.children[i])) {
                 node.removeChild(node.small.keys[i]);
                 continue;
             }
@@ -703,7 +733,7 @@ bool ArtPrimaryKeyIndex::eraseOffsetInternal(Node& node, offset_t offset) {
             if (pos == Node::EMPTY_MARKER) {
                 continue;
             }
-            if (eraseOffsetInternal(*node.node48->children[pos], offset)) {
+            if (pruneChild(static_cast<uint8_t>(byte), *node.node48->children[pos])) {
                 node.removeChild(static_cast<uint8_t>(byte));
             }
         }
@@ -713,7 +743,7 @@ bool ArtPrimaryKeyIndex::eraseOffsetInternal(Node& node, offset_t offset) {
             if (!node.node256->children[byte]) {
                 continue;
             }
-            if (eraseOffsetInternal(*node.node256->children[byte], offset)) {
+            if (pruneChild(static_cast<uint8_t>(byte), *node.node256->children[byte])) {
                 node.removeChild(static_cast<uint8_t>(byte));
             }
         }
@@ -721,11 +751,77 @@ bool ArtPrimaryKeyIndex::eraseOffsetInternal(Node& node, offset_t offset) {
     default:
         UNREACHABLE_CODE;
     }
+    key.resize(keySize);
     return node.empty();
 }
 
-void ArtPrimaryKeyIndex::commitInsert(transaction::Transaction*, const ValueVector& nodeIDVector,
-    const std::vector<ValueVector*>& indexVectors, Index::InsertState& insertState) {
+std::optional<std::vector<uint8_t>> ArtPrimaryKeyIndex::eraseOffsetInternal(offset_t offset) {
+    std::optional<std::vector<uint8_t>> erasedKey;
+    std::vector<uint8_t> key;
+    pruneTree(root, key, [&](Node& node, const std::vector<uint8_t>& nodeKey) {
+        if (eraseOffsetFromLeaf(node, offset)) {
+            erasedKey = nodeKey;
+        }
+    });
+    return erasedKey;
+}
+
+void ArtPrimaryKeyIndex::eraseOffsetRange(offset_t startOffset, offset_t endOffset) {
+    std::vector<uint8_t> key;
+    pruneTree(root, key, [&](Node& node, const std::vector<uint8_t>&) {
+        eraseOffsetRangeFromLeaf(node, startOffset, endOffset);
+    });
+}
+
+void ArtPrimaryKeyIndex::logUndo(transaction::Transaction* transaction, UndoEntry entry) {
+    if (transaction == nullptr) {
+        return;
+    }
+    if (undoLogTransactionID != transaction->getID()) {
+        undoLog.clear();
+        undoLogTransactionID = transaction->getID();
+        transaction->pushCommitCallback([this](transaction::Transaction&) {
+            std::lock_guard lck{mutex};
+            undoLog.clear();
+            undoLogTransactionID = INVALID_TRANSACTION;
+        });
+        transaction->pushRollbackCallback([this](transaction::Transaction&) { rollbackChanges(); });
+    }
+    // Adjacent inserted ranges are merged, so a large COPY needs few entries.
+    if (entry.kind == UndoEntry::Kind::INSERTED_RANGE && !undoLog.empty() &&
+        undoLog.back().kind == UndoEntry::Kind::INSERTED_RANGE &&
+        undoLog.back().endOffset == entry.startOffset) {
+        undoLog.back().endOffset = entry.endOffset;
+        return;
+    }
+    undoLog.push_back(std::move(entry));
+}
+
+void ArtPrimaryKeyIndex::rollbackChanges() {
+    std::lock_guard lck{mutex};
+    materializeDiskTree();
+    for (auto it = undoLog.rbegin(); it != undoLog.rend(); ++it) {
+        switch (it->kind) {
+        case UndoEntry::Kind::INSERTED_RANGE:
+            eraseOffsetRange(it->startOffset, it->endOffset);
+            break;
+        case UndoEntry::Kind::INSERTED_KEY:
+            eraseOffsetInternal(it->startOffset);
+            break;
+        case UndoEntry::Kind::ERASED_KEY:
+            insertSecondaryInternal(ArtKey{it->key}, it->startOffset);
+            break;
+        default:
+            UNREACHABLE_CODE;
+        }
+    }
+    undoLog.clear();
+    undoLogTransactionID = INVALID_TRANSACTION;
+}
+
+void ArtPrimaryKeyIndex::commitInsert(transaction::Transaction* transaction,
+    const ValueVector& nodeIDVector, const std::vector<ValueVector*>& indexVectors,
+    Index::InsertState& insertState) {
     DASSERT(indexVectors.size() == 1);
     std::lock_guard lck{mutex};
     materializeDiskTree();
@@ -744,6 +840,7 @@ void ArtPrimaryKeyIndex::commitInsert(transaction::Transaction*, const ValueVect
         }
         if (!indexInfo.isPrimary) {
             insertSecondaryInternal(key, offset);
+            logUndo(transaction, {UndoEntry::Kind::INSERTED_RANGE, {}, offset, offset + 1});
             continue;
         }
         if (!insertInternal(key, offset, artInsertState.isVisible)) {
@@ -758,8 +855,8 @@ std::unique_ptr<Index::UpdateState> ArtPrimaryKeyIndex::initUpdateState(main::Cl
     return std::make_unique<UpdateState>();
 }
 
-void ArtPrimaryKeyIndex::update(transaction::Transaction*, const ValueVector& nodeIDVector,
-    ValueVector& propertyVector, UpdateState&) {
+void ArtPrimaryKeyIndex::update(transaction::Transaction* transaction,
+    const ValueVector& nodeIDVector, ValueVector& propertyVector, UpdateState&) {
     if (indexInfo.isPrimary) {
         UNREACHABLE_CODE;
     }
@@ -768,17 +865,20 @@ void ArtPrimaryKeyIndex::update(transaction::Transaction*, const ValueVector& no
     for (auto i = 0u; i < nodeIDVector.state->getSelSize(); i++) {
         const auto nodeIDPos = nodeIDVector.state->getSelVector()[i];
         const auto offset = nodeIDVector.readNodeOffset(nodeIDPos);
-        eraseOffsetInternal(root, offset);
+        if (auto erasedKey = eraseOffsetInternal(offset)) {
+            logUndo(transaction, {UndoEntry::Kind::ERASED_KEY, std::move(*erasedKey), offset, 0});
+        }
         const auto keyPos = propertyVector.state->getSelVector()[i];
         const auto key = ArtKey::encode(&propertyVector, keyPos);
         if (!key.empty()) {
             insertSecondaryInternal(key, offset);
+            logUndo(transaction, {UndoEntry::Kind::INSERTED_KEY, {}, offset, 0});
         }
     }
 }
 
-void ArtPrimaryKeyIndex::delete_(transaction::Transaction*, const ValueVector& nodeIDVector,
-    DeleteState&) {
+void ArtPrimaryKeyIndex::delete_(transaction::Transaction* transaction,
+    const ValueVector& nodeIDVector, DeleteState&) {
     if (indexInfo.isPrimary) {
         return;
     }
@@ -786,7 +886,10 @@ void ArtPrimaryKeyIndex::delete_(transaction::Transaction*, const ValueVector& n
     materializeDiskTree();
     for (auto i = 0u; i < nodeIDVector.state->getSelSize(); i++) {
         const auto nodeIDPos = nodeIDVector.state->getSelVector()[i];
-        eraseOffsetInternal(root, nodeIDVector.readNodeOffset(nodeIDPos));
+        const auto offset = nodeIDVector.readNodeOffset(nodeIDPos);
+        if (auto erasedKey = eraseOffsetInternal(offset)) {
+            logUndo(transaction, {UndoEntry::Kind::ERASED_KEY, std::move(*erasedKey), offset, 0});
+        }
     }
 }
 
