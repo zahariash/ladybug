@@ -37,8 +37,11 @@ public:
 
     common::cardinality_t getTableCard() const { return cardinality; }
 
+    // Returns 0 (unknown) for a column without statistics.
     common::cardinality_t getNumDistinctValues(common::column_id_t columnID) const {
-        DASSERT(columnID < columnStats.size());
+        if (columnID >= columnStats.size()) {
+            return 0;
+        }
         return columnStats[columnID].getNumDistinctValues();
     }
 

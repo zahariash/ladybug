@@ -322,6 +322,20 @@ TEST_F(OptimizerTest, InListIndexScanTest) {
     ASSERT_EQ(result->getNext()->getValue(0)->getValue<int64_t>(), 1);
 }
 
+TEST_F(OptimizerTest, PlanAfterDropColumnWithUncommittedRows) {
+    ASSERT_TRUE(
+        conn->query("CREATE NODE TABLE dropped(id INT64, a STRING, name STRING, PRIMARY KEY(id));")
+            ->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE (:dropped {id: 1, a: 'x', name: 'n1'});")->isSuccess());
+    ASSERT_TRUE(conn->query("ALTER TABLE dropped DROP a;")->isSuccess());
+    ASSERT_TRUE(conn->query("BEGIN TRANSACTION;")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE (:dropped {id: 100, name: 'n1'});")->isSuccess());
+    // Planning merges this transaction's statistics, which lack the dropped column.
+    ASSERT_STREQ(getEncodedPlan("MATCH (d:dropped) WHERE d.name = 'n1' RETURN d.id;").c_str(),
+        "Filter()S(d)");
+    ASSERT_TRUE(conn->query("ROLLBACK;")->isSuccess());
+}
+
 TEST_F(OptimizerTest, RemoveUnnecessaryJoinTest) {
     auto q1 = "MATCH (a:person)-[e:knows]->(b:person) "
               "HINT (a JOIN e) JOIN b "
