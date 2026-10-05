@@ -29,6 +29,9 @@ LocalNodeTable::LocalNodeTable(const catalog::TableCatalogEntry* tableEntry, Tab
     MemoryManager& mm)
     : LocalTable{table}, overflowFileHandle(nullptr),
       nodeGroups{mm, getNodeTableColumnTypes(*tableEntry), false /*enableCompression*/} {
+    for (auto& property : tableEntry->getProperties()) {
+        columnIDs.push_back(tableEntry->getColumnID(property.getName()));
+    }
     initLocalHashIndex(mm);
     startOffset = table.getNumTotalRows(nullptr /* transaction */);
 }
@@ -118,6 +121,8 @@ bool LocalNodeTable::delete_(Transaction* transaction, TableDeleteState& deleteS
 
 bool LocalNodeTable::addColumn(TableAddColumnState& addColumnState) {
     nodeGroups.addColumn(addColumnState);
+    // NodeTable::addColumn has already appended the new table column.
+    columnIDs.push_back(table.cast<NodeTable>().getNumColumns() - 1);
     return true;
 }
 
