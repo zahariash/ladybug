@@ -1,0 +1,36 @@
+-DATASET CSV empty
+
+--
+
+-CASE CopyMaintainsSecondaryArtIndex
+-STATEMENT CREATE NODE TABLE C (ID INT64, g INT64, name STRING, PRIMARY KEY(ID));
+---- ok
+-STATEMENT CREATE ART INDEX c_g FOR (c:C) ON (c.g);
+---- ok
+-STATEMENT CREATE ART INDEX c_name FOR (c:C) ON (c.name);
+---- ok
+-STATEMENT COPY C FROM (UNWIND range(1, 100) AS i RETURN i, i % 10, 'n' + cast(i % 10 AS STRING));
+---- ok
+-STATEMENT MATCH (c:C) WHERE c.g = 5 RETURN count(*);
+---- 1
+10
+-STATEMENT MATCH (c:C) WHERE c.g IN [5, 6] RETURN count(*);
+---- 1
+20
+-STATEMENT MATCH (c:C) WHERE c.name = 'n3' RETURN count(*);
+---- 1
+10
+-STATEMENT COPY C FROM (UNWIND range(101, 200) AS i RETURN i, i % 10, 'n' + cast(i % 10 AS STRING));
+---- ok
+-STATEMENT MATCH (c:C) WHERE c.g = 5 RETURN count(*);
+---- 1
+20
+-STATEMENT CHECKPOINT;
+---- ok
+-RELOADDB
+-STATEMENT MATCH (c:C) WHERE c.g IN [5, 6] RETURN count(*);
+---- 1
+40
+-STATEMENT MATCH (c:C) WHERE c.name IN ['n3'] RETURN count(*);
+---- 1
+20
