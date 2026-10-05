@@ -1,0 +1,68 @@
+-DATASET CSV empty
+
+--
+
+-CASE RollbackRestoresSecondaryArtIndex
+-STATEMENT CREATE NODE TABLE P (ID INT64, name STRING, PRIMARY KEY(ID));
+---- ok
+-STATEMENT UNWIND range(1, 20) AS i CREATE (:P {ID: i, name: 'n' + cast(i % 5 AS STRING)});
+---- ok
+-STATEMENT CREATE ART INDEX p_name FOR (p:P) ON (p.name);
+---- ok
+-STATEMENT BEGIN TRANSACTION;
+---- ok
+-STATEMENT CREATE (:P {ID: 100, name: 'n1'});
+---- ok
+-STATEMENT MATCH (p:P) WHERE p.ID = 100 SET p.name = 'zz';
+---- ok
+-STATEMENT MATCH (p:P) WHERE p.ID = 3 SET p.name = 'zz';
+---- ok
+-STATEMENT MATCH (p:P) WHERE p.ID = 3 SET p.name = 'yy';
+---- ok
+-STATEMENT MATCH (p:P) WHERE p.ID = 8 DELETE p;
+---- ok
+-STATEMENT ROLLBACK;
+---- ok
+-STATEMENT MATCH (p:P) WHERE p.name IN ['zz', 'yy'] RETURN count(*);
+---- 1
+0
+-STATEMENT MATCH (p:P) WHERE p.name = 'n3' RETURN p.ID ORDER BY p.ID;
+---- 4
+3
+8
+13
+18
+-STATEMENT MATCH (p:P) WHERE p.name IN ['n3', 'n1'] RETURN count(*);
+---- 1
+8
+-STATEMENT CREATE (:P {ID: 200, name: 'qq'});
+---- ok
+-STATEMENT MATCH (p:P) WHERE p.name = 'zz' RETURN count(*);
+---- 1
+0
+-STATEMENT MATCH (p:P) WHERE p.name = 'qq' RETURN p.ID;
+---- 1
+200
+
+-CASE FailedCopyLeavesSecondaryArtIndexClean
+-STATEMENT CREATE NODE TABLE C (ID INT64, g INT64, PRIMARY KEY(ID));
+---- ok
+-STATEMENT CREATE ART INDEX c_g FOR (c:C) ON (c.g);
+---- ok
+-STATEMENT COPY C FROM (UNWIND [1, 2, 3, 2] AS i RETURN i, i % 10);
+---- error(regex)
+Copy exception: Found duplicated primary key value .*
+-STATEMENT MATCH (c:C) WHERE c.g IN [1, 2, 3] RETURN count(*);
+---- 1
+0
+-STATEMENT COPY C FROM (UNWIND range(1, 30) AS i RETURN i, i % 10);
+---- ok
+-STATEMENT MATCH (c:C) WHERE c.g IN [1, 2] RETURN count(*);
+---- 1
+6
+-STATEMENT CHECKPOINT;
+---- ok
+-RELOADDB
+-STATEMENT MATCH (c:C) WHERE c.g = 3 RETURN count(*);
+---- 1
+3

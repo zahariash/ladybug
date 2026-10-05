@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -85,7 +86,7 @@ public:
         visible_func) override {
         return std::make_unique<DeleteState>();
     }
-    void delete_(transaction::Transaction*, const common::ValueVector& nodeIDVector,
+    void delete_(transaction::Transaction* transaction, const common::ValueVector& nodeIDVector,
         DeleteState&) override;
 
     bool lookupPrimaryKey(const transaction::Transaction* transaction,
@@ -183,9 +184,30 @@ private:
         visible_func isVisible) const;
     bool eraseInternal(Node& node, const std::vector<uint8_t>& key, uint64_t depth);
     void erase(const ArtKey& key);
-    static void eraseOffsetFromLeaf(Node& node, common::offset_t offset);
+    static bool eraseOffsetFromLeaf(Node& node, common::offset_t offset);
+    static void eraseOffsetRangeFromLeaf(Node& node, common::offset_t startOffset,
+        common::offset_t endOffset);
+    // Calls visitLeaf on every node with the node's full key, then removes nodes left empty.
+    // Returns whether the node itself is empty.
+    bool pruneTree(Node& node, std::vector<uint8_t>& key,
+        const std::function<void(Node&, const std::vector<uint8_t>&)>& visitLeaf);
     static void resetNodePayload(Node& node);
-    bool eraseOffsetInternal(Node& node, common::offset_t offset);
+    // Removes the offset from the tree and returns the key it was stored under, if any.
+    std::optional<std::vector<uint8_t>> eraseOffsetInternal(common::offset_t offset);
+    void eraseOffsetRange(common::offset_t startOffset, common::offset_t endOffset);
+
+    // A secondary index changes in place within a transaction: SET and DELETE immediately, COPY
+    // and commit insert keys. The changes are logged so a rollback can undo them.
+    struct UndoEntry {
+        enum class Kind : uint8_t { INSERTED_RANGE, INSERTED_KEY, ERASED_KEY };
+        Kind kind;
+        std::vector<uint8_t> key;
+        common::offset_t startOffset;
+        // Exclusive; INSERTED_RANGE only.
+        common::offset_t endOffset;
+    };
+    void logUndo(transaction::Transaction* transaction, UndoEntry entry);
+    void rollbackChanges();
     Node* allocateNode();
     void recordKindChange(Node& node, Node::Kind newKind);
     void collectRange(const Node& node, std::vector<uint8_t>& key, const ArtKey* lowerBound,
@@ -212,6 +234,8 @@ private:
     PageRange checkpointRollbackTreePageRange;
     uint64_t checkpointRollbackTreeSize = 0;
     bool hasCheckpointRollbackState = false;
+    std::vector<UndoEntry> undoLog;
+    common::transaction_t undoLogTransactionID = common::INVALID_TRANSACTION;
     mutable std::mutex mutex;
 };
 
