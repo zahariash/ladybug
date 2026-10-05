@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <optional>
 #include <shared_mutex>
 
@@ -8,6 +9,7 @@
 #include "storage/predicate/column_predicate.h"
 #include "storage/table/node_group_collection.h"
 #include "storage/table/table.h"
+#include <span>
 
 namespace lbug {
 namespace evaluator {
@@ -23,6 +25,8 @@ class Transaction;
 } // namespace transaction
 
 namespace storage {
+
+class ArtKey;
 
 struct LBUG_API NodeTableScanState : TableScanState {
     NodeTableScanState(common::ValueVector* nodeIDVector,
@@ -166,6 +170,9 @@ public:
     bool lookupIndex(const transaction::Transaction* transaction, const std::string& indexName,
         common::ValueVector* keyVector, uint64_t keyPos,
         std::vector<common::offset_t>& results) const;
+    bool lookupIndex(const transaction::Transaction* transaction, const std::string& indexName,
+        common::ValueVector* keyVector, std::span<const uint64_t> keyPositions,
+        std::vector<common::offset_t>& results) const;
 
     void addIndex(std::unique_ptr<Index> index);
     void buildIndexAndAdd(main::ClientContext* context, std::unique_ptr<Index> index,
@@ -259,11 +266,10 @@ private:
         const std::vector<common::column_id_t>& columnIDs) const;
     bool scanPKColumn(const transaction::Transaction* transaction, const common::Value& keyToLookup,
         std::vector<ColumnPredicateSet> columnPredicateSets, common::offset_t& result) const;
-    // Appends the transaction's uncommitted rows whose index key lies within the bounds. A null
-    // bound vector leaves that side open.
+    // For an ART index, replaces the transaction's uncommitted rows among results[firstResult..]
+    // with those whose current ART-encoded key satisfies matches.
     void lookupUncommittedRows(const transaction::Transaction* transaction, const Index& index,
-        common::ValueVector* lowerBoundVector, uint64_t lowerBoundPos, bool lowerInclusive,
-        common::ValueVector* upperBoundVector, uint64_t upperBoundPos, bool upperInclusive,
+        size_t firstResult, const std::function<bool(const ArtKey&)>& matches,
         std::vector<common::offset_t>& results) const;
     void scanIndexColumns(main::ClientContext* context, IndexScanHelper& scanHelper,
         const NodeGroupCollection& nodeGroups_,
