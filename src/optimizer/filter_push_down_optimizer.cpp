@@ -267,7 +267,10 @@ bool FilterPushDownOptimizer::isIndexLookupCheaper(table_id_t tableID, const std
             return true;
         }
         const auto numDistinct = stats->storageStats->getNumDistinctValues(columnID);
-        rowsPerKey = std::max(1.0, numRows / std::max<double>(numDistinct, 1));
+        if (numDistinct == 0) {
+            return true;
+        }
+        rowsPerKey = std::max(1.0, numRows / static_cast<double>(numDistinct));
     }
     const auto numMatchedRows = std::min(numRows, numKeys * rowsPerKey);
     const auto keyCost = isHashIndex ? PlannerKnobs::HASH_INDEX_KEY_LOOKUP_COST :
@@ -289,7 +292,11 @@ static uint64_t getNumKeys(const Expression& keys) {
                    1;
     }
     case ExpressionType::PARAMETER: {
-        auto value = keys.constCast<ParameterExpression>().getValue();
+        auto& parameter = keys.constCast<ParameterExpression>();
+        // The index-or-scan choice depends on the list size, so the plan can't be reused for
+        // other values.
+        parameter.markBakedIntoPlan();
+        auto value = parameter.getValue();
         return value.getDataType().getLogicalTypeID() == LogicalTypeID::LIST ?
                    value.getChildrenSize() :
                    1;

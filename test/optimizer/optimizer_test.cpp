@@ -357,6 +357,23 @@ TEST_F(OptimizerTest, IndexScanCostGuard) {
     ASSERT_STREQ(plan("g.id IN range(1, 5000)").c_str(), "Filter()S(g)");
 }
 
+TEST_F(OptimizerTest, IndexScanCostGuardAfterDropColumn) {
+    ASSERT_TRUE(
+        conn->query("CREATE NODE TABLE dropped(id INT64, a STRING, name STRING, PRIMARY KEY(id));")
+            ->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE (:dropped {id: 1, a: 'x', name: 'n1'});")->isSuccess());
+    ASSERT_TRUE(
+        conn->query("CREATE ART INDEX dropped_name FOR (d:dropped) ON (d.name);")->isSuccess());
+    ASSERT_TRUE(conn->query("ALTER TABLE dropped DROP a;")->isSuccess());
+    ASSERT_TRUE(conn->query("BEGIN TRANSACTION;")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE (:dropped {id: 100, name: 'n1'});")->isSuccess());
+    // Planning merges this transaction's statistics, which lack the dropped column.
+    ASSERT_STREQ(
+        getEncodedPlan("MATCH (d:dropped) WHERE d.name IN ['n1', 'n2'] RETURN d.id;").c_str(),
+        "IndexScan(d)");
+    ASSERT_TRUE(conn->query("ROLLBACK;")->isSuccess());
+}
+
 TEST_F(OptimizerTest, RemoveUnnecessaryJoinTest) {
     auto q1 = "MATCH (a:person)-[e:knows]->(b:person) "
               "HINT (a JOIN e) JOIN b "
