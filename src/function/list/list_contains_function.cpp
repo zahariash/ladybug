@@ -91,6 +91,21 @@ struct ListContainsConstantList {
     }
 };
 
+static bool fitsInInt64(const LogicalType& type) {
+    switch (type.getLogicalTypeID()) {
+    case LogicalTypeID::INT8:
+    case LogicalTypeID::INT16:
+    case LogicalTypeID::INT32:
+    case LogicalTypeID::INT64:
+    case LogicalTypeID::UINT8:
+    case LogicalTypeID::UINT16:
+    case LogicalTypeID::UINT32:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static bool isConstantList(const Expression& listExpr) {
     return listExpr.expressionType == ExpressionType::LITERAL ||
            listExpr.expressionType == ExpressionType::PARAMETER;
@@ -115,6 +130,12 @@ static std::unique_ptr<FunctionBindData> bindFunc(const ScalarBindFuncInput& inp
         if (!LogicalTypeUtils::tryGetMaxLogicalType(listChildType, elementType, childType)) {
             throw BinderException(std::format("Cannot compare {} and {} in list_contains function.",
                 listChildType.toString(), elementType.toString()));
+        }
+        // As comparisons do, cast a constant integer list to SERIAL rather than the SERIAL
+        // element, so a SERIAL primary key stays usable for index lookups.
+        if (elementType.getLogicalTypeID() == LogicalTypeID::SERIAL && isConstantList(*listExpr) &&
+            fitsInInt64(listChildType)) {
+            childType = LogicalType::SERIAL();
         }
     }
     if (childType.getLogicalTypeID() == LogicalTypeID::ANY) {

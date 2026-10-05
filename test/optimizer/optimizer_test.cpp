@@ -299,6 +299,10 @@ TEST_F(OptimizerTest, InListIndexScanTest) {
     ASSERT_STREQ(
         getEncodedPlan("MATCH (a:person) WHERE a.fName IN ['Alice', 'Bob'] RETURN a.ID;").c_str(),
         "IndexScan(a)");
+    ASSERT_TRUE(
+        conn->query("CREATE NODE TABLE serial_user(id SERIAL, PRIMARY KEY(id));")->isSuccess());
+    ASSERT_STREQ(getEncodedPlan("MATCH (u:serial_user) WHERE u.id IN [1, 3] RETURN u.id;").c_str(),
+        "IndexScan(u)");
 
     auto prepared = conn->prepare("MATCH (a:person) WHERE a.ID IN $ids RETURN count(*);");
     auto idsParam = [](std::vector<int64_t> ids) {
