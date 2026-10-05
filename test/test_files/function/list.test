@@ -771,6 +771,24 @@ True
 0
 7
 
+-LOG ListContainsLongConstantList
+-STATEMENT MATCH (a:person) WHERE a.age IN [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 35, 45] RETURN a.ID ORDER BY a.ID
+---- 2
+0
+3
+-STATEMENT MATCH (a:person) WHERE a.fName IN ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'Bob', 'Greg'] RETURN a.ID ORDER BY a.ID
+---- 2
+2
+9
+-STATEMENT MATCH (a:person) WHERE a.ID < 4 RETURN a.ID, a.age IN [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 30, NULL] ORDER BY a.ID
+---- 3
+0|False
+2|True
+3|False
+-STATEMENT RETURN CAST(NULL AS INT64) IN range(0, 20)
+---- 1
+
+
 -LOG ListContainsSelect
 -STATEMENT MATCH (a:person) WHERE list_contains(a.courseScoresPerTerm, [8]) RETURN a.ID
 ---- 2
