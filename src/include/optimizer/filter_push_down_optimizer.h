@@ -107,8 +107,11 @@ private:
     // table. Without statistics the index is assumed cheaper.
     bool isPrimaryKeyLookupCheaper(common::table_id_t tableID, uint64_t numKeys,
         bool isHashIndex) const;
+    // keys is the equality operand, or the key list when isKeyList; literal keys are counted in
+    // the index.
     bool isSecondaryARTLookupCheaper(common::table_id_t tableID, const std::string& dbName,
-        uint64_t numKeys, const binder::PropertyExpression& property) const;
+        const binder::PropertyExpression& property, const std::string& indexName,
+        const binder::Expression& keys, bool isKeyList) const;
     double estimateScanCost(double numRows) const;
 
 private:

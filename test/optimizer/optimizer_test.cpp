@@ -337,14 +337,21 @@ TEST_F(OptimizerTest, PlanAfterDropColumnWithUncommittedRows) {
 }
 
 TEST_F(OptimizerTest, IndexScanCostGuard) {
-    ASSERT_TRUE(
-        conn->query("CREATE NODE TABLE guard(id INT64, u INT64, flag INT64, PRIMARY KEY(id));")
-            ->isSuccess());
-    ASSERT_TRUE(conn->query("COPY guard FROM (UNWIND range(0, 99999) AS i RETURN i, "
-                            "(i * 7919) % 100000, i % 2);")
+    ASSERT_TRUE(conn->query("CREATE NODE TABLE guard(id INT64, u INT64, flag INT64, skew INT64, "
+                            "st INT64, PRIMARY KEY(id));")
                     ->isSuccess());
-    ASSERT_TRUE(conn->query("CREATE ART INDEX guard_u FOR (g:guard) ON (g.u);")->isSuccess());
-    ASSERT_TRUE(conn->query("CREATE ART INDEX guard_flag FOR (g:guard) ON (g.flag);")->isSuccess());
+    // skew: half the rows share key 0, the rest are unique.
+    ASSERT_TRUE(
+        conn->query("COPY guard FROM (UNWIND range(0, 99999) AS i RETURN i, "
+                    "(i * 7919) % 100000, i % 2, CASE WHEN i % 2 = 0 THEN 0 ELSE i END, i + 0);")
+            ->isSuccess());
+    // st: the distinct-value estimate still counts the values overwritten here.
+    ASSERT_TRUE(conn->query("MATCH (g:guard) SET g.st = 1;")->isSuccess());
+    for (auto column : {"u", "flag", "skew", "st"}) {
+        ASSERT_TRUE(
+            conn->query(std::format("CREATE ART INDEX guard_{0} FOR (g:guard) ON (g.{0});", column))
+                ->isSuccess());
+    }
     auto plan = [&](const std::string& predicate) {
         return getEncodedPlan("MATCH (g:guard) WHERE " + predicate + " RETURN g.id;");
     };
@@ -355,6 +362,12 @@ TEST_F(OptimizerTest, IndexScanCostGuard) {
     ASSERT_STREQ(plan("g.flag = 1").c_str(), "Filter()S(g)");
     ASSERT_STREQ(plan("g.flag IN [1]").c_str(), "Filter()S(g)");
     ASSERT_STREQ(plan("g.id IN range(1, 5000)").c_str(), "Filter()S(g)");
+    // Literal keys are counted in the index rather than estimated from an average.
+    ASSERT_STREQ(plan("g.skew = 7").c_str(), "IndexScan(g)");
+    ASSERT_STREQ(plan("g.skew IN [7, 9]").c_str(), "IndexScan(g)");
+    ASSERT_STREQ(plan("g.skew = 0").c_str(), "Filter()S(g)");
+    ASSERT_STREQ(plan("g.skew IN [0, 7]").c_str(), "Filter()S(g)");
+    ASSERT_STREQ(plan("g.st = 1").c_str(), "Filter()S(g)");
 }
 
 TEST_F(OptimizerTest, IndexScanCostGuardCountsUncommittedRows) {

@@ -185,6 +185,8 @@ struct PlannerKnobs {
     static constexpr double INDEX_ROW_FETCH_COST = 250;
     // A secondary ART lookup also checks every uncommitted row of the transaction.
     static constexpr double UNCOMMITTED_ROW_MATCH_COST = 75;
+    // Literal keys whose index entries are counted when costing a secondary index lookup.
+    static constexpr uint64_t MAX_PROBED_INDEX_KEYS = 64;
     static constexpr double SCAN_STARTUP_COST = 1000000;
     static constexpr double SCAN_ROW_COST = 20;
 };

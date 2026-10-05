@@ -893,50 +893,59 @@ void ArtPrimaryKeyIndex::delete_(transaction::Transaction* transaction,
     }
 }
 
+std::optional<std::vector<offset_t>> ArtPrimaryKeyIndex::findDiskLeafOffsets(
+    const ArtKey& key) const {
+    if (key.empty()) {
+        return std::nullopt;
+    }
+    DASSERT(diskFileHandle != nullptr);
+    ArtPageRangeReader reader{*diskFileHandle, diskTreePageRange, diskTreeSize};
+    auto depth = 0u;
+    const auto& bytes = key.getBytes();
+    while (true) {
+        auto header = readArtDiskNodeHeader(reader);
+        const auto prefixMatch = matchPrefix(header.prefix, bytes, depth);
+        if (prefixMatch != header.prefix.size()) {
+            return std::nullopt;
+        }
+        depth += header.prefix.size();
+        if (depth == bytes.size()) {
+            return std::move(header.offsets);
+        }
+        const auto edge = bytes[depth++];
+        auto found = false;
+        for (auto i = 0u; i < header.numChildren; ++i) {
+            uint8_t byte = 0;
+            reader.read(&byte, 1);
+            uint64_t childSize = 0;
+            reader.read(reinterpret_cast<uint8_t*>(&childSize), sizeof(childSize));
+            if (byte == edge) {
+                found = true;
+                break;
+            }
+            reader.skip(childSize);
+        }
+        if (!found) {
+            return std::nullopt;
+        }
+    }
+}
+
 bool ArtPrimaryKeyIndex::lookupAll(const transaction::Transaction*, ValueVector* keyVector,
     uint64_t vectorPos, std::vector<offset_t>& results, visible_func isVisible) {
     std::lock_guard lck{mutex};
     const auto key = ArtKey::encode(keyVector, vectorPos);
     if (diskBacked) {
-        if (key.empty()) {
+        const auto offsets = findDiskLeafOffsets(key);
+        if (!offsets.has_value()) {
             return false;
         }
-        DASSERT(diskFileHandle != nullptr);
-        ArtPageRangeReader reader{*diskFileHandle, diskTreePageRange, diskTreeSize};
-        auto depth = 0u;
-        const auto& bytes = key.getBytes();
-        while (true) {
-            const auto header = readArtDiskNodeHeader(reader);
-            const auto prefixMatch = matchPrefix(header.prefix, bytes, depth);
-            if (prefixMatch != header.prefix.size()) {
-                return false;
-            }
-            depth += header.prefix.size();
-            if (depth == bytes.size()) {
-                for (const auto offset : header.offsets) {
-                    if (isVisible(offset)) {
-                        results.push_back(offset);
-                    }
-                }
-                return !results.empty();
-            }
-            const auto edge = bytes[depth++];
-            auto found = false;
-            for (auto i = 0u; i < header.numChildren; ++i) {
-                uint8_t byte = 0;
-                reader.read(&byte, 1);
-                uint64_t childSize = 0;
-                reader.read(reinterpret_cast<uint8_t*>(&childSize), sizeof(childSize));
-                if (byte == edge) {
-                    found = true;
-                    break;
-                }
-                reader.skip(childSize);
-            }
-            if (!found) {
-                return false;
+        for (const auto offset : *offsets) {
+            if (isVisible(offset)) {
+                results.push_back(offset);
             }
         }
+        return !results.empty();
     }
     const auto* node = findLeaf(key);
     if (node == nullptr) {
@@ -944,6 +953,21 @@ bool ArtPrimaryKeyIndex::lookupAll(const transaction::Transaction*, ValueVector*
     }
     appendVisibleOffsets(*node, results, std::move(isVisible));
     return !results.empty();
+}
+
+std::optional<uint64_t> ArtPrimaryKeyIndex::countKey(ValueVector* keyVector, uint64_t vectorPos) {
+    std::lock_guard lck{mutex};
+    const auto key = ArtKey::encode(keyVector, vectorPos);
+    if (diskBacked) {
+        const auto offsets = findDiskLeafOffsets(key);
+        return offsets.has_value() ? offsets->size() : 0;
+    }
+    const auto* node = findLeaf(key);
+    if (node == nullptr) {
+        return 0;
+    }
+    return (node->offset.has_value() ? 1 : 0) +
+           (node->overflowOffsets ? node->overflowOffsets->size() : 0);
 }
 
 static int compareKeys(const std::vector<uint8_t>& left, const std::vector<uint8_t>& right) {

@@ -164,6 +164,12 @@ public:
         std::vector<common::offset_t>& /*results*/, visible_func /*isVisible*/) {
         return false;
     }
+    // Number of index entries stored under the key, ignoring visibility, or nullopt if the index
+    // can't tell.
+    virtual std::optional<uint64_t> countKey(common::ValueVector* /*keyVector*/,
+        uint64_t /*vectorPos*/) {
+        return std::nullopt;
+    }
     virtual bool scanPrimaryKeyRange(common::ValueVector* /*lowerBoundVector*/,
         uint64_t /*lowerBoundPos*/, bool /*lowerInclusive*/,
         common::ValueVector* /*upperBoundVector*/, uint64_t /*upperBoundPos*/,
