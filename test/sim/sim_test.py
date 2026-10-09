@@ -31,12 +31,18 @@ from hypothesis.stateful import RuleBasedStateMachine, initialize, invariant, pr
 
 INT64_MIN, INT64_MAX = -(2**63), 2**63 - 1
 SKIPPED_RULES = set(os.environ.get("SIM_SKIP_RULES", "").split(","))
+# Semicolon-separated statements run after every open, e.g. "LOAD EXTENSION fts;LOAD EXTENSION vector".
+# Enables the Doc table with full-text and vector index rules.
+EXTENSION_LOADS = [q for q in os.environ.get("SIM_EXTENSIONS", "").split(";") if q]
 SMALL_IDS = st.integers(0, 40)
 BULK_ID_START = 1_000_000
 MACROS = st.integers(0, 3)
 TABLES = st.integers(0, 2)
 EXTRA_COLUMNS = st.sampled_from(["c0", "c1"])
 CLUSTERS = st.integers(1, 3)
+WORDS = ["apple", "grape", "melon", "lemon", "mango", "peach"]
+doc_words = st.lists(st.sampled_from(WORDS), min_size=1, max_size=4)
+embeddings = st.tuples(*[st.integers(-3, 3)] * 3).filter(any)
 
 ints = st.one_of(
     st.none(),
@@ -63,6 +69,15 @@ STATE_QUERIES = [
 
 def enabled(name):
     return precondition(lambda self: name not in SKIPPED_RULES and self.engine is not None)
+
+
+def with_extensions(name):
+    return precondition(lambda self: EXTENSION_LOADS and name not in SKIPPED_RULES and self.engine is not None)
+
+
+def cosine_distance(a, b):
+    dot = sum(x * y for x, y in zip(a, b))
+    return 1 - dot / (math.sqrt(sum(x * x for x in a)) * math.sqrt(sum(y * y for y in b)))
 
 
 class EngineError(Exception):
@@ -114,6 +129,8 @@ def worker_main(pipe, path, config):
     try:
         db = lb.Database(path, **config)
         conns = [lb.Connection(db), lb.Connection(db, num_threads=1)]
+        for query in EXTENSION_LOADS:
+            conns[0].execute(query)
     except Exception as e:
         pipe.send(("error", f"open failed: {e}"))
         return
@@ -210,11 +227,15 @@ class LadybugSim(RuleBasedStateMachine):
         self.tables = {}
         self.partitioned = {}
         self.pk_index = "_PK"
+        self.docs = {}
+        self.doc_indexes = set()
         self.next_bulk_id = BULK_ID_START
         self.engine = Engine(self.path, self.config)
         self.ok("CREATE NODE TABLE Person(id INT64 PRIMARY KEY, name STRING, age INT64, score DOUBLE)")
         self.ok("CREATE REL TABLE Knows(FROM Person TO Person, since INT64)")
         self.ok("CREATE NODE TABLE L(id INT64, cluster INT64, PRIMARY KEY(id)) PARTITION BY LIST (cluster)")
+        if EXTENSION_LOADS:
+            self.ok("CREATE NODE TABLE Doc(id INT64 PRIMARY KEY, text STRING, emb FLOAT[3])")
 
     def teardown(self):
         if self.engine:
@@ -340,6 +361,94 @@ class LadybugSim(RuleBasedStateMachine):
     def delete_partitioned(self, id):
         self.ok("MATCH (n:L {id: $id}) DELETE n", dict(id=id))
         self.partitioned.pop(id, None)
+
+    @with_extensions("docs")
+    @rule(id=SMALL_IDS, words=doc_words, emb=embeddings)
+    def insert_doc(self, id, words, emb):
+        params = dict(id=id, text=" ".join(words), emb=list(emb))
+        query = "CREATE (:Doc {id: $id, text: $text, emb: $emb})"
+        if id in self.docs:
+            self.fails(query, params)
+            return
+        self.ok(query, params)
+        self.docs[id] = (words, emb)
+
+    @with_extensions("docs")
+    @rule(id=SMALL_IDS, words=doc_words)
+    def update_doc_text(self, id, words):
+        self.ok("MATCH (d:Doc {id: $id}) SET d.text = $text", dict(id=id, text=" ".join(words)))
+        if id in self.docs:
+            self.docs[id] = (words, self.docs[id][1])
+
+    @with_extensions("docs")
+    @rule(id=SMALL_IDS, emb=embeddings)
+    def update_doc_emb(self, id, emb):
+        self.ok("MATCH (d:Doc {id: $id}) SET d.emb = $emb", dict(id=id, emb=list(emb)))
+        if id in self.docs:
+            self.docs[id] = (self.docs[id][0], emb)
+
+    @with_extensions("docs")
+    @rule(id=SMALL_IDS)
+    def delete_doc(self, id):
+        self.ok("MATCH (d:Doc {id: $id}) DELETE d", dict(id=id))
+        self.docs.pop(id, None)
+
+    @with_extensions("fts")
+    @rule()
+    def create_fts_index(self):
+        query = "CALL CREATE_FTS_INDEX('Doc', 'doc_fts', ['text'])"
+        if "doc_fts" in self.doc_indexes:
+            self.fails(query)
+            return
+        self.ok(query)
+        self.doc_indexes.add("doc_fts")
+
+    @with_extensions("fts")
+    @rule()
+    def drop_fts_index(self):
+        query = "CALL DROP_FTS_INDEX('Doc', 'doc_fts')"
+        if "doc_fts" not in self.doc_indexes:
+            self.fails(query)
+            return
+        self.ok(query)
+        self.doc_indexes.discard("doc_fts")
+
+    @with_extensions("vector")
+    @rule()
+    def create_vector_index(self):
+        query = "CALL CREATE_VECTOR_INDEX('Doc', 'doc_vec', 'emb')"
+        if "doc_vec" in self.doc_indexes:
+            self.fails(query)
+            return
+        self.ok(query)
+        self.doc_indexes.add("doc_vec")
+
+    @with_extensions("vector")
+    @rule()
+    def drop_vector_index(self):
+        query = "CALL DROP_VECTOR_INDEX('Doc', 'doc_vec')"
+        if "doc_vec" not in self.doc_indexes:
+            self.fails(query)
+            return
+        self.ok(query)
+        self.doc_indexes.discard("doc_vec")
+
+    @with_extensions("docs")
+    @rule(word=st.sampled_from(WORDS), other=st.sampled_from(WORDS), emb=embeddings, k=st.integers(1, 6))
+    def search_matches_model(self, word, other, emb, k):
+        if "doc_fts" in self.doc_indexes:
+            for words in ([word], [word, other]):
+                expected = [(id,) for id, (text, _) in self.docs.items() if set(words) & set(text)]
+                self.check("CALL QUERY_FTS_INDEX('Doc', 'doc_fts', $q) RETURN node.id", dict(q=" ".join(words)),
+                           expected)
+        if "doc_vec" in self.doc_indexes:
+            expected = sorted(cosine_distance(emb, e) for _, e in self.docs.values())[:k]
+            for conn in (0, 0, 1):
+                rows = self.rows("CALL QUERY_VECTOR_INDEX('Doc', 'doc_vec', $q, $k) RETURN distance",
+                                 dict(q=list(emb), k=k), conn)
+                actual = sorted(d for (d,) in rows)
+                assert len(actual) == len(expected) and all(
+                    abs(a - b) < 1e-4 for a, b in zip(actual, expected)), (emb, k, actual, expected)
 
     # Catalog
 
@@ -554,6 +663,10 @@ class LadybugSim(RuleBasedStateMachine):
         assert actual == expected, diff(actual, expected)
         actual = Counter(self.rows("MATCH (a:Person)-[k:Knows]->(b:Person) RETURN a.id, b.id, k.since"))
         assert actual == self.knows, diff(actual, self.knows)
+        if EXTENSION_LOADS:
+            actual = Counter(self.rows("MATCH (d:Doc) RETURN d.id, d.text"))
+            expected = Counter((id, " ".join(words)) for id, (words, _) in self.docs.items())
+            assert actual == expected, diff(actual, expected)
         actual = Counter(self.rows("MATCH (n:L) RETURN n.id, n.cluster"))
         assert actual == Counter(self.partitioned.items()), diff(actual, Counter(self.partitioned.items()))
 
@@ -561,17 +674,28 @@ class LadybugSim(RuleBasedStateMachine):
     def catalog_matches_model(self):
         if not self.engine:
             return
-        tables = {name for (name,) in self.rows("CALL show_tables() RETURN name") if not name.startswith("L_p")}
-        assert tables == {"Person", "Knows", "L"} | {f"T{i}" for i in self.tables}, tables
+        tables = {name for (name,) in self.rows("CALL show_tables() RETURN name")
+                  if not name.startswith(("L_p", "_")) and not name[0].isdigit()}
+        expected_tables = {"Person", "Knows", "L"} | {f"T{i}" for i in self.tables}
+        if EXTENSION_LOADS:
+            expected_tables.add("Doc")
+        assert tables == expected_tables, tables
         for i, values in self.tables.items():
             self.check(f"MATCH (t:T{i}) RETURN count(*), sum(t.v)", {}, [(len(values), sum(values) if values else None)])
         macros = {name.lower() for (name,) in self.rows("CALL show_macros() RETURN name")}
-        assert macros == {f"m{i}" for i in self.macros}, macros
+        # The FTS index owns an internal `<table id>_doc_fts_tokenize` macro, which
+        # DROP_FTS_INDEX leaves behind.
+        fts_macros = {m for m in macros if m.endswith("_doc_fts_tokenize")}
+        assert ("doc_fts" in self.doc_indexes) <= len(fts_macros) <= 1, fts_macros
+        assert macros - fts_macros == {f"m{i}" for i in self.macros}, macros
         for i, k in self.macros.items():
             self.check(f"RETURN m{i}(10)", {}, [(10 + k,)])
-        indexes = {name for table, name in self.rows("CALL show_indexes() RETURN table_name, index_name")
-                   if table == "Person"}
-        assert indexes == ({self.pk_index} if self.pk_index else set()), indexes
+        indexes = self.rows("CALL show_indexes() RETURN table_name, index_name")
+        person_indexes = {name for table, name in indexes if table == "Person"}
+        assert person_indexes == ({self.pk_index} if self.pk_index else set()), person_indexes
+        if EXTENSION_LOADS:
+            doc_indexes = {name for table, name in indexes if table == "Doc"} - {"_PK"}
+            assert doc_indexes == self.doc_indexes, doc_indexes
 
     @precondition(lambda self: self.engine is not None)
     @rule(x=st.integers(-200, 200), id=SMALL_IDS, limit=st.integers(1, 20), cluster=CLUSTERS)
