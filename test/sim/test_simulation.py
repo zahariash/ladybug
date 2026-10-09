@@ -1,6 +1,6 @@
 """Random workloads against an in-memory model of what the database should contain.
 
-Hypothesis drives random sequences of steps on one database (see the rules_*.py modules):
+Hypothesis drives random sequences of steps on one database (see rules/):
 
 - writes with edge values, transactions that commit or roll back, bulk COPY, and a partitioned
   table;

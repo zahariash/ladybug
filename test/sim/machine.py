@@ -10,10 +10,10 @@ import hypothesis.strategies as st
 from checks import Checks
 from hypothesis.stateful import RuleBasedStateMachine, initialize
 from model import Model
-from rules_catalog import CatalogRules
-from rules_data import DataRules
-from rules_durability import DurabilityRules
-from rules_extensions import ExtensionRules
+from rules.catalog import CatalogRules
+from rules.data import DataRules
+from rules.durability import DurabilityRules
+from rules.extensions import ExtensionRules
 
 SCHEMA = [
     "CREATE NODE TABLE Person(id INT64 PRIMARY KEY, name STRING, age INT64, score DOUBLE)",
