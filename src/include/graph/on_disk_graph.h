@@ -99,6 +99,7 @@ public:
     void startScan(common::offset_t beginOffset, common::offset_t endOffsetExclusive);
 
     bool next() override;
+    // Chunk exposes the first selSize rows, so next() moves the selected rows there.
     Chunk getChunk() override {
         return createChunk(std::span(&nodeIDVector->getValue<common::nodeID_t>(0),
                                nodeIDVector->getSelVectorPtr()->getSelSize()),
@@ -106,6 +107,8 @@ public:
     }
 
 private:
+    void compactSelectedRows();
+
     const main::ClientContext& context;
     const storage::NodeTable& nodeTable;
 

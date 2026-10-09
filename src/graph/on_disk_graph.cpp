@@ -1,5 +1,7 @@
 #include "graph/on_disk_graph.h"
 
+#include <cstring>
+
 #include "binder/expression/expression_util.h"
 #include "binder/expression/property_expression.h"
 #include "binder/expression_visitor.h"
@@ -366,7 +368,41 @@ bool OnDiskGraphVertexScanState::next() {
     numNodesToScan = std::min(endOffset - currentOffset, DEFAULT_VECTOR_CAPACITY);
     auto result = tableScanState->scanNext(transaction, currentOffset, numNodesToScan);
     currentOffset += result.numRows;
+    compactSelectedRows();
     return result != NODE_GROUP_SCAN_EMPTY_RESULT;
+}
+
+// Copies the slot only: string and list payloads stay where they are and remain valid.
+static void moveValue(ValueVector& vector, sel_t from, sel_t to) {
+    vector.setNull(to, vector.isNull(from));
+    // A struct slot stores its own position, so only the field values move.
+    if (vector.dataType.getPhysicalType() == PhysicalTypeID::STRUCT) {
+        for (auto& field : StructVector::getFieldVectors(&vector)) {
+            moveValue(*field, from, to);
+        }
+        return;
+    }
+    const auto numBytes = vector.getNumBytesPerValue();
+    memcpy(vector.getData() + to * numBytes, vector.getData() + from * numBytes, numBytes);
+}
+
+// Deleted rows leave gaps in the selection vector.
+void OnDiskGraphVertexScanState::compactSelectedRows() {
+    auto& selVector = propertyVectors.state->getSelVectorUnsafe();
+    if (selVector.isUnfiltered()) {
+        return;
+    }
+    for (auto i = 0u; i < selVector.getSelSize(); i++) {
+        const auto pos = selVector[i];
+        if (pos == i) {
+            continue;
+        }
+        moveValue(*nodeIDVector, pos, i);
+        for (auto& vector : propertyVectors.valueVectors) {
+            moveValue(*vector, pos, i);
+        }
+    }
+    selVector.setToUnfiltered(selVector.getSelSize());
 }
 
 } // namespace graph

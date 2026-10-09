@@ -1,3 +1,4 @@
+#include <functional>
 #include <vector>
 
 #include "api_test/private_api_test.h"
@@ -293,6 +294,61 @@ TEST_F(EmptyVertexScanTest, ScanVertexPropertiesAfterDeletionReInsert) {
         }
     }
     ASSERT_EQ(idx, 20000);
+}
+
+TEST_F(EmptyVertexScanTest, ScanVertexPropertiesAfterInterleavedDeletion) {
+    auto res = conn->query("CREATE NODE TABLE account(id INT64 PRIMARY KEY, name STRING);");
+    ASSERT_TRUE(res->isSuccess());
+    res = conn->query("UNWIND range(0, 4999) AS i CREATE (a:account {id: i, name: 'name' + "
+                      "string(i) + ' long enough to not be inlined'});");
+    ASSERT_TRUE(res->isSuccess());
+    res = conn->query("MATCH (a:account) WHERE a.id % 2 = 0 OR a.id < 10 DELETE a;");
+    ASSERT_TRUE(res->isSuccess());
+
+    const auto checkScan = [&](const std::function<bool(int64_t)>& isLive) {
+        context = getClientContext(*conn);
+        catalog = catalog::Catalog::Get(*context);
+        auto transaction = transaction::Transaction::Get(*context);
+        auto tableEntry = catalog->getTableCatalogEntry(transaction, "account");
+        graph = std::make_unique<graph::OnDiskGraph>(context,
+            graph::NativeGraphEntry({tableEntry}, {}));
+        auto scanState = graph->prepareVertexScan(tableEntry, {"id", "name"});
+        for (auto [start, end] : {std::pair<offset_t, offset_t>{0, 5000}, {1000, 4500}}) {
+            std::vector<int64_t> expected;
+            for (auto id = (int64_t)start; id < (int64_t)end; id++) {
+                if (isLive(id)) {
+                    expected.push_back(id);
+                }
+            }
+            std::vector<int64_t> actual;
+            for (auto chunk : graph->scanVertices(start, end, *scanState)) {
+                for (auto i = 0u; i < chunk.size(); i++) {
+                    auto id = chunk.getProperties<int64_t>(0)[i];
+                    ASSERT_EQ(chunk.getNodeIDs()[i].offset, (offset_t)id);
+                    ASSERT_EQ(chunk.getProperties<common::string_t>(1)[i].getAsString(),
+                        "name" + std::to_string(id) + " long enough to not be inlined");
+                    actual.push_back(id);
+                }
+            }
+            ASSERT_EQ(actual, expected);
+        }
+    };
+
+    conn->query("BEGIN TRANSACTION");
+    checkScan([](int64_t id) { return id % 2 == 1 && id >= 10; });
+    conn->query("COMMIT");
+    if (!inMemMode) {
+        res = conn->query("CHECKPOINT");
+        ASSERT_TRUE(res->isSuccess());
+        conn->query("BEGIN TRANSACTION");
+        checkScan([](int64_t id) { return id % 2 == 1 && id >= 10; });
+        conn->query("COMMIT");
+    }
+    conn->query("BEGIN TRANSACTION");
+    res = conn->query("MATCH (a:account) WHERE a.id % 3 = 0 DELETE a;");
+    ASSERT_TRUE(res->isSuccess());
+    checkScan([](int64_t id) { return id % 2 == 1 && id >= 10 && id % 3 != 0; });
+    conn->query("ROLLBACK");
 }
 
 TEST_F(EmptyVertexScanTest, ScanVertexPropertiesDuringTransaction) {
