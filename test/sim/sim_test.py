@@ -12,7 +12,8 @@ Hypothesis' example database.
 
     uv run --with hypothesis --with pytest --with ladybug pytest test/sim/sim_test.py
     SIM_EXAMPLES=500 SIM_STEPS=80 ... for longer runs
-    SIM_SKIP_RULES=drop_macro,partitions ... to turn rules off
+    SIM_SKIP_RULES=drop_macro,partitions ... to turn rules off; crash_copy, crash_create,
+    crash_delete, crash_checkpoint and race_checkpoint turn off single variants
 """
 
 import math
@@ -449,6 +450,7 @@ class LadybugSim(RuleBasedStateMachine):
     )
     def crash_during(self, op, size, delay):
         """Kills the engine while a large statement runs; recovery must see all of it or none."""
+        assume(f"crash_{op}" not in SKIPPED_RULES)
         before = {id: dict(p) for id, p in self.persons.items()}
         after = {id: dict(p) for id, p in self.persons.items()}
         knows_after = Counter(self.knows)
@@ -500,6 +502,8 @@ class LadybugSim(RuleBasedStateMachine):
         states = [self.state_of(persons, knows)]
         writes = []
         for op, id, value in ops:
+            if op == "checkpoint" and "race_checkpoint" in SKIPPED_RULES:
+                continue
             if op == "insert":
                 if id in persons:
                     continue
