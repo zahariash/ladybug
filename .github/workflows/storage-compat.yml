@@ -8,7 +8,9 @@ on:
   workflow_call:
     inputs:
       releases:
-        description: "latest: the newest release test/storage_compat/releases.py selects; all: every one"
+        description: >-
+          latest: the newest release test/storage_compat/releases.py selects; all: every one;
+          auto: all when the change touches storage, catalog or serializer code, else latest
         type: string
         default: latest
 
@@ -83,6 +85,17 @@ jobs:
         env:
           RELEASES: ${{ inputs.releases }}
         run: |
+          # Only an older release may write the format a change to storage code reads, such as
+          # the ART entry list of 0.17.
+          if [ "$RELEASES" = auto ]; then
+            storage='^src/(include/)?(storage|catalog|common/serializer)/|^test/storage_compat/'
+            if git diff --name-only HEAD^1 HEAD | grep -qE "$storage"; then
+              RELEASES=all
+            else
+              RELEASES=latest
+            fi
+            echo "Checking releases: $RELEASES"
+          fi
           args=(--lib build/release/src/liblbug.so --base-lib compat-lib/liblbug.so)
           args+=(--releases "$RELEASES")
           uv run --no-project --with pytest pytest test/storage_compat -v -rsxX "${args[@]}"
