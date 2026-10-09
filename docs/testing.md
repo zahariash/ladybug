@@ -46,7 +46,8 @@ For guidelines on writing and reviewing these tests, see [Node.js API — Testin
 
 `test/sim/` is a Hypothesis state machine that runs random workloads through the Python package
 and checks the database against an in-memory model of what it should contain. Steps cover writes
-with edge values, transactions, bulk `COPY`, a partitioned table, DDL (macros, tables,
+with edge values, transactions (with DDL, ending in commit, rollback or a crash), bulk `COPY`
+of nodes and edges, a partitioned table, DDL (macros, tables,
 `ALTER TABLE`, the primary-key index, and with `--sim-extensions` full-text and vector indexes),
 checkpoints, reopens, crashes between and in the middle of statements, and writes racing
 concurrent readers. The database runs in a worker process, so a crash is a SIGKILL followed by

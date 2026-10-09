@@ -2,8 +2,9 @@
 
 Hypothesis drives random sequences of steps on one database (see rules/):
 
-- writes with edge values, transactions that commit or roll back, bulk COPY, and a partitioned
-  table;
+- writes with edge values, bulk COPY of nodes and edges, and a partitioned table;
+- transactions with writes and DDL that commit, roll back or crash, and must see their own
+  writes; a statement that fails midway, which must leave nothing behind;
 - DDL: macros, tables, ALTER TABLE ADD/DROP, Person's primary-key index, and with
   --sim-extensions full-text and vector indexes;
 - checkpoints, clean reopens, crashes between statements, and crashes in the middle of a large

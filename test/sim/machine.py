@@ -14,6 +14,7 @@ from rules.catalog import CatalogRules
 from rules.data import DataRules
 from rules.durability import DurabilityRules
 from rules.extensions import ExtensionRules
+from rules.transactions import TransactionRules
 from search import SearchChecks
 
 SCHEMA = [
@@ -26,6 +27,7 @@ EXTENSION_SCHEMA = ["CREATE NODE TABLE Doc(id INT64 PRIMARY KEY, text STRING, em
 
 class LadybugSim(
     DataRules,
+    TransactionRules,
     CatalogRules,
     ExtensionRules,
     DurabilityRules,

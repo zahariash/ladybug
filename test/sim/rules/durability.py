@@ -117,17 +117,11 @@ class DurabilityRules(Session):
         if "race_checkpoint" in self.options.skipped:
             # Empties the WAL, so that the race's writes cannot trigger an automatic checkpoint.
             self.ok("CHECKPOINT")
-        # Races write only small ids, so only those rows are copied; bulk rows are shared.
-        persons = {id: dict(p) for id, p in self.model.persons.items() if id < BULK_ID_START}
-        model = Model(
-            columns=self.model.columns,
-            persons={**self.model.persons, **persons},
-            knows=copy.copy(self.model.knows),
-        )
+        model = self.model.fork()
         writes, states = self.race_writes(model, ops)
         self.check_race(writes, STATE_QUERIES, states, num_readers)
-        self.model.persons, self.model.knows = model.persons, model.knows
-        self.model.persons_ever = self.model.persons_ever or bool(model.persons)
+        model.persons_ever = model.persons_ever or bool(model.persons)
+        self.model = model
 
     def race_writes(self, model: Model, ops: list) -> tuple[list, list]:
         """The statements for `ops`, applied to `model`, and the state after each of them."""

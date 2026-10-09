@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import NamedTuple
 
 from strategies import BULK_ID_START
@@ -60,6 +60,27 @@ class Model:
         self.persons.pop(id, None)
         for key in [k for k in self.knows if id in (k[0], k[1])]:
             del self.knows[key]
+
+    def set_since(self, src: int, dst: int, since) -> None:
+        """SET k.since on every Knows edge from src to dst."""
+        count = sum(n for (s, d, _), n in self.knows.items() if (s, d) == (src, dst))
+        for key in [k for k in self.knows if k[:2] == (src, dst)]:
+            del self.knows[key]
+        if count:
+            self.knows[(src, dst, since)] += count
+
+    def fork(self) -> Model:
+        """A copy that transactions and races can change. They write only small ids, Knows,
+        macros and T tables, so bulk rows and docs are shared, not copied."""
+        persons = {id: dict(p) if id < BULK_ID_START else p for id, p in self.persons.items()}
+        return replace(
+            self,
+            columns=dict(self.columns),
+            persons=persons,
+            knows=Counter(self.knows),
+            macros=dict(self.macros),
+            tables={i: list(values) for i, values in self.tables.items()},
+        )
 
     def take_bulk_ids(self, count: int) -> range:
         ids = range(self.next_bulk_id, self.next_bulk_id + count)

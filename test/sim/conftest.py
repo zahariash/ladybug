@@ -12,6 +12,8 @@ FOCUS = {
         "persons",
         "bulk_copy",
         "transaction",
+        "atomic_statement",
+        "knows",
         "partitions",
         "macros",
         "tables",

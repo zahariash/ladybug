@@ -1,11 +1,12 @@
-"""Rules that write data: persons, Knows edges, bulk COPY, transactions, the partitioned table."""
+"""Rules that write data: persons, Knows edges, bulk COPY, the partitioned table."""
 
 from __future__ import annotations
 
 import os
+import tempfile
 
 import hypothesis.strategies as st
-from hypothesis.stateful import rule
+from hypothesis.stateful import precondition, rule
 from engine import EngineError
 from session import DUPLICATE_KEY, Session, enabled
 from strategies import clusters, csv_names, doubles, ints, names, small_ids
@@ -40,10 +41,8 @@ class DataRules(Session):
         self.model.forget(id)
 
     @enabled("persons")
-    @rule(src=small_ids, offset=st.integers(1, 40), since=ints)
-    def insert_knows(self, src, offset, since):
-        # No self-loops: they would make the 2-hop count depend on the path semantics.
-        dst = (src + offset) % 41
+    @rule(src=small_ids, dst=small_ids, since=ints)
+    def insert_knows(self, src, dst, since):
         self.ok(
             "MATCH (a:Person {id: $a}), (b:Person {id: $b}) CREATE (a)-[:Knows {since: $s}]->(b)",
             dict(a=src, b=dst, s=since),
@@ -60,6 +59,37 @@ class DataRules(Session):
         )
         for key in [k for k in self.model.knows if k[:2] == (src, dst)]:
             del self.model.knows[key]
+
+    @enabled("knows")
+    @rule(src=small_ids, dst=small_ids, since=ints)
+    def update_knows(self, src, dst, since):
+        self.ok(
+            "MATCH (a:Person {id: $a})-[k:Knows]->(b:Person {id: $b}) SET k.since = $s",
+            dict(a=src, b=dst, s=since),
+        )
+        self.model.set_since(src, dst, since)
+
+    @enabled("knows")
+    @precondition(lambda self: self.model.persons)
+    @rule(data=st.data(), count=st.integers(1, 200), missing=st.booleans())
+    def copy_knows(self, data, count, missing):
+        """COPYs edges between existing persons; with an unknown endpoint the whole COPY
+        fails and adds nothing."""
+        ids = st.sampled_from(sorted(self.model.persons))
+        edges = [
+            (data.draw(ids), data.draw(ids), data.draw(st.one_of(st.none(), ints)))
+            for _ in range(count)
+        ]
+        if missing:
+            edges.insert(data.draw(st.integers(0, count)), (edges[0][0], -1, 0))
+        fd, csv = tempfile.mkstemp(suffix=".csv", dir=self.dir)
+        with os.fdopen(fd, "w") as f:
+            f.writelines(f"{s},{d},{'' if v is None else v}\n" for s, d, v in edges)
+        if missing:
+            self.fails(f'COPY Knows FROM "{csv}"', None, "Unable to find primary key value -1")
+            return
+        self.ok(f'COPY Knows FROM "{csv}"')
+        self.model.knows.update(edges)
 
     def write_bulk_csv(self, rows: list[tuple[str, int]]) -> tuple[str, dict]:
         """Writes rows of (name, age) with fresh ids; returns the file and the new persons."""
@@ -91,18 +121,6 @@ class DataRules(Session):
         else:
             self.ok(query)
         self.model.add_persons(added)
-
-    @enabled("transaction")
-    @rule(id=small_ids, age=ints, commit=st.booleans())
-    def transaction(self, id, age, commit):
-        self.ok("BEGIN TRANSACTION")
-        self.ok("MATCH (p:Person {id: $id}) SET p.age = $v", dict(id=id, v=age))
-        self.ok("MATCH (p:Person {id: $id}) DETACH DELETE p", dict(id=id + 1))
-        self.ok("COMMIT" if commit else "ROLLBACK")
-        if commit:
-            if id in self.model.persons:
-                self.model.persons[id]["age"] = age
-            self.model.forget(id + 1)
 
     @enabled("partitions")
     @rule(id=small_ids, cluster=clusters)
