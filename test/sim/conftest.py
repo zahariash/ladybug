@@ -5,6 +5,22 @@ from hypothesis import HealthCheck, settings
 from known import KNOWN_BUGS, known_rules
 from session import Options
 
+# Rule groups each focus turns off.
+FOCUS = {
+    "extensions": {
+        "persons",
+        "bulk_copy",
+        "transaction",
+        "partitions",
+        "macros",
+        "tables",
+        "columns",
+        "pk_index",
+        "race",
+        "crash_during",
+    },
+}
+
 
 def pytest_addoption(parser) -> None:
     group = parser.getgroup("sim", "workload simulation")
@@ -17,6 +33,11 @@ def pytest_addoption(parser) -> None:
         "--sim-known", action="store_true", help="also run the rules that hit known.py's bugs"
     )
     group.addoption(
+        "--sim-focus",
+        choices=sorted(FOCUS),
+        help="turn off the rules outside one area; checkpoints, reopens and crashes stay on",
+    )
+    group.addoption(
         "--sim-extensions",
         default="",
         help='statements that load extensions, separated by ";", e.g. '
@@ -27,6 +48,8 @@ def pytest_addoption(parser) -> None:
 @pytest.fixture(scope="session")
 def sim_options(pytestconfig) -> Options:
     skipped = set(pytestconfig.getoption("sim_skip"))
+    if pytestconfig.getoption("sim_focus"):
+        skipped |= FOCUS[pytestconfig.getoption("sim_focus")]
     if not pytestconfig.getoption("sim_known"):
         skipped |= known_rules()
     loads = [q for q in pytestconfig.getoption("sim_extensions").split(";") if q.strip()]

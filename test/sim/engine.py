@@ -10,26 +10,21 @@ from __future__ import annotations
 import multiprocessing
 import threading
 
-# The committed state a reader sees, read in one read-only transaction (see race).
-STATE_QUERIES = [
-    "MATCH (p:Person) RETURN count(*), sum(p.id), count(p.age)",
-    "MATCH (:Person)-[k:Knows]->(:Person) RETURN count(*)",
-]
-
 
 class EngineError(Exception):
     """A statement failed in the engine."""
 
 
-def read_state(conn) -> tuple:
+def read_state(conn, queries: list[str]) -> tuple:
+    """The sorted rows of each query, read in one read-only transaction."""
     conn.execute("BEGIN TRANSACTION READ ONLY")
-    state = tuple(tuple(conn.execute(q).get_all()[0]) for q in STATE_QUERIES)
+    state = tuple(tuple(sorted(map(tuple, conn.execute(q).get_all()))) for q in queries)
     conn.execute("COMMIT")
     return state
 
 
-def race(db, connect, writer, writes: list, num_readers: int) -> tuple[list, list]:
-    """Runs `writes` on `writer` while readers repeatedly read the state; returns every state
+def race(db, connect, writer, writes: list, queries: list[str], num_readers: int) -> tuple:
+    """Runs `writes` on `writer` while readers repeatedly read `queries`; returns every state
     each reader saw and the errors of the writer and the readers."""
     done = threading.Event()
     observations = [[] for _ in range(num_readers)]
@@ -39,8 +34,8 @@ def race(db, connect, writer, writes: list, num_readers: int) -> tuple[list, lis
         conn = connect(db)
         try:
             while not done.is_set():
-                out.append(read_state(conn))
-            out.append(read_state(conn))
+                out.append(read_state(conn, queries))
+            out.append(read_state(conn, queries))
         except Exception as e:
             errors.append(f"reader: {e}")
         finally:
@@ -63,7 +58,7 @@ def race(db, connect, writer, writes: list, num_readers: int) -> tuple[list, lis
 
 def worker_main(pipe, path: str, config: dict, loads: list[str]) -> None:
     """Opens the database with `config`, runs `loads` and serves requests until closed:
-    (connection, query, params), ("race", writes, readers), or None to close."""
+    (connection, query, params), ("race", writes, queries, readers), or None to close."""
     import ladybug as lb
 
     try:
@@ -84,8 +79,8 @@ def worker_main(pipe, path: str, config: dict, loads: list[str]) -> None:
             pipe.send(("ok", None))
             return
         if message[0] == "race":
-            _, writes, num_readers = message
-            pipe.send(("ok", race(db, lb.Connection, conns[0], writes, num_readers)))
+            _, writes, queries, num_readers = message
+            pipe.send(("ok", race(db, lb.Connection, conns[0], writes, queries, num_readers)))
             continue
         conn, query, params = message
         try:
@@ -105,6 +100,8 @@ class Engine:
             target=worker_main, args=(child, path, config, loads), daemon=True
         )
         self.process.start()
+        # Without closing its copy of the worker's end, a dead worker never reads as EOF.
+        child.close()
         self.reply()
 
     def execute(self, query: str, params: dict, conn: int = 0) -> list:
@@ -115,8 +112,8 @@ class Engine:
         """Sends a statement without waiting for it, to kill the worker while it runs."""
         self.pipe.send((0, query, {}))
 
-    def race(self, writes: list, num_readers: int) -> tuple[list, list]:
-        self.pipe.send(("race", writes, num_readers))
+    def race(self, writes: list, queries: list[str], num_readers: int) -> tuple[list, list]:
+        self.pipe.send(("race", writes, queries, num_readers))
         return self.reply()
 
     def reply(self):

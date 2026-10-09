@@ -31,6 +31,15 @@ KNOWN_BUGS = [
     ),
     Known("pk_index", "a crash undoes DROP INDEX"),
     Known("crash_create", "a kill mid-write can leave a WAL that fails its checksum on reopen"),
+    Known(
+        "drop_doc_index",
+        "a crash after DROP_FTS_INDEX or DROP_VECTOR_INDEX leaves Doc unwritable, or segfaulting",
+    ),
+    Known("dotproduct", "dotproduct vector indexes return the least similar vectors first"),
+    Known(
+        "vector_recall",
+        "#1023: inserts after CREATE_VECTOR_INDEX pick neighbours by cosine whatever the metric",
+    ),
 ]
 
 

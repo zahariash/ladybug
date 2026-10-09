@@ -24,8 +24,8 @@ class Model:
     tables: dict = field(default_factory=dict)  # i -> values of T{i}.v
     partitioned: dict = field(default_factory=dict)  # id -> cluster, in L
     pk_index: str | None = "_PK"  # the name of Person's primary-key index, if any
-    docs: dict = field(default_factory=dict)  # id -> (words, embedding)
-    doc_indexes: set = field(default_factory=set)  # "doc_fts", "doc_vec"
+    docs: dict = field(default_factory=dict)  # id -> (words or None, embedding or None)
+    doc_indexes: dict = field(default_factory=dict)  # "doc_fts"/"doc_vec" -> option value
     next_bulk_id: int = BULK_ID_START
 
     def new_person(self, **values) -> dict:
@@ -46,7 +46,7 @@ class Model:
         return Counter(canonical((id, *p.values())) for id, p in self.persons.items())
 
     def state(self) -> tuple:
-        """What engine.STATE_QUERIES return for this model."""
+        """What engine.read_state returns for rules.durability.STATE_QUERIES."""
         ages = [p["age"] for p in self.persons.values() if p["age"] is not None]
         persons = (len(self.persons), sum(self.persons) if self.persons else None, len(ages))
-        return persons, (sum(self.knows.values()),)
+        return (persons,), ((sum(self.knows.values()),),)

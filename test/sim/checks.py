@@ -33,7 +33,7 @@ class Checks(Session):
         assert actual == expected, diff(actual, expected)
         if self.options.extensions:
             docs = self.model.docs.items()
-            expected = Counter((id, " ".join(words)) for id, (words, _) in docs)
+            expected = Counter((id, words and " ".join(words)) for id, (words, _) in docs)
             actual = Counter(self.rows("MATCH (d:Doc) RETURN d.id, d.text"))
             assert actual == expected, diff(actual, expected)
 
@@ -56,14 +56,15 @@ class Checks(Session):
         assert person == ({self.model.pk_index} - {None}), person
         if self.options.extensions:
             docs = {name for table, name in indexes if table == "Doc"} - {"_PK"}
-            assert docs == self.model.doc_indexes, docs
+            assert docs == set(self.model.doc_indexes), docs
 
     def check_macros(self) -> None:
         macros = {name.lower() for (name,) in self.rows("CALL show_macros() RETURN name")}
-        # The FTS index owns an internal `<table id>_doc_fts_tokenize` macro, which
+        # Each FTS index owns an internal `<table id>_<index>_tokenize` macro, which
         # DROP_FTS_INDEX leaves behind.
-        fts = {macro for macro in macros if macro.endswith("_doc_fts_tokenize")}
-        assert ("doc_fts" in self.model.doc_indexes) <= len(fts) <= 1, fts
+        fts = {macro for macro in macros if macro.endswith("_tokenize")}
+        if "doc_fts" in self.model.doc_indexes:
+            assert any(macro.endswith("_doc_fts_tokenize") for macro in fts), fts
         assert macros - fts == {f"m{i}" for i in self.model.macros}, macros
         for i, k in self.model.macros.items():
             self.check(f"RETURN m{i}(10)", {}, [(10 + k,)])

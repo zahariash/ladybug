@@ -12,6 +12,7 @@ from strategies import clusters, csv_names, doubles, ints, names, small_ids
 
 
 class DataRules(Session):
+    @enabled("persons")
     @rule(id=small_ids, name=names, age=ints, score=doubles)
     def insert_person(self, id, name, age, score):
         params = dict(id=id, name=name, age=age, score=score)
@@ -22,6 +23,7 @@ class DataRules(Session):
         self.ok(query, params)
         self.model.persons[id] = self.model.new_person(name=name, age=age, score=score)
 
+    @enabled("persons")
     @rule(id=small_ids, field=st.sampled_from(["name", "age", "score"]), data=st.data())
     def update_person(self, id, field, data):
         value = data.draw({"name": names, "age": ints, "score": doubles}[field])
@@ -29,11 +31,13 @@ class DataRules(Session):
         if id in self.model.persons:
             self.model.persons[id][field] = value
 
+    @enabled("persons")
     @rule(id=small_ids)
     def delete_person(self, id):
         self.ok("MATCH (p:Person {id: $id}) DETACH DELETE p", dict(id=id))
         self.model.forget(id)
 
+    @enabled("persons")
     @rule(src=small_ids, dst=small_ids, since=ints)
     def insert_knows(self, src, dst, since):
         # Self-loops would make the 2-hop count depend on the path semantics.
@@ -45,6 +49,7 @@ class DataRules(Session):
         if src in self.model.persons and dst in self.model.persons:
             self.model.knows[(src, dst, since)] += 1
 
+    @enabled("persons")
     @rule(src=small_ids, dst=small_ids)
     def delete_knows(self, src, dst):
         self.ok(
@@ -66,6 +71,7 @@ class DataRules(Session):
                 f.write(",".join([str(id), *values]) + "\n")
         return csv, added
 
+    @enabled("bulk_copy")
     @rule(rows=st.lists(st.tuples(csv_names, st.integers(-1000, 1000)), min_size=1, max_size=3000))
     def bulk_copy(self, rows):
         csv, added = self.write_bulk_csv(rows)
@@ -76,6 +82,7 @@ class DataRules(Session):
         self.ok(f'COPY Person FROM "{csv}"')
         self.model.persons.update(added)
 
+    @enabled("transaction")
     @rule(id=small_ids, age=ints, commit=st.booleans())
     def transaction(self, id, age, commit):
         self.ok("BEGIN TRANSACTION")

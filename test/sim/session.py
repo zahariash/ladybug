@@ -74,6 +74,21 @@ class Session:
             same = actual == expected if ordered else Counter(actual) == Counter(expected)
             assert same, (query, params, conn, actual, expected)
 
+    def check_race(self, writes: list, queries: list[str], states: list, num_readers: int) -> None:
+        """Runs `writes` against readers of `queries`; every read must be one of `states`, the
+        committed state after each write, and no reader may go back to an earlier one."""
+        observations, errors = self.engine.race(writes, queries, num_readers)
+        assert not errors, errors
+        for reader in observations:
+            position = 0
+            for seen in reader:
+                matches = [i for i in range(position, len(states)) if states[i] == seen]
+                assert matches, (
+                    f"a reader saw {seen}, which is not a committed state at or after "
+                    f"step {position}: {states}"
+                )
+                position = matches[0]
+
     def person_rows(self) -> Counter:
         columns = "".join(f", p.{column}" for column in self.model.columns)
         return Counter(self.rows(f"MATCH (p:Person) RETURN p.id{columns}"))

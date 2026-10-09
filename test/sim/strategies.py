@@ -31,6 +31,10 @@ names = st.one_of(
 )
 csv_names = st.text("abcdefghijklmnopqrstuvwxyz ", min_size=1, max_size=20)
 
+# Plain words, case and Unicode variants, and stopwords, which full-text queries never match.
 WORDS = ["apple", "grape", "melon", "lemon", "mango", "peach"]
-doc_words = st.lists(st.sampled_from(WORDS), min_size=1, max_size=4)
-embeddings = st.tuples(*[st.integers(-3, 3)] * 3).filter(any)
+HARD_WORDS = ["Apples", "GRAPE", "café", "Straße", "日本語", "naïve"]
+STOPWORDS = ["the", "and", "of"]
+ALL_WORDS = WORDS + HARD_WORDS + STOPWORDS
+doc_words = st.one_of(st.none(), st.lists(st.sampled_from(ALL_WORDS), min_size=1, max_size=5))
+embeddings = st.one_of(st.none(), st.tuples(*[st.integers(-3, 3)] * 3).filter(any))

@@ -13,6 +13,11 @@ from session import Session, diff, enabled
 from strategies import BULK_ID_START, small_ids
 
 RACE_OPS = ["insert", "delete", "set_age", "clear_age", "checkpoint"]
+# The committed state a racing reader sees (see engine.read_state and Model.state).
+STATE_QUERIES = [
+    "MATCH (p:Person) RETURN count(*), sum(p.id), count(p.age)",
+    "MATCH (:Person)-[k:Knows]->(:Person) RETURN count(*)",
+]
 
 
 class DurabilityRules(Session):
@@ -90,17 +95,7 @@ class DurabilityRules(Session):
             assume(self.config["checkpoint_threshold"] != 0)
         model = copy.deepcopy(self.model)
         writes, states = self.race_writes(model, ops)
-        observations, errors = self.engine.race(writes, num_readers)
-        assert not errors, errors
-        for reader in observations:
-            position = 0
-            for seen in reader:
-                matches = [i for i in range(position, len(states)) if states[i] == seen]
-                assert matches, (
-                    f"a reader saw {seen}, which is not a committed state at or after "
-                    f"step {position}: {states}"
-                )
-                position = matches[0]
+        self.check_race(writes, STATE_QUERIES, states, num_readers)
         self.model = model
 
     def race_writes(self, model: Model, ops: list) -> tuple[list, list]:
