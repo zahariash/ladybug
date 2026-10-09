@@ -46,7 +46,7 @@ class CatalogRules(Session):
         self.ok(f"UNWIND $vs AS v CREATE (:T{i} {{v: v}})", dict(vs=values))
         self.model.tables[i] += values
 
-    @enabled("tables")
+    @enabled("drop_table")
     @rule(i=table_ids)
     def drop_table(self, i):
         if i not in self.model.tables:

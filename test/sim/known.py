@@ -35,6 +35,11 @@ KNOWN_BUGS = [
         "drop_doc_index",
         "a crash after DROP_FTS_INDEX or DROP_VECTOR_INDEX leaves Doc unwritable, or segfaulting",
     ),
+    Known(
+        "drop_table",
+        "a prepared insert reused after DROP TABLE and CREATE TABLE of the same name fails or "
+        "segfaults (prepared statements survive DDL, like #1158)",
+    ),
     Known("dotproduct", "dotproduct vector indexes return the least similar vectors first"),
     Known(
         "vector_recall",
