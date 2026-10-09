@@ -14,6 +14,7 @@ from rules.catalog import CatalogRules
 from rules.data import DataRules
 from rules.durability import DurabilityRules
 from rules.extensions import ExtensionRules
+from search import SearchChecks
 
 SCHEMA = [
     "CREATE NODE TABLE Person(id INT64 PRIMARY KEY, name STRING, age INT64, score DOUBLE)",
@@ -24,8 +25,16 @@ EXTENSION_SCHEMA = ["CREATE NODE TABLE Doc(id INT64 PRIMARY KEY, text STRING, em
 
 
 class LadybugSim(
-    DataRules, CatalogRules, ExtensionRules, DurabilityRules, Checks, RuleBasedStateMachine
+    DataRules,
+    CatalogRules,
+    ExtensionRules,
+    DurabilityRules,
+    SearchChecks,
+    Checks,
+    RuleBasedStateMachine,
 ):
+    dir = None
+
     @initialize(
         threads=st.integers(1, 8),
         compression=st.booleans(),
@@ -42,10 +51,11 @@ class LadybugSim(
         )
         self.model = Model()
         self.reopen_engine()
-        for statement in SCHEMA + (EXTENSION_SCHEMA if self.options.extensions else []):
+        for statement in SCHEMA + (EXTENSION_SCHEMA if self.options.loaded else []):
             self.ok(statement)
 
     def teardown(self):
         if self.engine:
             self.engine.kill()
+        if self.dir and not self.options.keep:
             shutil.rmtree(self.dir, ignore_errors=True)

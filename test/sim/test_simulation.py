@@ -11,15 +11,14 @@ Hypothesis drives random sequences of steps on one database (see rules/):
 - batches of writes racing readers, each of which must see committed states, in order.
 
 The database runs in a worker process (engine.py), so a crash is a SIGKILL followed by WAL
-replay and an engine segfault fails the test instead of the run. After every step the data,
-the catalog and a set of queries are checked against the model (checks.py), each query twice on
-one connection, which reuses its cached plan, and once on a single-threaded connection. Failures
+replay, and an engine segfault or hang fails the test instead of the run. After every step the
+data and the catalog are checked against the model (checks.py), and query rules compare their
+results with it four ways (Session.check): a freshly prepared statement, the same statement
+again on its cached plan, the driver's own path and a single-threaded connection. Failures
 shrink to a minimal sequence of steps, except those that depend on timing.
 
-Rules that hit the known bugs in known.py are off unless --sim-known is given.
-
-Run with: PYTHONPATH=tools/python_api/build uv run --with hypothesis --with pytest
-pytest test/sim [--sim-examples N] [--sim-steps N] [--sim-extensions "LOAD EXTENSION ..."]
+Rules that hit the known bugs in known.py are off unless --sim-known is given. See
+docs/testing.md for how to run it.
 """
 
 from __future__ import annotations

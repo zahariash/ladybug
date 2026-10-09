@@ -12,11 +12,6 @@ from strategies import clusters, small_ids
 USER_TABLES = {"Person", "Knows", "L"}
 
 
-def is_internal_table(name: str) -> bool:
-    """Partitions of L, and the tables FTS and HNSW indexes keep."""
-    return name.startswith(("L_p", "_")) or name[0].isdigit()
-
-
 class Checks(Session):
     @invariant()
     def data_matches_model(self):
@@ -31,30 +26,35 @@ class Checks(Session):
         expected = Counter(self.model.partitioned.items())
         actual = Counter(self.rows("MATCH (n:L) RETURN n.id, n.cluster"))
         assert actual == expected, diff(actual, expected)
-        if self.options.extensions:
-            docs = self.model.docs.items()
-            expected = Counter((id, words and " ".join(words)) for id, (words, _) in docs)
-            actual = Counter(self.rows("MATCH (d:Doc) RETURN d.id, d.text"))
+        for i, values in self.model.tables.items():
+            # SERIAL ids must be unique; values are compared as a multiset.
+            rows = self.rows(f"MATCH (t:T{i}) RETURN t.id, t.v")
+            assert len({id for id, _ in rows}) == len(rows), rows
+            assert Counter(v for _, v in rows) == Counter(values), (i, rows, values)
+        if self.options.loaded:
+            expected = Counter(
+                (id, doc.text, doc.emb and tuple(map(float, doc.emb)))
+                for id, doc in self.model.docs.items()
+            )
+            actual = Counter(self.rows("MATCH (d:Doc) RETURN d.id, d.text, d.emb"))
             assert actual == expected, diff(actual, expected)
 
     @invariant()
     def catalog_matches_model(self):
         if not self.engine:
             return
-        names = self.rows("CALL show_tables() RETURN name")
-        tables = {name for (name,) in names if not is_internal_table(name)}
+        # show_tables leaves out the tables FTS and HNSW indexes keep, but lists partitions.
+        names = {name for (name,) in self.rows("CALL show_tables() RETURN name")}
+        tables = {name for name in names if not name.startswith("L_p")}
         expected = USER_TABLES | {f"T{i}" for i in self.model.tables}
-        if self.options.extensions:
+        if self.options.loaded:
             expected.add("Doc")
         assert tables == expected, tables
-        for i, values in self.model.tables.items():
-            total = sum(values) if values else None
-            self.check(f"MATCH (t:T{i}) RETURN count(*), sum(t.v)", {}, [(len(values), total)])
         self.check_macros()
         indexes = self.rows("CALL show_indexes() RETURN table_name, index_name")
         person = {name for table, name in indexes if table == "Person"}
         assert person == ({self.model.pk_index} - {None}), person
-        if self.options.extensions:
+        if self.options.loaded:
             docs = {name for table, name in indexes if table == "Doc"} - {"_PK"}
             assert docs == set(self.model.doc_indexes), docs
 

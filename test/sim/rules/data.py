@@ -5,10 +5,12 @@ from __future__ import annotations
 import os
 
 import hypothesis.strategies as st
-from hypothesis import assume
 from hypothesis.stateful import rule
-from session import Session, enabled
+from engine import EngineError
+from session import DUPLICATE_KEY, Session, enabled
 from strategies import clusters, csv_names, doubles, ints, names, small_ids
+
+NO_PK_INDEX = "COPY into a non-empty primary-key node table without a hash index"
 
 
 class DataRules(Session):
@@ -18,10 +20,10 @@ class DataRules(Session):
         params = dict(id=id, name=name, age=age, score=score)
         query = "CREATE (:Person {id: $id, name: $name, age: $age, score: $score})"
         if id in self.model.persons:
-            self.fails(query, params)
+            self.fails(query, params, DUPLICATE_KEY)
             return
         self.ok(query, params)
-        self.model.persons[id] = self.model.new_person(name=name, age=age, score=score)
+        self.model.add_persons({id: self.model.new_person(name=name, age=age, score=score)})
 
     @enabled("persons")
     @rule(id=small_ids, field=st.sampled_from(["name", "age", "score"]), data=st.data())
@@ -38,10 +40,10 @@ class DataRules(Session):
         self.model.forget(id)
 
     @enabled("persons")
-    @rule(src=small_ids, dst=small_ids, since=ints)
-    def insert_knows(self, src, dst, since):
-        # Self-loops would make the 2-hop count depend on the path semantics.
-        assume(src != dst)
+    @rule(src=small_ids, offset=st.integers(1, 40), since=ints)
+    def insert_knows(self, src, offset, since):
+        # No self-loops: they would make the 2-hop count depend on the path semantics.
+        dst = (src + offset) % 41
         self.ok(
             "MATCH (a:Person {id: $a}), (b:Person {id: $b}) CREATE (a)-[:Knows {since: $s}]->(b)",
             dict(a=src, b=dst, s=since),
@@ -75,12 +77,20 @@ class DataRules(Session):
     @rule(rows=st.lists(st.tuples(csv_names, st.integers(-1000, 1000)), min_size=1, max_size=3000))
     def bulk_copy(self, rows):
         csv, added = self.write_bulk_csv(rows)
+        query = f'COPY Person FROM "{csv}"'
         if self.model.pk_index is None and self.model.persons:
-            # COPY into a non-empty table needs the primary-key index.
-            self.fails(f'COPY Person FROM "{csv}"')
+            self.fails(query, None, NO_PK_INDEX)
             return
-        self.ok(f'COPY Person FROM "{csv}"')
-        self.model.persons.update(added)
+        if self.model.pk_index is None and self.model.persons_ever:
+            # Deleted rows count as rows until they are compacted, so the COPY may be refused.
+            try:
+                self.ok(query)
+            except EngineError as e:
+                assert NO_PK_INDEX in str(e), e
+                return
+        else:
+            self.ok(query)
+        self.model.add_persons(added)
 
     @enabled("transaction")
     @rule(id=small_ids, age=ints, commit=st.booleans())
@@ -99,7 +109,7 @@ class DataRules(Session):
     def insert_partitioned(self, id, cluster):
         query = "CREATE (:L {id: $id, cluster: $c})"
         if id in self.model.partitioned:
-            self.fails(query, dict(id=id, c=cluster))
+            self.fails(query, dict(id=id, c=cluster), DUPLICATE_KEY)
             return
         self.ok(query, dict(id=id, c=cluster))
         self.model.partitioned[id] = cluster
