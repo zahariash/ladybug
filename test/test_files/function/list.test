@@ -789,6 +789,32 @@ True
 ---- 1
 
 
+-LOG ListContainsLongComputedList
+-STATEMENT MATCH (b:person) WITH collect(b.age) + range(100, 120) AS ages MATCH (a:person) WHERE (a.age + 5) IN ages RETURN a.ID ORDER BY a.ID
+---- 6
+0
+2
+5
+7
+8
+9
+-STATEMENT UNWIND [range(0, 20), range(21, 41), NULL, range(0, 20)] AS xs UNWIND range(0, 40) AS e WITH * WHERE e IN xs RETURN xs[1], count(*) ORDER BY xs[1]
+---- 2
+0|42
+21|20
+-STATEMENT UNWIND [range(0, 20), range(21, 41)] AS xs UNWIND range(10, 30) AS e RETURN xs[1], count(CASE WHEN e IN xs THEN 1 END) ORDER BY xs[1]
+---- 2
+0|11
+21|10
+-STATEMENT UNWIND [[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 30, NULL], [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, NULL, 45]] AS xs UNWIND range(25, 50) AS e WITH * WHERE e IN xs RETURN xs[17], e ORDER BY e
+---- 2
+30|30
+|45
+-STATEMENT UNWIND [['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'Bob'], ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'Greg']] AS xs UNWIND ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'Bob', 'Greg'] AS e WITH * WHERE e IN xs AND size(e) > 1 RETURN xs[17], e ORDER BY e
+---- 2
+Bob|Bob
+Greg|Greg
+
 -LOG ListContainsSelect
 -STATEMENT MATCH (a:person) WHERE list_contains(a.courseScoresPerTerm, [8]) RETURN a.ID
 ---- 2
