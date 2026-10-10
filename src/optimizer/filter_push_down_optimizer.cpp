@@ -361,19 +361,93 @@ bool FilterPushDownOptimizer::isSecondaryARTLookupCheaper(table_id_t tableID,
         numMatchedRows += static_cast<double>(numKeys - numCountedKeys) * rowsPerKey;
     }
     numMatchedRows = std::min(numRows, numMatchedRows);
-    // The ART index lacks this transaction's inserts, so each lookup also checks all of the
-    // transaction's uncommitted rows.
-    double numUncommittedRows = 0;
-    if (auto* localStorage = transaction->getLocalStorage()) {
-        if (auto* localTable = localStorage->getLocalTable(tableID)) {
-            numUncommittedRows = static_cast<double>(localTable->getNumTotalRows());
-        }
-    }
-    const auto indexCost = numKeys * PlannerKnobs::ART_INDEX_KEY_LOOKUP_COST +
-                           numMatchedRows * PlannerKnobs::INDEX_ROW_FETCH_COST +
-                           numUncommittedRows * PlannerKnobs::UNCOMMITTED_ROW_MATCH_COST;
+    const auto indexCost =
+        numKeys * PlannerKnobs::ART_INDEX_KEY_LOOKUP_COST +
+        numMatchedRows * PlannerKnobs::INDEX_ROW_FETCH_COST +
+        getNumUncommittedRows(tableID) * PlannerKnobs::UNCOMMITTED_ROW_MATCH_COST;
     return indexCost < PlannerKnobs::INDEX_SCAN_COST_MARGIN *
                            estimateScanCost(numRows, isKeyList ? numKeys : 0);
+}
+
+// The ART index lacks this transaction's inserts, so each lookup also checks all of the
+// transaction's uncommitted rows.
+double FilterPushDownOptimizer::getNumUncommittedRows(table_id_t tableID) const {
+    auto* localStorage = transaction::Transaction::Get(*context)->getLocalStorage();
+    if (localStorage == nullptr) {
+        return 0;
+    }
+    auto* localTable = localStorage->getLocalTable(tableID);
+    return localTable == nullptr ? 0 : static_cast<double>(localTable->getNumTotalRows());
+}
+
+static std::optional<Value> getRangeBoundValue(const Expression& bound) {
+    switch (bound.expressionType) {
+    case ExpressionType::LITERAL:
+        return bound.constCast<LiteralExpression>().getValue();
+    case ExpressionType::PARAMETER: {
+        auto& parameter = bound.constCast<ParameterExpression>();
+        // The index-or-scan choice depends on the bound, so the plan can't be reused for other
+        // values.
+        parameter.markBakedIntoPlan();
+        return parameter.getValue();
+    }
+    default:
+        return std::nullopt;
+    }
+}
+
+// A range bound as a single-value vector, or nullptr if its value isn't known while planning.
+static std::unique_ptr<ValueVector> evaluateRangeBound(const Expression& bound,
+    MemoryManager* memoryManager) {
+    auto value = getRangeBoundValue(bound);
+    if (!value.has_value() || value->getDataType() != bound.getDataType()) {
+        return nullptr;
+    }
+    auto vector = std::make_unique<ValueVector>(bound.getDataType().copy(), memoryManager);
+    vector->state = DataChunkState::getSingleValueDataChunkState();
+    vector->copyFromValue(0, *value);
+    return vector;
+}
+
+bool FilterPushDownOptimizer::isPrimaryKeyRangeLookupCheaper(table_id_t tableID, Index& index,
+    const PrimaryKeyRangePredicate& range) const {
+    // Without statistics, keep preferring the index.
+    auto* stats = getStorageStats(cardinalityEstimator, tableID);
+    if (stats == nullptr) {
+        return true;
+    }
+    auto* memoryManager = MemoryManager::Get(*context);
+    std::unique_ptr<ValueVector> lowerBound, upperBound;
+    if (range.lowerBound != nullptr) {
+        lowerBound = evaluateRangeBound(*range.lowerBound, memoryManager);
+        if (lowerBound == nullptr) {
+            return true;
+        }
+    }
+    if (range.upperBound != nullptr) {
+        upperBound = evaluateRangeBound(*range.upperBound, memoryManager);
+        if (upperBound == nullptr) {
+            return true;
+        }
+    }
+    const auto maxIndexCost =
+        PlannerKnobs::INDEX_SCAN_COST_MARGIN *
+        estimateScanCost(static_cast<double>(stats->getTableCard()), 0 /* numListKeys */);
+    const auto fixedCost =
+        PlannerKnobs::ART_INDEX_KEY_LOOKUP_COST +
+        getNumUncommittedRows(tableID) * PlannerKnobs::UNCOMMITTED_ROW_MATCH_COST;
+    if (fixedCost >= maxIndexCost) {
+        return false;
+    }
+    const auto maxRows =
+        static_cast<uint64_t>((maxIndexCost - fixedCost) / PlannerKnobs::INDEX_ROW_FETCH_COST);
+    if (maxRows >= PlannerKnobs::MAX_PROBED_RANGE_ENTRIES) {
+        return true;
+    }
+    std::vector<offset_t> entries;
+    index.scanPrimaryKeyRange(lowerBound.get(), 0, range.lowerInclusive, upperBound.get(), 0,
+        range.upperInclusive, maxRows + 1, entries, [](offset_t) { return true; });
+    return entries.size() <= maxRows;
 }
 
 // Number of keys in a constant key list: a literal, a parameter, or a cast of either.
@@ -520,8 +594,11 @@ std::shared_ptr<LogicalOperator> FilterPushDownOptimizer::visitScanNodeTableRepl
             scan.computeFlatSchema();
         } else if (pkIndex != nullptr && pkIndex->getIndexInfo().indexType ==
                                              storage::ArtPrimaryKeyIndex::getIndexType().typeName) {
-            auto primaryKeyRangeComparison = predicateSet.popNodePKRangeComparison(*nodeID);
-            if (primaryKeyRangeComparison.hasBound()) {
+            auto remainingPredicates = predicateSet.copy();
+            auto primaryKeyRangeComparison = remainingPredicates.popNodePKRangeComparison(*nodeID);
+            if (primaryKeyRangeComparison.hasBound() &&
+                isPrimaryKeyRangeLookupCheaper(tableIDs[0], *pkIndex, primaryKeyRangeComparison)) {
+                predicateSet = std::move(remainingPredicates);
                 auto extraInfo = std::make_unique<PrimaryKeyScanInfo>(
                     primaryKeyRangeComparison.lowerBound, primaryKeyRangeComparison.lowerInclusive,
                     primaryKeyRangeComparison.upperBound, primaryKeyRangeComparison.upperInclusive);
