@@ -4,12 +4,15 @@
 #include "binder/expression/scalar_function_expression.h"
 #include "common/enums/expression_type.h"
 #include "common/types/value/value.h"
+#include "function/boolean/vector_boolean_functions.h"
+#include "function/scalar_function.h"
 #include "planner/operator/logical_empty_result.h"
 #include "planner/operator/logical_filter.h"
 
 using namespace lbug::binder;
 using namespace lbug::common;
 using namespace lbug::planner;
+using namespace lbug::function;
 
 namespace lbug {
 namespace optimizer {
@@ -54,6 +57,34 @@ static std::shared_ptr<Expression> boolLiteral(bool v) {
 }
 
 // ---------------------------------------------------------------------------
+// Helper: build AND / OR / NOT over already-boolean children
+// ---------------------------------------------------------------------------
+
+static std::shared_ptr<Expression> boolOperator(ExpressionType type, expression_vector children) {
+    auto functionName = ExpressionTypeUtil::toString(type);
+    scalar_func_exec_t execFunc;
+    VectorBooleanFunction::bindExecFunction(type, children, execFunc);
+    scalar_func_select_t selectFunc;
+    VectorBooleanFunction::bindSelectFunction(type, children, selectFunc);
+    std::vector<LogicalTypeID> inputTypeIDs(children.size(), LogicalTypeID::BOOL);
+    auto uniqueName = ScalarFunctionExpression::getUniqueName(functionName, children);
+    auto function = std::make_unique<ScalarFunction>(functionName, std::move(inputTypeIDs),
+        LogicalTypeID::BOOL, execFunc, selectFunc);
+    return std::make_shared<ScalarFunctionExpression>(type, std::move(function),
+        std::make_unique<FunctionBindData>(LogicalType::BOOL()), std::move(children), uniqueName);
+}
+
+// AND and OR are binary, so several operands are chained left-deep.
+static std::shared_ptr<Expression> chainBoolOperator(ExpressionType type,
+    const expression_vector& operands) {
+    auto result = operands[0];
+    for (auto i = 1u; i < operands.size(); ++i) {
+        result = boolOperator(type, {result, operands[i]});
+    }
+    return result;
+}
+
+// ---------------------------------------------------------------------------
 // Core folding  (tree-propagating version)
 // ---------------------------------------------------------------------------
 
@@ -90,7 +121,7 @@ static std::shared_ptr<Expression> foldBool(const std::shared_ptr<Expression>& e
             auto& lit = effective->constCast<LiteralExpression>();
             return boolLiteral(lit.isNull() || !lit.getValue().getValue<bool>());
         }
-        return folded ? effective : nullptr;
+        return folded ? boolOperator(ExpressionType::NOT, {folded}) : nullptr;
     }
 
     // --- AND -----------------------------------------------------------
@@ -136,10 +167,8 @@ static std::shared_ptr<Expression> foldBool(const std::shared_ptr<Expression>& e
             return kept[0];
         }
 
-        // 5) Multiple children remain; we currently do not rebuild the
-        //    AND tree.  If any child was simplified it is a missed
-        //    opportunity, but the predicate is still correct as-is.
-        return anyChanged ? kept[0] : nullptr;
+        // 5) Several children remain: rebuild the AND from them.
+        return anyChanged ? chainBoolOperator(ExpressionType::AND, kept) : nullptr;
     }
 
     // --- OR ------------------------------------------------------------
@@ -188,7 +217,7 @@ static std::shared_ptr<Expression> foldBool(const std::shared_ptr<Expression>& e
             return kept[0];
         }
 
-        return anyChanged ? kept[0] : nullptr;
+        return anyChanged ? chainBoolOperator(ExpressionType::OR, kept) : nullptr;
     }
 
     return nullptr;
