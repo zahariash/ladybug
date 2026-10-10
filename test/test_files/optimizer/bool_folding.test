@@ -25,3 +25,30 @@
 -STATEMENT MATCH (p:A) WHERE NOT ((p.x IS NULL OR p.x IS NOT NULL) AND p.id <= 3 AND p.x > 1) RETURN count(*);
 ---- 1
 98
+-STATEMENT MATCH (p:A) WITH p WHERE (p.x IS NULL OR p.x IS NOT NULL) AND p.id < 20 AND p.x > 5 RETURN count(*);
+---- 1
+8
+
+-CASE FoldingRespectsNull
+-STATEMENT CREATE NODE TABLE B (id INT64, x INT64, PRIMARY KEY(id));
+---- ok
+-STATEMENT UNWIND range(1, 100) AS i CREATE (:B {id: i, x: CASE WHEN i % 10 = 0 THEN NULL ELSE i % 10 END});
+---- ok
+-STATEMENT MATCH (p:B) WHERE p.x > p.id OR NOT p.x > p.id RETURN count(*);
+---- 1
+90
+-STATEMENT MATCH (p:B) WHERE NOT (p.x > p.id AND NOT p.x > p.id) RETURN count(*);
+---- 1
+90
+-STATEMENT MATCH (p:B) WHERE NOT (p.id = 1 OR (p.x > p.id AND NOT p.x > p.id)) RETURN count(*);
+---- 1
+89
+-STATEMENT MATCH (p:B) WHERE NOT (p.x > 5 OR NULL) RETURN count(*);
+---- 1
+0
+-STATEMENT MATCH (p:B) WHERE NOT (p.x > 5 AND NULL) RETURN count(*);
+---- 1
+50
+-STATEMENT MATCH (p:B) WHERE (p.x IS NULL AND p.x IS NOT NULL) OR p.x IS NULL RETURN count(*);
+---- 1
+10
