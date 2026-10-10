@@ -498,6 +498,13 @@ int main(int argc, char** argv) {
         }
         TestHelper::setRewriteTests(rewrite_tests);
 
+        char* env_reexecute = std::getenv("E2E_REEXECUTE");
+        if (env_reexecute != nullptr && std::string(env_reexecute) != "FALSE" &&
+            std::string(env_reexecute) != "OFF") {
+            TestHelper::setReexecuteReads(true);
+            spdlog::info("Starting runner in Reexecute Mode");
+        }
+
         checkGtestParams(argc, argv);
         testing::InitGoogleTest(&argc, argv);
         if (argc > 1) {
