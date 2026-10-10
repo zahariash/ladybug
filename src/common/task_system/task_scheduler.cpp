@@ -15,6 +15,10 @@ namespace common {
 
 #ifndef __SINGLE_THREADED__
 
+namespace {
+thread_local bool onWorkerThread = false;
+} // namespace
+
 #if defined(__APPLE__)
 TaskScheduler::TaskScheduler(uint64_t numWorkerThreads, uint32_t threadQos)
 #else
@@ -60,10 +64,19 @@ void TaskScheduler::scheduleTaskAndWaitOrError(const std::shared_ptr<Task>& task
         // numThreadsRegistered field of the task, tt does not keep track of the thread ids or
         // anything specific to the thread.
         task->registerThread();
-        newWorkerThread = std::thread(runTask, task.get());
+        newWorkerThread = std::thread([rawTask = task.get()] {
+            onWorkerThread = true;
+            runTask(rawTask);
+        });
     }
+    // A query started from inside a task (IMPORT DATABASE, PROJECT_GRAPH) is scheduled from a
+    // worker, so the worker works on it too: with a single worker nobody else can.
+    const bool runOnThisThread = onWorkerThread && task->registerThread();
     auto scheduledTask = pushTaskIntoQueue(task);
     cv.notify_all();
+    if (runOnThisThread) {
+        runTask(task.get());
+    }
     std::unique_lock<std::mutex> taskLck{task->taskMtx, std::defer_lock};
     while (true) {
         taskLck.lock();
@@ -111,6 +124,7 @@ void TaskScheduler::runWorkerThread() {
         UNUSED(pthreadQosStatus);
     }
 #endif
+    onWorkerThread = true;
     std::unique_lock<std::mutex> lck{taskSchedulerMtx, std::defer_lock};
     std::exception_ptr exceptionPtr = nullptr;
     std::shared_ptr<ScheduledTask> scheduledTask = nullptr;
