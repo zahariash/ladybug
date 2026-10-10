@@ -23,6 +23,12 @@ class Checks(Session):
         query = "MATCH (a:Person)-[k:Knows]->(b:Person) RETURN a.id, b.id, k.since"
         actual = Counter(self.rows(query))
         assert actual == self.model.knows, diff(actual, self.model.knows)
+        if self.model.knows_w is not None:
+            # Every edge, old or new, carries the default of the added property.
+            total = sum(self.model.knows.values())
+            query = "MATCH (:Person)-[k:Knows]->(:Person) RETURN k.w, count(*)"
+            actual = self.rows(query)
+            assert actual == ([(self.model.knows_w, total)] if total else []), actual
         expected = Counter(self.model.partitioned.items())
         actual = Counter(self.rows("MATCH (n:L) RETURN n.id, n.cluster"))
         assert actual == expected, diff(actual, expected)

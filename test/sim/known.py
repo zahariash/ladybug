@@ -36,6 +36,20 @@ KNOWN_BUGS = [
         "a crash after DROP_FTS_INDEX or DROP_VECTOR_INDEX leaves Doc unwritable, or segfaulting",
     ),
     Known(
+        "rel_columns",
+        "after DROP of a property, a crash and a CHECKPOINT, re-adding a property of the same name "
+        "brings back the dropped values",
+    ),
+    Known(
+        "rename_table",
+        "renaming a table leaves its SERIAL sequence under the old name, so the name can't be "
+        "reused",
+    ),
+    Known(
+        "prepared_ddl",
+        "#1158 family: prepared statements kept across DDL are not rebound (PR #1169 fixes it)",
+    ),
+    Known(
         "drop_table",
         "a prepared insert reused after DROP TABLE and CREATE TABLE of the same name fails or "
         "segfaults (prepared statements survive DDL, like #1158)",

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+import tempfile
+
 import machine  # noqa: F401  imports every rule module, so that RULE_NAMES is complete
 import pytest
 from hypothesis import HealthCheck, settings
@@ -18,6 +21,9 @@ FOCUS = {
         "macros",
         "tables",
         "columns",
+        "rename_table",
+        "rel_columns",
+        "prepared_ddl",
         "pk_index",
         "race",
         "crash_during",
@@ -39,6 +45,12 @@ def pytest_addoption(parser) -> None:
         "--sim-known", action="store_true", help="also run the rules that hit known.py's bugs"
     )
     group.addoption(
+        "--sim-enable",
+        action="append",
+        default=[],
+        help="known.py rule to run anyway, e.g. to verify a fix; repeatable",
+    )
+    group.addoption(
         "--sim-focus",
         choices=sorted(FOCUS),
         help="turn off the rules outside one area; checkpoints, reopens and crashes stay on",
@@ -52,20 +64,39 @@ def pytest_addoption(parser) -> None:
     group.addoption(
         "--sim-keep", action="store_true", help="keep every database directory after the run"
     )
+    group.addoption(
+        "--sim-gdb",
+        action="store_true",
+        help="run workers under gdb, so that a crash reports its native stack (slower)",
+    )
+    group.addoption(
+        "--sim-trace-dir",
+        default=os.path.join(tempfile.gettempdir(), f"lbug-sim-traces-{os.getpid()}"),
+        help="where the trace and files of the current workload go; after a failure, "
+        "<dir>/current/trace.json is the failing workload, for replay.py",
+    )
 
 
 @pytest.fixture(scope="session")
 def sim_options(pytestconfig) -> Options:
     skipped = set(pytestconfig.getoption("sim_skip"))
-    unknown = skipped - RULE_NAMES
+    enable = set(pytestconfig.getoption("sim_enable"))
+    unknown = (skipped | enable) - RULE_NAMES
     if unknown:
-        raise pytest.UsageError(f"--sim-skip names no rule: {sorted(unknown)}")
+        raise pytest.UsageError(f"--sim-skip/--sim-enable name no rule: {sorted(unknown)}")
     if pytestconfig.getoption("sim_focus"):
         skipped |= FOCUS[pytestconfig.getoption("sim_focus")]
     if not pytestconfig.getoption("sim_known"):
-        skipped |= known_rules()
+        skipped |= known_rules() - enable
     loads = [q for q in pytestconfig.getoption("sim_extensions").split(";") if q.strip()]
-    return Options(frozenset(skipped), tuple(loads), pytestconfig.getoption("sim_keep"))
+    os.makedirs(pytestconfig.getoption("sim_trace_dir"), exist_ok=True)
+    return Options(
+        frozenset(skipped),
+        tuple(loads),
+        keep=pytestconfig.getoption("sim_keep"),
+        debug=pytestconfig.getoption("sim_gdb"),
+        traces=pytestconfig.getoption("sim_trace_dir"),
+    )
 
 
 @pytest.fixture(scope="session")
@@ -85,3 +116,12 @@ def pytest_report_header(config) -> list[str]:
     if config.getoption("sim_known"):
         return ["simulation: running the rules for known bugs too"]
     return [f"simulation: skipping {k.rule} ({k.reason})" for k in KNOWN_BUGS]
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config) -> None:
+    trace = os.path.join(config.getoption("sim_trace_dir"), "current", "trace.json")
+    if exitstatus != 0 and os.path.exists(trace):
+        terminalreporter.write_line(
+            f"trace of the failing workload: {trace}\n"
+            f"replay it with: python test/sim/replay.py {trace} --runs 5 [--minimize] [--gdb]"
+        )

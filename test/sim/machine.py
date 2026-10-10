@@ -14,6 +14,7 @@ from rules.catalog import CatalogRules
 from rules.data import DataRules
 from rules.durability import DurabilityRules
 from rules.extensions import ExtensionRules
+from rules.prepared import PreparedRules
 from rules.transactions import TransactionRules
 from search import SearchChecks
 
@@ -29,6 +30,7 @@ class LadybugSim(
     DataRules,
     TransactionRules,
     CatalogRules,
+    PreparedRules,
     ExtensionRules,
     DurabilityRules,
     SearchChecks,
@@ -45,6 +47,10 @@ class LadybugSim(
     def open_db(self, threads, compression, checkpoint_threshold):
         self.dir = tempfile.mkdtemp(prefix="lbug-sim-")
         self.path = os.path.join(self.dir, "db")
+        # The files of the current workload live with its trace, so a failure can be replayed.
+        self.files = os.path.join(self.options.traces or self.dir, "current")
+        shutil.rmtree(self.files, ignore_errors=True)
+        os.makedirs(self.files)
         self.config = dict(
             buffer_pool_size=256 * 1024 * 1024,
             max_num_threads=threads,
@@ -52,11 +58,13 @@ class LadybugSim(
             checkpoint_threshold=checkpoint_threshold,
         )
         self.model = Model()
-        self.reopen_engine()
+        self.start_trace()
         for statement in SCHEMA + (EXTENSION_SCHEMA if self.options.loaded else []):
             self.ok(statement)
 
     def teardown(self):
+        if getattr(self, "trace", None) is not None:
+            self.save_trace()
         if self.engine:
             self.engine.kill()
         if self.dir and not self.options.keep:

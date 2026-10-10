@@ -14,6 +14,20 @@ from strategies import clusters, csv_names, doubles, ints, names, small_ids
 NO_PK_INDEX = "COPY into a non-empty primary-key node table without a hash index"
 
 
+def csv_field(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return '"' + value.replace('"', '""') + '"'
+    return str(value)
+
+
+def copy_query(csv: str, rows) -> str:
+    """The parallel CSV reader rejects quoted newlines."""
+    newline = any(isinstance(name, str) and "\n" in name for name, _ in rows)
+    return f'COPY Person FROM "{csv}"' + (" (parallel=false)" if newline else "")
+
+
 class DataRules(Session):
     @enabled("persons")
     @rule(id=small_ids, name=names, age=ints, score=doubles)
@@ -82,24 +96,25 @@ class DataRules(Session):
         ]
         if missing:
             edges.insert(data.draw(st.integers(0, count)), (edges[0][0], -1, 0))
-        fd, csv = tempfile.mkstemp(suffix=".csv", dir=self.dir)
+        fd, csv = tempfile.mkstemp(suffix=".csv", dir=self.files)
+        w = "" if self.model.knows_w is None else f",{self.model.knows_w}"
         with os.fdopen(fd, "w") as f:
-            f.writelines(f"{s},{d},{'' if v is None else v}\n" for s, d, v in edges)
+            f.writelines(f"{s},{d},{'' if v is None else v}{w}\n" for s, d, v in edges)
         if missing:
             self.fails(f'COPY Knows FROM "{csv}"', None, "Unable to find primary key value -1")
             return
         self.ok(f'COPY Knows FROM "{csv}"')
         self.model.knows.update(edges)
 
-    def write_bulk_csv(self, rows: list[tuple[str, int]]) -> tuple[str, dict]:
+    def write_bulk_csv(self, rows: list[tuple[str | None, int]]) -> tuple[str, dict]:
         """Writes rows of (name, age) with fresh ids; returns the file and the new persons."""
         ids = self.model.take_bulk_ids(len(rows))
-        csv = os.path.join(self.dir, f"bulk{ids.start}.csv")
+        csv = os.path.join(self.files, f"bulk{ids.start}.csv")
         added = {}
         with open(csv, "w") as f:
             for id, (name, age) in zip(ids, rows, strict=True):
                 added[id] = self.model.new_person(name=name, age=age, score=age / 4)
-                values = ["" if v is None else str(v) for v in added[id].values()]
+                values = [csv_field(v) for v in added[id].values()]
                 f.write(",".join([str(id), *values]) + "\n")
         return csv, added
 
@@ -107,7 +122,7 @@ class DataRules(Session):
     @rule(rows=st.lists(st.tuples(csv_names, st.integers(-1000, 1000)), min_size=1, max_size=3000))
     def bulk_copy(self, rows):
         csv, added = self.write_bulk_csv(rows)
-        query = f'COPY Person FROM "{csv}"'
+        query = copy_query(csv, rows)
         if self.model.pk_index is None and self.model.persons:
             self.fails(query, None, NO_PK_INDEX)
             return

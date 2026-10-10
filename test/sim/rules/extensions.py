@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import os
-import time
 
 import hypothesis.strategies as st
 from hypothesis.stateful import precondition, rule
@@ -69,7 +68,7 @@ class ExtensionRules(Session):
         """COPYs docs with random words and embeddings, some of them NULL, into Doc and every
         index on it."""
         ids = self.model.take_bulk_ids(count)
-        csv = os.path.join(self.dir, f"docs{ids.start}.csv")
+        csv = os.path.join(self.files, f"docs{ids.start}.csv")
         added = {}
         with open(csv, "w") as f:
             for id in ids:
@@ -117,10 +116,7 @@ class ExtensionRules(Session):
             return
         index = data.draw(st.sampled_from(missing))
         option = data.draw(self.index_options(index))
-        self.engine.start(create_statement(index, option))
-        time.sleep(delay)
-        self.engine.kill()
-        self.reopen_engine()
+        self.crash_during_statement(create_statement(index, option), delay)
         indexes = self.rows("CALL show_indexes() RETURN table_name, index_name")
         if ("Doc", index) in indexes:
             self.model.doc_indexes[index] = option

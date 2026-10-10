@@ -5,7 +5,7 @@ from __future__ import annotations
 import hypothesis.strategies as st
 from hypothesis.stateful import precondition, rule
 from session import Session, enabled
-from strategies import extra_columns, macro_ids, table_ids
+from strategies import EXTRA_COLUMNS, extra_columns, macro_ids, table_ids
 
 
 class CatalogRules(Session):
@@ -92,3 +92,49 @@ class CatalogRules(Session):
     def create_pk_index(self):
         self.ok("CREATE INDEX person_pk FOR (p:Person) ON (p.id)")
         self.model.pk_index = "person_pk"
+
+    @enabled("columns")
+    @precondition(lambda self: any(c in self.model.columns for c in EXTRA_COLUMNS))
+    @rule(data=st.data())
+    def rename_column(self, data):
+        old = data.draw(st.sampled_from([c for c in EXTRA_COLUMNS if c in self.model.columns]))
+        new = data.draw(st.sampled_from(EXTRA_COLUMNS))
+        query = f"ALTER TABLE Person RENAME {old} TO {new}"
+        if new in self.model.columns:
+            self.fails(query, None, "already has property")
+            return
+        self.ok(query)
+        self.model.columns = {new if c == old else c: d for c, d in self.model.columns.items()}
+        for id, person in self.model.persons.items():
+            self.model.persons[id] = {new if c == old else c: v for c, v in person.items()}
+
+    @enabled("rename_table")
+    @precondition(lambda self: self.model.tables)
+    @rule(data=st.data(), new=table_ids)
+    def rename_table(self, data, new):
+        old = data.draw(st.sampled_from(sorted(self.model.tables)))
+        query = f"ALTER TABLE T{old} RENAME TO T{new}"
+        if new in self.model.tables:
+            self.fails(query, None, "already exists")
+            return
+        self.ok(query)
+        self.model.tables[new] = self.model.tables.pop(old)
+
+    @enabled("rel_columns")
+    @rule(default=st.integers(-5, 5))
+    def add_knows_property(self, default):
+        query = f"ALTER TABLE Knows ADD w INT64 DEFAULT {default}"
+        if self.model.knows_w is not None:
+            self.fails(query, None, "already has property")
+            return
+        self.ok(query)
+        self.model.knows_w = default
+
+    @enabled("rel_columns")
+    @rule()
+    def drop_knows_property(self):
+        if self.model.knows_w is None:
+            self.fails("ALTER TABLE Knows DROP w", None, "does not have property")
+            return
+        self.ok("ALTER TABLE Knows DROP w")
+        self.model.knows_w = None

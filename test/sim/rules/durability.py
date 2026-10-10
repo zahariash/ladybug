@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import copy
-import time
+import shutil
 
 import hypothesis.strategies as st
 from hypothesis.stateful import precondition, rule
@@ -13,6 +13,16 @@ from strategies import BULK_ID_START, small_ids
 
 CRASH_OPS = ["copy", "create", "delete", "checkpoint"]
 RACE_OPS = ["insert", "delete", "set_age", "clear_age", "checkpoint"]
+# File syscalls a crash point can kill at, with how many calls a statement makes at most; the
+# engine writes from two threads, each counted separately.
+SYSCALLS = {
+    "pwrite64": 600,
+    "fdatasync": 12,
+    "fsync": 12,
+    "ftruncate": 6,
+    "rename": 2,
+    "unlink": 10,
+}
 gated(*(f"crash_{op}" for op in CRASH_OPS), "race_checkpoint")
 
 # The committed state a racing reader sees (see engine.read_state and race_state). Races write
@@ -41,32 +51,28 @@ class DurabilityRules(Session):
     @enabled("reopen")
     @rule()
     def reopen(self):
-        self.engine.close()
         self.reopen_engine()
 
     @enabled("crash")
     @rule()
     def crash(self):
-        self.engine.kill()
-        self.reopen_engine()
+        self.crash_engine()
 
-    @enabled("crash_during")
-    @rule(data=st.data(), size=st.integers(2000, 40000), delay=st.floats(0.01, 0.3))
-    def crash_during(self, data, size, delay):
-        """Kills the engine while a large statement runs; recovery must see all of it or none."""
+    def crash_ops(self) -> list[str]:
         ops = [op for op in CRASH_OPS if f"crash_{op}" not in self.options.skipped]
         if self.model.pk_index is None and self.model.persons_ever:
             ops = [op for op in ops if op != "copy"]
-        if not ops:
-            return
-        op = data.draw(st.sampled_from(ops))
+        return ops
+
+    def plan_crash(self, op: str, size: int) -> tuple[str, Model]:
+        """The statement for a crash op and the model if it completes."""
         after = copy.deepcopy(self.model)
         if op == "copy":
             csv, added = self.write_bulk_csv([("bulk", i % 1000) for i in range(size)])
             after.add_persons(added)
             after.next_bulk_id = self.model.next_bulk_id
-            query = f'COPY Person FROM "{csv}"'
-        elif op == "create":
+            return f'COPY Person FROM "{csv}"', after
+        if op == "create":
             ids = after.take_bulk_ids(size)
             self.model.next_bulk_id = after.next_bulk_id
             after.add_persons({id: after.new_person(age=id % 1000) for id in ids})
@@ -74,16 +80,15 @@ class DurabilityRules(Session):
                 f"UNWIND range({ids.start}, {ids.stop - 1}) AS i "
                 "CREATE (:Person {id: i, age: i % 1000})"
             )
-        elif op == "delete":
+            return query, after
+        if op == "delete":
             for id in [id for id in after.persons if id >= BULK_ID_START]:
                 after.forget(id)
-            query = f"MATCH (p:Person) WHERE p.id >= {BULK_ID_START} DETACH DELETE p"
-        else:
-            query = "CHECKPOINT"
-        self.engine.start(query)
-        time.sleep(delay)
-        self.engine.kill()
-        self.reopen_engine()
+            return f"MATCH (p:Person) WHERE p.id >= {BULK_ID_START} DETACH DELETE p", after
+        return "CHECKPOINT", after
+
+    def check_crash(self, op: str, after: Model) -> None:
+        """After a crash, the data is all of the statement or none of it."""
         actual = self.person_rows()
         if actual == after.person_rows():
             self.model = after
@@ -95,6 +100,31 @@ class DurabilityRules(Session):
         )
         # An interrupted statement may still have reserved rows, as for an interrupted COPY.
         self.model.persons_ever = after.persons_ever
+
+    @enabled("crash_during")
+    @rule(data=st.data(), size=st.integers(2000, 40000), delay=st.floats(0.01, 0.3))
+    def crash_during(self, data, size, delay):
+        """Kills the engine while a large statement runs; recovery must see all of it or none."""
+        if not (ops := self.crash_ops()):
+            return
+        op = data.draw(st.sampled_from(ops))
+        query, after = self.plan_crash(op, size)
+        self.crash_during_statement(query, delay)
+        self.check_crash(op, after)
+
+    @enabled("crash_at_syscall")
+    @precondition(lambda self: shutil.which("strace") is not None)
+    @rule(data=st.data(), size=st.integers(500, 5000), syscall=st.sampled_from(sorted(SYSCALLS)))
+    def crash_at_syscall(self, data, size, syscall):
+        """Kills the engine at the n-th call of a file syscall in a large statement, a crash
+        point that does not depend on timing and shrinks with n."""
+        if not (ops := self.crash_ops()):
+            return
+        op = data.draw(st.sampled_from(ops))
+        n = data.draw(st.integers(1, SYSCALLS[syscall]))
+        query, after = self.plan_crash(op, size)
+        self.crash_at_syscall_point(query, syscall, n)
+        self.check_crash(op, after)
 
     @enabled("race")
     @precondition(

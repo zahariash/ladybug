@@ -66,7 +66,20 @@ given; `--sim-skip <name>` turns off more, `--sim-focus extensions` keeps only t
 rules, and `--sim-keep` keeps the database directories. With `--sim-extensions "LOAD EXTENSION
 fts;LOAD EXTENSION vector"` (or `LOAD EXTENSION '<path>'` for extensions built from
 `extension/`), the Doc table and the rules of each loaded extension are added.
-`SIM_TIMEOUT_SECONDS` (300 by default) bounds how long one statement may take.
+`SIM_TIMEOUT_SECONDS` (300 by default) bounds how long one statement may take; a hang reports the
+native stack of every engine thread, and `--sim-gdb` runs workers under gdb so that a crash
+reports its native stack too. With `strace` installed, crash points kill the engine at the n-th
+call of a file syscall, which does not depend on timing; `--sim-enable <name>` turns a known-bug
+rule back on, e.g. to verify a fix.
+
+Every workload records its engine interactions in a trace. After a failure,
+`<--sim-trace-dir>/current/trace.json` holds the failing workload; `test/sim/replay.py` reruns it
+without the model, `--minimize` shrinks it to the steps that still fail the same way, and
+`--gdb` adds native stacks. This covers crashes, hangs and errors, including timing-dependent
+ones; wrong results need the model and the simulator's own shrinking.
+
+The simulator's own logic (model, search oracles, trace minimization, rule helpers) has unit
+tests next to it that need no database: `pytest test/sim -k "not simulation"`.
 
 The end-to-end runner also has a mode for the cached-plan path: with `E2E_REEXECUTE=1`, every
 read-only query is prepared once and executed twice, and the second result is checked.

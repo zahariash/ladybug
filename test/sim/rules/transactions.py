@@ -140,8 +140,7 @@ class TransactionRules(Session):
         elif end == "rollback":
             self.ok("ROLLBACK")
         else:
-            self.engine.kill()
-            self.reopen_engine()
+            self.crash_engine()
 
     @enabled("atomic_statement")
     @precondition(lambda self: any(id < 41 for id in self.model.persons))

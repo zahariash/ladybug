@@ -40,6 +40,7 @@ class Model:
     # Whether Person ever held rows; the engine counts deleted rows until they are compacted.
     persons_ever: bool = False
     knows: Counter = field(default_factory=Counter)  # (src, dst, since) -> count
+    knows_w: int | None = None  # the default of Knows.w, while the property exists
     macros: dict = field(default_factory=dict)  # i -> k, for m{i}(x) = x + k
     tables: dict = field(default_factory=dict)  # i -> values of T{i}.v, in insertion order
     partitioned: dict = field(default_factory=dict)  # id -> cluster, in L

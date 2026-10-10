@@ -11,7 +11,8 @@ BULK_ID_START = 1_000_000
 small_ids = st.integers(0, 40)
 macro_ids = st.integers(0, 3)
 table_ids = st.integers(0, 2)
-extra_columns = st.sampled_from(["c0", "c1"])
+EXTRA_COLUMNS = ["c0", "c1", "c2"]
+extra_columns = st.sampled_from(EXTRA_COLUMNS)
 clusters = st.integers(1, 3)
 
 ints = st.one_of(
@@ -29,7 +30,9 @@ names = st.one_of(
     st.none(),
     st.text(st.characters(exclude_characters="\x00", exclude_categories=["Cs"]), max_size=40),
 )
-csv_names = st.text("abcdefghijklmnopqrstuvwxyz ", min_size=1, max_size=20)
+# Names for CSV files: commas, quotes, newlines and Unicode must survive quoting; "" is an
+# empty string and an unquoted empty field is NULL.
+csv_names = st.one_of(st.none(), st.text('abcxyz ,"\néß日', max_size=12))
 
 # Plain words, case and Unicode variants, and stopwords, which full-text queries never match.
 WORDS = ["apple", "grape", "melon", "lemon", "mango", "peach"]
