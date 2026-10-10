@@ -180,15 +180,22 @@ struct PlannerKnobs {
     // Estimated costs (nanoseconds) for choosing between index lookups and a node table scan.
     // Index lookups run on one thread and fetch matching rows one at a time; a scan pays a startup
     // cost and then reads rows on all threads.
-    static constexpr double HASH_INDEX_KEY_LOOKUP_COST = 3000;
-    static constexpr double ART_INDEX_KEY_LOOKUP_COST = 20000;
-    static constexpr double INDEX_ROW_FETCH_COST = 250;
+    static constexpr double HASH_INDEX_KEY_LOOKUP_COST = 1500;
+    static constexpr double ART_INDEX_KEY_LOOKUP_COST = 12000;
+    static constexpr double INDEX_ROW_FETCH_COST = 500;
     // A secondary ART lookup also checks every uncommitted row of the transaction.
     static constexpr double UNCOMMITTED_ROW_MATCH_COST = 75;
     // Literal keys whose index entries are counted when costing a secondary index lookup.
     static constexpr uint64_t MAX_PROBED_INDEX_KEYS = 64;
     static constexpr double SCAN_STARTUP_COST = 1000000;
-    static constexpr double SCAN_ROW_COST = 20;
+    // Per row and thread, for a scan filtering on a comparison or on an IN list.
+    static constexpr double SCAN_ROW_COST = 6;
+    static constexpr double IN_LIST_SCAN_ROW_COST = 22;
+    // Per list element, for a scan filtering on an IN list.
+    static constexpr double IN_LIST_SCAN_KEY_COST = 2000;
+    // The estimates are rough, so the index, which costs little when they are wrong, is kept
+    // unless it looks this many times more expensive than the scan.
+    static constexpr double INDEX_SCAN_COST_MARGIN = 2;
 };
 
 struct OrderByConstants {

@@ -112,7 +112,8 @@ private:
     bool isSecondaryARTLookupCheaper(common::table_id_t tableID, const std::string& dbName,
         const binder::PropertyExpression& property, const std::string& indexName,
         const binder::Expression& keys, bool isKeyList) const;
-    double estimateScanCost(double numRows) const;
+    // numListKeys is the size of the IN list the scan would filter on, or 0 for a comparison.
+    double estimateScanCost(double numRows, uint64_t numListKeys) const;
 
 private:
     PredicateSet predicateSet;

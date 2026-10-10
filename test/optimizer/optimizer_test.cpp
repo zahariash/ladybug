@@ -361,7 +361,9 @@ TEST_F(OptimizerTest, IndexScanCostGuard) {
     // Half the table matches, or too many keys: scanning is cheaper.
     ASSERT_STREQ(plan("g.flag = 1").c_str(), "Filter()S(g)");
     ASSERT_STREQ(plan("g.flag IN [1]").c_str(), "Filter()S(g)");
-    ASSERT_STREQ(plan("g.id IN range(1, 5000)").c_str(), "Filter()S(g)");
+    ASSERT_STREQ(plan("g.u IN range(1, 5000)").c_str(), "Filter()S(g)");
+    // Hash primary-key lookups stay cheaper than the scan even for long lists.
+    ASSERT_STREQ(plan("g.id IN range(1, 5000)").c_str(), "IndexScan(g)");
     // Literal keys are counted in the index rather than estimated from an average.
     ASSERT_STREQ(plan("g.skew = 7").c_str(), "IndexScan(g)");
     ASSERT_STREQ(plan("g.skew IN [7, 9]").c_str(), "IndexScan(g)");

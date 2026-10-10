@@ -259,9 +259,14 @@ static const TableStats* getStorageStats(const CardinalityEstimator* cardinality
     return stats != nullptr && stats->storageStats.has_value() ? &*stats->storageStats : nullptr;
 }
 
-double FilterPushDownOptimizer::estimateScanCost(double numRows) const {
+double FilterPushDownOptimizer::estimateScanCost(double numRows, uint64_t numListKeys) const {
     const auto numThreads = std::max<uint64_t>(1, context->getClientConfig()->numThreads);
-    return PlannerKnobs::SCAN_STARTUP_COST + numRows * PlannerKnobs::SCAN_ROW_COST / numThreads;
+    if (numListKeys == 0) {
+        return PlannerKnobs::SCAN_STARTUP_COST + numRows * PlannerKnobs::SCAN_ROW_COST / numThreads;
+    }
+    return PlannerKnobs::SCAN_STARTUP_COST +
+           numRows * PlannerKnobs::IN_LIST_SCAN_ROW_COST / numThreads +
+           static_cast<double>(numListKeys) * PlannerKnobs::IN_LIST_SCAN_KEY_COST;
 }
 
 bool FilterPushDownOptimizer::isPrimaryKeyLookupCheaper(table_id_t tableID, uint64_t numKeys,
@@ -274,7 +279,8 @@ bool FilterPushDownOptimizer::isPrimaryKeyLookupCheaper(table_id_t tableID, uint
     const auto keyCost = isHashIndex ? PlannerKnobs::HASH_INDEX_KEY_LOOKUP_COST :
                                        PlannerKnobs::ART_INDEX_KEY_LOOKUP_COST;
     const auto indexCost = numKeys * (keyCost + PlannerKnobs::INDEX_ROW_FETCH_COST);
-    return indexCost < estimateScanCost(static_cast<double>(stats->getTableCard()));
+    return indexCost < PlannerKnobs::INDEX_SCAN_COST_MARGIN *
+                           estimateScanCost(static_cast<double>(stats->getTableCard()), numKeys);
 }
 
 static uint64_t getNumKeys(const Expression& keys);
@@ -366,7 +372,8 @@ bool FilterPushDownOptimizer::isSecondaryARTLookupCheaper(table_id_t tableID,
     const auto indexCost = numKeys * PlannerKnobs::ART_INDEX_KEY_LOOKUP_COST +
                            numMatchedRows * PlannerKnobs::INDEX_ROW_FETCH_COST +
                            numUncommittedRows * PlannerKnobs::UNCOMMITTED_ROW_MATCH_COST;
-    return indexCost < estimateScanCost(numRows);
+    return indexCost < PlannerKnobs::INDEX_SCAN_COST_MARGIN *
+                           estimateScanCost(numRows, isKeyList ? numKeys : 0);
 }
 
 // Number of keys in a constant key list: a literal, a parameter, or a cast of either.
