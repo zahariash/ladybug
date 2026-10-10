@@ -58,6 +58,8 @@ struct VectorVersionInfo {
 
     row_idx_t getNumDeletions(transaction_t startTS, transaction_t transactionID,
         row_idx_t startRow, length_t numRows) const;
+    row_idx_t getNumVisibleRows(transaction_t startTS, transaction_t transactionID,
+        row_idx_t startRow, length_t numRows) const;
 
     void serialize(Serializer& serializer) const;
     static std::unique_ptr<VectorVersionInfo> deSerialize(Deserializer& deSer);
@@ -250,6 +252,29 @@ row_idx_t VectorVersionInfo::getNumDeletions(transaction_t startTS, transaction_
         numDeletions += isDeleted(startTS, transactionID, startRow + i);
     }
     return numDeletions;
+}
+
+row_idx_t VectorVersionInfo::getNumVisibleRows(transaction_t startTS, transaction_t transactionID,
+    row_idx_t startRow, length_t numRows) const {
+    if (insertionStatus == InsertionStatus::NO_INSERTED) {
+        return 0;
+    }
+    if (deletionStatus == DeletionStatus::NO_DELETED) {
+        if (insertionStatus == InsertionStatus::ALWAYS_INSERTED || isSameInsertionVersion()) {
+            return isInserted(startTS, transactionID, startRow) ? numRows : 0;
+        }
+        row_idx_t numVisible = 0u;
+        for (auto i = 0u; i < numRows; i++) {
+            const auto insertion = insertedVersions->operator[](startRow + i);
+            numVisible += insertion == transactionID || insertion <= startTS;
+        }
+        return numVisible;
+    }
+    row_idx_t numVisible = 0u;
+    for (auto i = 0u; i < numRows; i++) {
+        numVisible += isSelected(startTS, transactionID, startRow + i);
+    }
+    return numVisible;
 }
 
 void VectorVersionInfo::rollbackInsertions(row_idx_t startRowInVector, row_idx_t numRows) {
@@ -548,6 +573,29 @@ row_idx_t VersionInfo::getNumDeletions(const transaction::Transaction* transacti
         vectorIdx++;
     }
     return numDeletions;
+}
+
+row_idx_t VersionInfo::getNumVisibleRows(const transaction::Transaction* transaction,
+    row_idx_t startRow, length_t numRows) const {
+    if (numRows == 0) {
+        return 0;
+    }
+    auto [startVector, startRowInVector] =
+        StorageUtils::getQuotientRemainder(startRow, DEFAULT_VECTOR_CAPACITY);
+    auto [endVectorIdx, endRowInVector] =
+        StorageUtils::getQuotientRemainder(startRow + numRows - 1, DEFAULT_VECTOR_CAPACITY);
+    row_idx_t numVisible = 0u;
+    for (auto vectorIdx = startVector; vectorIdx <= endVectorIdx; vectorIdx++) {
+        const auto rowInVector = vectorIdx == startVector ? startRowInVector : 0;
+        const auto numRowsInVector = vectorIdx == endVectorIdx ?
+                                         endRowInVector - rowInVector + 1 :
+                                         DEFAULT_VECTOR_CAPACITY - rowInVector;
+        const auto vectorVersion = getVectorVersionInfo(vectorIdx);
+        numVisible += vectorVersion ? vectorVersion->getNumVisibleRows(transaction->getStartTS(),
+                                          transaction->getID(), rowInVector, numRowsInVector) :
+                                      numRowsInVector;
+    }
+    return numVisible;
 }
 
 bool VersionInfo::hasInsertions() const {
