@@ -1,3 +1,4 @@
+#include <optional>
 #include <string_view>
 #include <unordered_set>
 
@@ -31,11 +32,23 @@ struct StringViewHash {
     size_t operator()(std::string_view value) const { return std::hash<std::string_view>{}(value); }
 };
 
-// Holds the members of a constant list as a hash set, built on first use.
+// Holds the members of a list as a hash set. A constant list's set is built on first use; for
+// other lists the hashed list is kept too, so the set is rebuilt only when the list changes.
 struct ListContainsBindData final : FunctionBindData {
     std::unordered_set<uint64_t> integerKeys;
     std::unordered_set<std::string, StringViewHash, std::equal_to<>> stringKeys;
+    std::vector<std::optional<uint64_t>> hashedIntegerList;
+    std::vector<std::optional<std::string>> hashedStringList;
     bool isBuilt = false;
+
+    template<typename T>
+    const auto& hashedList() const {
+        if constexpr (std::is_same_v<T, string_t>) {
+            return hashedStringList;
+        } else {
+            return hashedIntegerList;
+        }
+    }
 
     ListContainsBindData(std::vector<LogicalType> paramTypes, LogicalType resultType)
         : FunctionBindData{std::move(paramTypes), std::move(resultType)} {}
@@ -91,6 +104,116 @@ struct ListContainsConstantList {
     }
 };
 
+// list_contains over a list that can differ between calls. When one list applies to many rows of
+// a call (a flat list against enough unflat elements to pay for a rebuild), the constant-list path
+// is used with a set refreshed for that list.
+struct ListContainsFlatList {
+    static bool canHash(const std::vector<std::shared_ptr<ValueVector>>& params, void* dataPtr) {
+        const auto& elementState = *params[1]->state;
+        return dataPtr != nullptr && params[0]->state->isFlat() && !elementState.isFlat() &&
+               elementState.getSelVector().getSelSize() >=
+                   ListContainsConstantList::MIN_LIST_SIZE_TO_HASH;
+    }
+
+    // Linear membership test, for lists that differ per row.
+    template<typename T>
+    static void operation(list_entry_t& list, T& element, uint8_t& result, ValueVector& listVector,
+        ValueVector& elementVector, ValueVector& resultVector, void* /*dataPtr*/) {
+        ListContains::operation(list, element, result, listVector, elementVector, resultVector);
+    }
+
+    template<HashableListElement T>
+    static void refresh(ListContainsBindData& bindData, ValueVector& listVector,
+        const SelectionVector& listSelVector) {
+        const auto pos = listSelVector[0];
+        if (listVector.isNull(pos)) {
+            return;
+        }
+        auto& list = listVector.getValue<list_entry_t>(pos);
+        if (list.size < ListContainsConstantList::MIN_LIST_SIZE_TO_HASH) {
+            return;
+        }
+        auto dataVector = ListVector::getDataVector(&listVector);
+        if (isHashed<T>(bindData, list, *dataVector)) {
+            return;
+        }
+        bindData.integerKeys.clear();
+        bindData.stringKeys.clear();
+        bindData.hashedIntegerList.clear();
+        bindData.hashedStringList.clear();
+        for (auto i = list.offset; i < list.offset + list.size; ++i) {
+            const auto isNull = dataVector->isNull(i);
+            if constexpr (std::is_same_v<T, string_t>) {
+                bindData.hashedStringList.push_back(
+                    isNull ? std::nullopt :
+                             std::optional{dataVector->getValue<string_t>(i).getAsString()});
+            } else {
+                bindData.hashedIntegerList.push_back(
+                    isNull ? std::nullopt :
+                             std::optional{static_cast<uint64_t>(dataVector->getValue<T>(i))});
+            }
+        }
+        ListContainsConstantList::build<T>(bindData, list, listVector);
+    }
+
+    template<HashableListElement T>
+    static bool isHashed(const ListContainsBindData& bindData, const list_entry_t& list,
+        ValueVector& dataVector) {
+        const auto& hashed = bindData.hashedList<T>();
+        if (hashed.size() != list.size) {
+            return false;
+        }
+        for (auto i = 0u; i < list.size; ++i) {
+            const auto pos = list.offset + i;
+            if (dataVector.isNull(pos)) {
+                if (hashed[i].has_value()) {
+                    return false;
+                }
+                continue;
+            }
+            if constexpr (std::is_same_v<T, string_t>) {
+                if (hashed[i] != dataVector.getValue<string_t>(pos).getAsStringView()) {
+                    return false;
+                }
+            } else {
+                if (hashed[i] != static_cast<uint64_t>(dataVector.getValue<T>(pos))) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    template<HashableListElement T>
+    static void exec(const std::vector<std::shared_ptr<ValueVector>>& params,
+        const std::vector<SelectionVector*>& paramSelVectors, ValueVector& result,
+        SelectionVector* resultSelVector, void* dataPtr) {
+        if (canHash(params, dataPtr)) {
+            refresh<T>(*static_cast<ListContainsBindData*>(dataPtr), *params[0],
+                *paramSelVectors[0]);
+            ScalarFunction::BinaryExecWithBindData<list_entry_t, T, uint8_t,
+                ListContainsConstantList>(params, paramSelVectors, result, resultSelVector,
+                dataPtr);
+            return;
+        }
+        ScalarFunction::BinaryExecListStructFunction<list_entry_t, T, uint8_t, ListContains>(params,
+            paramSelVectors, result, resultSelVector, dataPtr);
+    }
+
+    template<HashableListElement T>
+    static bool select(const std::vector<std::shared_ptr<ValueVector>>& params,
+        SelectionVector& selVector, void* dataPtr) {
+        if (canHash(params, dataPtr)) {
+            refresh<T>(*static_cast<ListContainsBindData*>(dataPtr), *params[0],
+                params[0]->state->getSelVector());
+            return ScalarFunction::BinarySelectWithBindData<list_entry_t, T,
+                ListContainsConstantList>(params, selVector, dataPtr);
+        }
+        return ScalarFunction::BinarySelectWithBindData<list_entry_t, T, ListContainsFlatList>(
+            params, selVector, dataPtr);
+    }
+};
+
 static bool isConstantList(const Expression& listExpr) {
     return listExpr.expressionType == ExpressionType::LITERAL ||
            listExpr.expressionType == ExpressionType::PARAMETER;
@@ -123,23 +246,26 @@ static std::unique_ptr<FunctionBindData> bindFunc(const ScalarBindFuncInput& inp
     auto listType = LogicalType::LIST(childType.copy());
     paramTypes.push_back(listType.copy());
     paramTypes.push_back(childType.copy());
-    auto hashConstantList = false;
+    auto hashList = false;
     TypeUtils::visit(childType.getPhysicalType(), [&]<typename T>(T) {
         scalarFunction->selectFunc = nullptr;
         if constexpr (HashableListElement<T>) {
+            hashList = true;
             if (isConstantList(*listExpr)) {
-                hashConstantList = true;
                 scalarFunction->execFunc = ScalarFunction::BinaryExecWithBindData<list_entry_t, T,
                     uint8_t, ListContainsConstantList>;
                 scalarFunction->selectFunc = ScalarFunction::BinarySelectWithBindData<list_entry_t,
                     T, ListContainsConstantList>;
-                return;
+            } else {
+                scalarFunction->execFunc = ListContainsFlatList::exec<T>;
+                scalarFunction->selectFunc = ListContainsFlatList::select<T>;
             }
+            return;
         }
         scalarFunction->execFunc =
             ScalarFunction::BinaryExecListStructFunction<list_entry_t, T, uint8_t, ListContains>;
     });
-    if (hashConstantList) {
+    if (hashList) {
         return std::make_unique<ListContainsBindData>(std::move(paramTypes), LogicalType::BOOL());
     }
     return std::make_unique<FunctionBindData>(std::move(paramTypes), LogicalType::BOOL());
