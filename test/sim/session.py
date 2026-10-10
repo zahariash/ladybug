@@ -32,6 +32,7 @@ class Options:
     keep: bool = False  # keep each database directory after the run
     debug: bool = False  # run workers under gdb, so that crashes report native stacks
     traces: str = ""  # where the current workload's trace and files are written
+    scratch: str = ""  # where the databases are created
 
     @property
     def loaded(self) -> set[str]:

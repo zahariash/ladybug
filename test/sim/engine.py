@@ -16,6 +16,7 @@ import ctypes
 import multiprocessing
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -157,6 +158,39 @@ def gdb_stacks(pid: int) -> str:
     except (OSError, subprocess.TimeoutExpired) as e:
         return f"(no stacks: {e})"
     return native_stacks(result.stdout)
+
+
+SCRATCH_PREFIX = "lbug-sim-run-"
+KEEP_MARKER = "keep"
+
+
+def pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    return True
+
+
+def scratch_root(tmp: str | None = None) -> str:
+    """This process's directory for databases. Roots left by processes that died without
+    cleaning up, such as a run killed mid-workload, are removed first unless they were kept."""
+    tmp = tmp or tempfile.gettempdir()
+    for name in os.listdir(tmp):
+        pid = name.removeprefix(SCRATCH_PREFIX)
+        path = os.path.join(tmp, name)
+        if (
+            name.startswith(SCRATCH_PREFIX)
+            and pid.isdigit()
+            and not pid_alive(int(pid))
+            and not os.path.exists(os.path.join(path, KEEP_MARKER))
+        ):
+            shutil.rmtree(path, ignore_errors=True)
+    root = os.path.join(tmp, f"{SCRATCH_PREFIX}{os.getpid()}")
+    os.makedirs(root, exist_ok=True)
+    return root
 
 
 def strace_executable() -> str:

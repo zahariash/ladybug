@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import os
+import shutil
 import tempfile
+from collections.abc import Iterator
 
 import machine  # noqa: F401  imports every rule module, so that RULE_NAMES is complete
 import pytest
+from engine import KEEP_MARKER, scratch_root
 from hypothesis import HealthCheck, settings
 from known import KNOWN_BUGS, known_rules
 from session import RULE_NAMES, Options
+
+DEFAULT_TRACES = os.path.join(tempfile.gettempdir(), f"lbug-sim-traces-{os.getpid()}")
 
 # Rule groups each focus turns off.
 FOCUS = {
@@ -71,14 +76,14 @@ def pytest_addoption(parser) -> None:
     )
     group.addoption(
         "--sim-trace-dir",
-        default=os.path.join(tempfile.gettempdir(), f"lbug-sim-traces-{os.getpid()}"),
+        default=DEFAULT_TRACES,
         help="where the trace and files of the current workload go; after a failure, "
         "<dir>/current/trace.json is the failing workload, for replay.py",
     )
 
 
 @pytest.fixture(scope="session")
-def sim_options(pytestconfig) -> Options:
+def sim_options(pytestconfig) -> Iterator[Options]:
     skipped = set(pytestconfig.getoption("sim_skip"))
     enable = set(pytestconfig.getoption("sim_enable"))
     unknown = (skipped | enable) - RULE_NAMES
@@ -90,13 +95,19 @@ def sim_options(pytestconfig) -> Options:
         skipped |= known_rules() - enable
     loads = [q for q in pytestconfig.getoption("sim_extensions").split(";") if q.strip()]
     os.makedirs(pytestconfig.getoption("sim_trace_dir"), exist_ok=True)
-    return Options(
+    scratch = scratch_root()
+    if pytestconfig.getoption("sim_keep"):
+        open(os.path.join(scratch, KEEP_MARKER), "w").close()
+    yield Options(
         frozenset(skipped),
         tuple(loads),
         keep=pytestconfig.getoption("sim_keep"),
         debug=pytestconfig.getoption("sim_gdb"),
         traces=pytestconfig.getoption("sim_trace_dir"),
+        scratch=scratch,
     )
+    if not pytestconfig.getoption("sim_keep"):
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 @pytest.fixture(scope="session")
@@ -125,3 +136,9 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config) -> None:
             f"trace of the failing workload: {trace}\n"
             f"replay it with: python test/sim/replay.py {trace} --runs 5 [--minimize] [--gdb]"
         )
+
+
+def pytest_sessionfinish(session, exitstatus) -> None:
+    traces = session.config.getoption("sim_trace_dir", None)
+    if exitstatus == 0 and traces == DEFAULT_TRACES:
+        shutil.rmtree(traces, ignore_errors=True)

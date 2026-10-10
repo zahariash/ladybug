@@ -45,7 +45,7 @@ class LadybugSim(
         checkpoint_threshold=st.sampled_from([-1, 0, 4096]),
     )
     def open_db(self, threads, compression, checkpoint_threshold):
-        self.dir = tempfile.mkdtemp(prefix="lbug-sim-")
+        self.dir = tempfile.mkdtemp(prefix="db-", dir=self.options.scratch)
         self.path = os.path.join(self.dir, "db")
         # The files of the current workload live with its trace, so a failure can be replayed.
         self.files = os.path.join(self.options.traces or self.dir, "current")

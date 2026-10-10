@@ -24,7 +24,7 @@ import tempfile
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from engine import Engine, EngineError  # noqa: E402
+from engine import Engine, EngineError, scratch_root  # noqa: E402
 
 
 def original_failure(trace: list) -> tuple[str, str] | None:
@@ -43,7 +43,7 @@ def original_failure(trace: list) -> tuple[str, str] | None:
 class Replayer:
     def __init__(self, trace: list, debug: bool) -> None:
         self.trace, self.debug = trace, debug
-        self.dir = tempfile.mkdtemp(prefix="lbug-replay-")
+        self.dir = tempfile.mkdtemp(prefix="replay-", dir=scratch_root())
         self.path = os.path.join(self.dir, "db")
         self.config, self.loads = trace[0]["config"], trace[0]["loads"]
         self.engine = None

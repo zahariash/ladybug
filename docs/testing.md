@@ -63,9 +63,11 @@ PYTHONPATH=tools/python_api/build uv run --no-project --with hypothesis --with p
 
 Rules that hit known bugs are listed in `test/sim/known.py` and stay off unless `--sim-known` is
 given; `--sim-skip <name>` turns off more, `--sim-focus extensions` keeps only the extension
-rules, and `--sim-keep` keeps the database directories. With `--sim-extensions "LOAD EXTENSION
-fts;LOAD EXTENSION vector"` (or `LOAD EXTENSION '<path>'` for extensions built from
-`extension/`), the Doc table and the rules of each loaded extension are added.
+rules, and `--sim-keep` keeps the database directories. They live in `/tmp/lbug-sim-run-<pid>`,
+which a run removes at the end; the next run removes those of runs that were killed. With
+`--sim-extensions "LOAD EXTENSION fts;LOAD EXTENSION vector"` (or `LOAD EXTENSION '<path>'` for
+extensions built from `extension/`), the Doc table and the rules of each loaded extension are
+added.
 `SIM_TIMEOUT_SECONDS` (300 by default) bounds how long one statement may take; a hang reports the
 native stack of every engine thread, and `--sim-gdb` runs workers under gdb so that a crash
 reports its native stack too. With `strace` installed, crash points kill the engine at the n-th
