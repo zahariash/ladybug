@@ -313,6 +313,16 @@ jobs:
           path: D:\c
           key: minimal-test-${{ runner.os }}-${{ github.ref }}-${{ github.run_id }}-${{ github.run_attempt }}
 
+  # Pull requests and pushes check the newest release; nightly and manual runs check every release
+  # test/storage_compat/releases.py selects.
+  storage-compat:
+    needs: [ sanity-checks ]
+    permissions:
+      contents: read
+    uses: ./.github/workflows/storage-compat.yml
+    with:
+      releases: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 'all' || 'latest' }}
+
   minimal-linux-extension-test:
     name: minimal linux extension test
     runs-on: ubuntu-latest

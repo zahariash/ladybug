@@ -1,0 +1,10 @@
+CREATE NODE TABLE Person(id INT64 PRIMARY KEY, name STRING, age INT32, score DOUBLE, born DATE, seen TIMESTAMP, active BOOL, tags INT64[]);
+CREATE NODE TABLE City(name STRING PRIMARY KEY, population INT64);
+CREATE REL TABLE LivesIn(FROM Person TO City, since DATE, MANY_ONE);
+CREATE REL TABLE Knows(FROM Person TO Person, weight DOUBLE);
+UNWIND range(0, 139999) AS i CREATE (:Person {id: i, name: 'p' + CAST(i AS STRING), age: CAST(i % 90 AS INT32), score: CASE WHEN i % 7 = 0 THEN NULL ELSE i * 0.25 END, born: date('1950-01-01') + i % 20000, seen: timestamp('2020-01-01 00:00:00') + to_seconds(i * 37), active: i % 3 = 0, tags: CASE WHEN i % 5 = 0 THEN NULL ELSE [i, i % 11] END});
+UNWIND range(0, 99) AS i CREATE (:City {name: 'c' + CAST(i AS STRING), population: i * 1000});
+UNWIND range(0, 139999, 3) AS i MATCH (p:Person {id: i}), (c:City {name: 'c' + CAST(i % 100 AS STRING)}) CREATE (p)-[:LivesIn {since: date('2000-01-01') + i % 5000}]->(c);
+UNWIND range(0, 69999) AS i MATCH (a:Person {id: i}) WITH a, i MATCH (b:Person {id: (i * 7 + 1) % 140000}) CREATE (a)-[:Knows {weight: i * 0.5}]->(b);
+MATCH (p:Person) WHERE p.id % 1000 = 500 DETACH DELETE p;
+MATCH (p:Person) WHERE p.id % 1000 = 999 SET p.name = NULL, p.age = 1;

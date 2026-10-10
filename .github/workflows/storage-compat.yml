@@ -1,0 +1,101 @@
+name: Storage compatibility
+
+# Builds this commit and its base commit and runs test/storage_compat: this build must read,
+# upgrade and hand back databases written by the base commit and by past releases. Called from
+# ci-workflow.yml for every change and from build-and-deploy.yml before anything is published.
+
+on:
+  workflow_call:
+    inputs:
+      releases:
+        description: "latest: the newest release test/storage_compat/releases.py selects; all: every one"
+        type: string
+        default: latest
+
+permissions: {}
+
+jobs:
+  storage-compat:
+    name: storage compatibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    env:
+      GEN: Ninja
+      NUM_THREADS: 4
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+      # The base commit is built in .base; relative paths let it reuse this build's cache.
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_NOHASHDIR: "true"
+    steps:
+      # HEAD^1 is the base branch for a pull request's merge commit and the previous commit
+      # otherwise.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      # The suite reads every build through the Python package in tools/python_api.
+      - name: Checkout dataset and the Python package
+        run: git submodule update --init dataset tools/python_api
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: src/include/storage/storage_version_info.h
+
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@5ebbd400eff9e74630f759d94ddd7b6c26299639 # v1.2
+        with:
+          key: storage-compat-${{ runner.os }}-${{ github.ref }}
+          max-size: 2G
+          restore-keys: |
+            storage-compat-${{ runner.os }}-refs/heads/main
+            storage-compat-${{ runner.os }}-
+
+      - name: Find the base commit
+        id: base
+        run: echo "sha=$(git rev-parse HEAD^1)" >> "$GITHUB_OUTPUT"
+
+      # Runs on main save their library below, so most pull requests skip building the base.
+      - name: Restore the base commit's library
+        id: base-lib
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: compat-lib/liblbug.so
+          key: storage-compat-lib-${{ runner.os }}-${{ steps.base.outputs.sha }}
+
+      - name: Build
+        run: make release
+
+      - name: Build the base commit
+        if: steps.base-lib.outputs.cache-hit != 'true'
+        run: |
+          git worktree add .base HEAD^1
+          make -C .base release
+          mkdir -p compat-lib
+          cp -L .base/build/release/src/liblbug.so compat-lib/liblbug.so
+
+      - name: Check storage compatibility
+        env:
+          RELEASES: ${{ inputs.releases }}
+        run: |
+          args=(--lib build/release/src/liblbug.so --base-lib compat-lib/liblbug.so)
+          args+=(--releases "$RELEASES")
+          uv run --no-project --with pytest pytest test/storage_compat -v -rsxX "${args[@]}"
+
+      - name: Keep this commit's library for later runs
+        if: github.event_name == 'push'
+        run: |
+          mkdir -p compat-lib
+          cp -L build/release/src/liblbug.so compat-lib/liblbug.so
+
+      - name: Save this commit's library
+        if: github.event_name == 'push'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: compat-lib/liblbug.so
+          key: storage-compat-lib-${{ runner.os }}-${{ github.sha }}
