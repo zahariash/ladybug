@@ -115,8 +115,8 @@ private:
     bool isSecondaryARTLookupCheaper(common::table_id_t tableID, const std::string& dbName,
         const binder::PropertyExpression& property, const std::string& indexName,
         const binder::Expression& keys, bool isKeyList) const;
-    // Counts the range's entries in the ART primary-key index, up to the number at which the scan
-    // becomes cheaper.
+    // Estimates the range's entries in the ART primary-key index, or counts them up to the number
+    // at which the scan becomes cheaper.
     bool isPrimaryKeyRangeLookupCheaper(common::table_id_t tableID, storage::Index& index,
         const PrimaryKeyRangePredicate& range) const;
     // numListKeys is the size of the IN list the scan would filter on, or 0 for a comparison.

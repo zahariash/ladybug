@@ -430,9 +430,9 @@ bool FilterPushDownOptimizer::isPrimaryKeyRangeLookupCheaper(table_id_t tableID,
             return true;
         }
     }
+    const auto numRows = static_cast<double>(stats->getTableCard());
     const auto maxIndexCost =
-        PlannerKnobs::INDEX_SCAN_COST_MARGIN *
-        estimateScanCost(static_cast<double>(stats->getTableCard()), 0 /* numListKeys */);
+        PlannerKnobs::INDEX_SCAN_COST_MARGIN * estimateScanCost(numRows, 0 /* numListKeys */);
     const auto fixedCost =
         PlannerKnobs::ART_INDEX_KEY_LOOKUP_COST +
         getNumUncommittedRows(tableID) * PlannerKnobs::UNCOMMITTED_ROW_MATCH_COST;
@@ -441,6 +441,9 @@ bool FilterPushDownOptimizer::isPrimaryKeyRangeLookupCheaper(table_id_t tableID,
     }
     const auto maxRows =
         static_cast<uint64_t>((maxIndexCost - fixedCost) / PlannerKnobs::INDEX_ROW_FETCH_COST);
+    if (auto fraction = index.estimateRangeFraction(lowerBound.get(), 0, upperBound.get(), 0)) {
+        return *fraction * numRows <= static_cast<double>(maxRows);
+    }
     if (maxRows >= PlannerKnobs::MAX_PROBED_RANGE_ENTRIES) {
         return true;
     }
