@@ -30,6 +30,12 @@ STRACE_WRAPPER = """#!/bin/sh
 exec strace -f -qq -o /dev/null -e trace="$SIM_STRACE_SYSCALL" \\
     -e inject="$SIM_STRACE_SYSCALL:signal=KILL:when=$SIM_STRACE_WHEN" "$SIM_PYTHON" "$@"
 """
+# The worker starts under gdb, so that even a crash in its first statement leaves a stack: the
+# crashing thread's first, then every thread's.
+GDB_WRAPPER = """#!/bin/sh
+exec gdb -q -batch -ex "handle $SIM_GDB_SIGNALS nostop noprint pass" -ex run -ex "bt 25" \\
+    -ex "thread apply all bt 25" --args "$SIM_PYTHON" "$@" > "$SIM_GDB_OUT" 2>&1
+"""
 
 
 class EngineError(Exception):
@@ -77,11 +83,33 @@ def race(db, connect, writer, writes: list, queries: list[str], num_readers: int
     return observations, errors
 
 
-def serve(conns: list, db, connect, named: dict, message: tuple):
+# Results of decreasing size that ("hold", ...) keeps unconsumed until the buffer pool is full.
+PAD_ROWS = (200000, 20000, 2000, 200)
+PAD_QUERY = "UNWIND range(1, $n) AS i RETURN 'pad-' + CAST(i AS STRING)"
+
+
+def hold(conn, held: list) -> int:
+    """Keeps results on `conn` unconsumed until the buffer pool cannot take another one."""
+    for rows in PAD_ROWS:
+        while len(held) < 2000:
+            try:
+                held.append(conn.execute(PAD_QUERY, {"n": rows}))
+            except RuntimeError:
+                break
+    return len(held)
+
+
+def serve(conns: list, db, connect, named: dict, held: list, message: tuple):
     """Handles one request: ("race", writes, queries, readers); ("prepared", connection,
     query, params), which prepares the query and executes it twice; ("prepare", name,
-    connection, query, params), which keeps the statement for ("run", name, params); or
-    (connection, query, params)."""
+    connection, query, params), which keeps the statement for ("run", name, params);
+    ("hold", connection) and ("release",), which fill the buffer pool with unconsumed
+    results and free them; or (connection, query, params)."""
+    if message[0] == "hold":
+        return hold(conns[message[1]], held)
+    if message[0] == "release":
+        held.clear()
+        return None
     if message[0] == "race":
         _, writes, queries, num_readers = message
         return race(db, connect, conns[0], writes, queries, num_readers)
@@ -114,20 +142,23 @@ def worker_main(pipe, path: str, config: dict, loads: list[str]) -> None:
 
     try:
         db = lb.Database(path, **config)
+        # 0 is the default, 1 single-threaded, 2-4 hold the sessions' transactions.
         conns = [lb.Connection(db), lb.Connection(db, num_threads=1)]
+        conns += [lb.Connection(db) for _ in range(3)]
         for query in loads:
             conns[0].execute(query)
     except Exception as e:
         pipe.send(("error", f"open failed: {e}"))
         return
-    pipe.send(("ok", os.getpid()))
-    named = {}
+    pipe.send(("ok", dict(pid=os.getpid(), version=lb.__version__, module=lb.__file__)))
+    named, held = {}, []
     while (message := pipe.recv()) is not None:
         try:
-            pipe.send(("ok", serve(conns, db, lb.Connection, named, message)))
+            pipe.send(("ok", serve(conns, db, lb.Connection, named, held, message)))
         except Exception as e:
             pipe.send(("error", str(e)))
     named.clear()
+    held.clear()
     for conn in conns:
         conn.close()
     db.close()
@@ -193,11 +224,11 @@ def scratch_root(tmp: str | None = None) -> str:
     return root
 
 
-def strace_executable() -> str:
-    path = os.path.join(tempfile.gettempdir(), f"lbug-sim-strace-{os.getuid()}.sh")
-    if not os.path.exists(path):
+def wrapper_executable(name: str, text: str) -> str:
+    path = os.path.join(tempfile.gettempdir(), f"lbug-sim-{name}-{os.getuid()}.sh")
+    if not os.path.exists(path) or open(path).read() != text:
         with open(path, "w") as f:
-            f.write(STRACE_WRAPPER)
+            f.write(text)
         os.chmod(path, 0o755)
     return path
 
@@ -220,11 +251,21 @@ class Engine:
         self.process = context.Process(
             target=worker_main, args=(child, path, config, loads), daemon=True
         )
-        self.pid, self.gdb, self.request = None, None, "open"
+        self.pid, self.request, self.build = None, "open", {}
+        self.gdb_output = None
         if inject:
             env = dict(SIM_STRACE_SYSCALL=inject[0], SIM_STRACE_WHEN=str(inject[1]))
+            executable = wrapper_executable("strace", STRACE_WRAPPER)
+        elif debug:
+            fd, self.gdb_output = tempfile.mkstemp(prefix="lbug-sim-gdb-", suffix=".txt")
+            os.close(fd)
+            env = dict(SIM_GDB_SIGNALS=GDB_SIGNALS, SIM_GDB_OUT=self.gdb_output)
+            executable = wrapper_executable("gdb", GDB_WRAPPER)
+        else:
+            env, executable = {}, None
+        if executable:
             os.environ.update(env, SIM_PYTHON=sys.executable)
-            context.set_executable(strace_executable())
+            context.set_executable(executable)
             try:
                 self.process.start()
             finally:
@@ -236,20 +277,12 @@ class Engine:
         # Without closing its copy of the worker's end, a dead worker never reads as EOF.
         child.close()
         try:
-            self.pid = self.reply()
+            self.build = self.reply()
         except EngineError:
             self.process.join()
             self.pipe.close()
             raise
-        if debug:
-            self.gdb = subprocess.Popen(
-                ["gdb", "-q", "-batch", "-p", str(self.pid)]
-                + ["-ex", f"handle {GDB_SIGNALS} nostop noprint pass", "-ex", "continue"]
-                + ["-ex", "thread apply all bt 25"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-            )
+        self.pid = self.build.pop("pid")
 
     def send(self, message, request: str) -> None:
         self.request = request
@@ -275,6 +308,15 @@ class Engine:
         self.send(("run", name, params), f"execute prepared {name}")
         return self.reply()
 
+    def hold(self, conn: int) -> int:
+        """Fills the buffer pool with results kept unconsumed on `conn`; returns how many."""
+        self.send(("hold", conn), "hold results")
+        return self.reply()
+
+    def release(self) -> None:
+        self.send(("release",), "release results")
+        self.reply()
+
     def start(self, query: str) -> None:
         """Sends a statement without waiting for it, to kill the worker while it runs."""
         self.send((0, query, {}), query)
@@ -292,9 +334,12 @@ class Engine:
             status, value = self.pipe.recv()
         except EOFError:
             self.process.join()
+            stacks = self.stacks_of_crash()
+            # Under gdb the exit code is gdb's; the signal is in its output.
+            signal_name = re.search(r"received signal (SIG\w+)", stacks)
+            how = signal_name[1] if signal_name else f"exit code {self.process.exitcode}"
             raise AssertionError(
-                f"engine process died with exit code {self.process.exitcode} on {self.request}"
-                + self.stacks_of_crash()
+                f"engine process died with {how} on {self.request}" + stacks
             ) from None
         if status == "error":
             raise EngineError(value)
@@ -303,20 +348,18 @@ class Engine:
     def stacks_of_hang(self) -> str:
         if self.pid is None:
             return ""
-        if self.gdb:
+        if self.gdb_output:
             os.kill(self.pid, signal.SIGINT)  # gdb stops the worker and prints its stacks
             return self.stacks_of_crash()
         return gdb_stacks(self.pid)
 
     def stacks_of_crash(self) -> str:
-        if not self.gdb:
+        """The stacks gdb wrote when the worker stopped; gdb exits once it has written them."""
+        if not self.gdb_output:
             return ""
-        try:
-            output, _ = self.gdb.communicate(timeout=120)
-        except subprocess.TimeoutExpired:
-            self.gdb.kill()
-            output, _ = self.gdb.communicate()
-        self.gdb = None
+        self.process.join(timeout=120)
+        with open(self.gdb_output) as f:
+            output = f.read()
         return "\n" + native_stacks(output)
 
     def close(self) -> None:
@@ -338,7 +381,6 @@ class Engine:
         self.stop_gdb()
 
     def stop_gdb(self) -> None:
-        if self.gdb:
-            self.gdb.kill()
-            self.gdb.wait()
-            self.gdb = None
+        if self.gdb_output:
+            os.remove(self.gdb_output)
+            self.gdb_output = None

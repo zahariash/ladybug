@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 from collections import Counter
 from dataclasses import dataclass, field
@@ -16,6 +17,7 @@ from dataclasses import dataclass, field
 from engine import Engine, EngineError
 from hypothesis.stateful import precondition
 from model import Model, canonical
+from triage import signature
 
 # Every name rules are gated on, so --sim-skip can reject names that match nothing. Rules add
 # theirs when their module is imported.
@@ -45,10 +47,17 @@ def gated(*names: str) -> None:
     RULE_NAMES.update(names)
 
 
-def enabled(name: str):
-    """Runs the rule unless --sim-skip, --sim-focus or known.py turn `name` off."""
+def enabled(name: str, writes: bool = True):
+    """Runs the rule unless --sim-skip, --sim-focus or known.py turn `name` off. A rule that
+    writes waits until no session holds a write transaction, since only one can be open."""
     gated(name)
-    return precondition(lambda self: self.engine is not None and name not in self.options.skipped)
+    return precondition(
+        lambda self: (
+            self.engine is not None
+            and name not in self.options.skipped
+            and not (writes and self.session_writer() is not None)
+        )
+    )
 
 
 def with_extension(name: str, extension: str | None = None):
@@ -59,6 +68,7 @@ def with_extension(name: str, extension: str | None = None):
             self.engine is not None
             and bool(self.options.loaded if extension is None else extension in self.options.loaded)
             and name not in self.options.skipped
+            and self.session_writer() is None
         )
     )
 
@@ -67,6 +77,22 @@ def diff(actual: Counter, expected: Counter) -> str:
     missing = list((expected - actual).items())[:5]
     unexpected = list((actual - expected).items())[:5]
     return f"missing={missing} unexpected={unexpected}"
+
+
+RULE_MARKERS = ("hypothesis_stateful_rule", "hypothesis_stateful_invariant")
+# Every failure this process recorded, for the terminal summary: (kind, slug, directory).
+FAILURES: list[tuple[str, str, str]] = []
+
+
+def failure_kind(error: BaseException) -> str:
+    message = str(error)
+    if isinstance(error, EngineError):
+        return "error"
+    if message.startswith("engine hung"):
+        return "hung"
+    if message.startswith("engine process died"):
+        return "died"
+    return "wrong result"
 
 
 def outcome_of(error: BaseException) -> str:
@@ -90,6 +116,17 @@ class Session:
     config: dict
     trace: list
     kept: dict  # names of the prepared statements the current worker keeps
+    # Open transactions on the session connections (rules/sessions.py), by connection.
+    txns: dict
+
+    def session_writer(self) -> int | None:
+        """The session connection holding the write transaction, if any."""
+        return next((conn for conn, txn in self.txns.items() if txn.kind == "write"), None)
+
+    def checkpoint_keeps_snapshots(self) -> bool:
+        """Whether a CHECKPOINT now leaves the sessions' snapshots alone: a checkpoint breaks
+        open read-only transactions (#1184)."""
+        return "snapshot_checkpoint" not in self.options.skipped or not self.txns
 
     # Engine lifecycle
 
@@ -97,13 +134,44 @@ class Session:
         self.trace = []
         op = dict(op="open", config=self.config, loads=list(self.options.extensions))
         self.traced(op, self.open_engine)
+        op["build"] = self.engine.build
+
+    def current_rule(self) -> str | None:
+        """The rule or invariant of this machine that is running, from the call stack."""
+        frame = sys._getframe(1)
+        while frame:
+            method = getattr(type(self), frame.f_code.co_name, None)
+            if frame.f_locals.get("self") is self and any(
+                hasattr(method, marker) for marker in RULE_MARKERS
+            ):
+                return frame.f_code.co_name
+            frame = frame.f_back
+        return None
+
+    def record_failure(self, error: BaseException) -> dict:
+        """Appends the failure to the trace: its kind, its message (with native stacks for a
+        crash or hang) and its signature (see triage.py)."""
+        kind, message = failure_kind(error), str(error)
+        step = next(
+            (
+                op
+                for op in reversed(self.trace)
+                if op.get("outcome", "ok") != "ok" and not op.get("expected")
+            ),
+            self.trace[-1],
+        )
+        record = dict(op="failure", kind=kind, message=message[:8000])
+        record["signature"] = signature(kind, step, message)
+        self.trace.append(record)
+        return record
 
     def save_trace(self) -> None:
         with open(os.path.join(self.files, "trace.json"), "w") as f:
             json.dump(self.trace, f, indent=1, default=str)
 
     def traced(self, op: dict, call):
-        """Records `op`, runs `call` and records how it ended."""
+        """Records `op` with the rule it belongs to, runs `call` and records how it ended."""
+        op["rule"] = self.current_rule()
         self.trace.append(op)
         try:
             result = call()
@@ -116,6 +184,11 @@ class Session:
     def open_engine(self, inject: tuple[str, int] | None = None) -> None:
         self.engine = None
         self.kept = {}
+        # A new worker has new connections, without transactions; rolled-back inserts may still
+        # count as rows until compaction (see bulk_copy).
+        for txn in getattr(self, "txns", {}).values():
+            self.model.persons_ever |= txn.view.persons_ever
+        self.txns = {}
         config = self.config
         if inject:
             # With one worker thread, the caller and the worker take turns, so the n-th call
@@ -167,18 +240,24 @@ class Session:
         op = dict(op="execute", conn=conn, query=query, params=params or {})
         return self.traced(op, lambda: self.engine.execute(query, params or {}, conn))
 
-    def ok(self, query: str, params: dict | None = None) -> None:
-        self.run(query, params)
+    def ok(self, query: str, params: dict | None = None, conn: int = 0) -> None:
+        self.run(query, params, conn)
 
-    def fails(self, query: str, params: dict | None, error: str) -> None:
+    def fails(self, query: str, params: dict | None, error: str, conn: int = 0) -> None:
         """The statement must fail with a message containing `error`."""
         try:
-            self.run(query, params)
+            self.run(query, params, conn)
         except EngineError as e:
             self.trace[-1]["expected"] = True
             assert error in str(e), f"{query} {params} failed with {e!r}, expected {error!r}"
             return
         raise AssertionError(f"expected an error with {error!r}: {query} {params}")
+
+    def hold_results(self, conn: int) -> int:
+        return self.traced(dict(op="hold", conn=conn), lambda: self.engine.hold(conn))
+
+    def release_results(self) -> None:
+        self.traced(dict(op="release"), self.engine.release)
 
     def rows(self, query: str, params: dict | None = None, conn: int = 0) -> list[tuple]:
         return [canonical(row) for row in self.run(query, params, conn)]
@@ -191,20 +270,28 @@ class Session:
         op = dict(op="run", name=name, params=params)
         return [canonical(row) for row in self.traced(op, lambda: self.engine.run(name, params))]
 
-    def check(self, query: str, params: dict, expected: list, ordered: bool = False) -> None:
+    def check(
+        self,
+        query: str,
+        params: dict,
+        expected: list,
+        ordered: bool = False,
+        conn: int = 0,
+        alone: bool = False,
+    ) -> None:
         """Runs the query four ways and compares each result with `expected`: a statement
         prepared now, executed again so that it reuses its cached plan, the driver's own path
         (which caches prepared statements across steps when there are parameters), and on the
-        single-threaded connection."""
+        single-threaded connection. Inside a transaction (`alone`, or a session connection)
+        another connection would see another state, so the query runs on `conn` only."""
         expected = [canonical(row) for row in expected]
-        runs = {
-            "fresh plan": None,
-            "cached plan": None,
-            "driver": self.rows(query, params, 0),
-            "single thread": self.rows(query, params, 1),
-        }
-        op = dict(op="prepared", conn=0, query=query, params=params)
-        prepared = self.traced(op, lambda: self.engine.execute_prepared(query, params))
+        runs = {"fresh plan": None, "cached plan": None}
+        if conn not in self.txns or "snapshot_prepared" not in self.options.skipped:
+            runs["driver"] = self.rows(query, params, conn)
+        if conn == 0 and not alone:
+            runs["single thread"] = self.rows(query, params, 1)
+        op = dict(op="prepared", conn=conn, query=query, params=params)
+        prepared = self.traced(op, lambda: self.engine.execute_prepared(query, params, conn))
         runs["fresh plan"], runs["cached plan"] = ([canonical(r) for r in rs] for rs in prepared)
         for how, actual in runs.items():
             same = actual == expected if ordered else Counter(actual) == Counter(expected)
@@ -231,6 +318,7 @@ class Session:
                 position = matches[0]
             assert reader[-1] == states[-1], (reader[-1], states[-1])
 
-    def person_rows(self) -> Counter:
-        columns = "".join(f", p.{column}" for column in self.model.columns)
-        return Counter(self.rows(f"MATCH (p:Person) RETURN p.id{columns}"))
+    def person_rows(self, model: Model | None = None, conn: int = 0) -> Counter:
+        """Person's rows, with the columns `model` (by default the committed one) has."""
+        columns = "".join(f", p.{column}" for column in (model or self.model).columns)
+        return Counter(self.rows(f"MATCH (p:Person) RETURN p.id{columns}", None, conn))

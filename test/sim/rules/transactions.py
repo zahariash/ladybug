@@ -8,14 +8,12 @@ fails because no transaction is active.
 
 from __future__ import annotations
 
-from collections import Counter
-
 import hypothesis.strategies as st
 from engine import EngineError
 from hypothesis.stateful import precondition, rule
 from model import Model
-from session import DUPLICATE_KEY, Session, diff, enabled, gated
-from strategies import ints, macro_ids, small_ids, table_ids
+from session import DUPLICATE_KEY, Session, enabled, gated
+from strategies import clusters, extra_columns, ints, macro_ids, small_ids, table_ids
 
 ENDS = ["commit", "rollback", "crash"]
 gated("txn_ddl", "txn_error", *(f"txn_{end}" for end in ENDS))
@@ -30,8 +28,13 @@ op = st.one_of(
     st.tuples(st.just("insert_t"), table_ids, st.integers(-1000, 1000)),
     st.tuples(st.just("create_macro"), macro_ids, st.integers(-5, 5)),
     st.tuples(st.just("duplicate"), small_ids, st.none()),
+    st.tuples(st.just("add_column"), extra_columns, st.integers(-5, 5)),
+    st.tuples(st.just("drop_column"), extra_columns, st.none()),
+    st.tuples(st.just("drop_table"), table_ids, st.none()),
+    st.tuples(st.just("drop_macro"), macro_ids, st.none()),
 )
-DDL_OPS = {"create_table", "create_macro"}
+DDL_OPS = {"create_table", "create_macro", "add_column", "drop_column", "drop_table", "drop_macro"}
+gated("txn_drop_column")
 
 
 def statement(model: Model, kind: str, a, b) -> tuple[str, dict, str | None] | None:
@@ -59,6 +62,16 @@ def statement(model: Model, kind: str, a, b) -> tuple[str, dict, str | None] | N
         if a in model.macros:
             return None
         return f"CREATE MACRO m{a}(x) AS x + {b}", {}, None
+    if kind == "add_column":
+        query = f"ALTER TABLE Person ADD {a} INT64 DEFAULT {b}"
+        return query, {}, "already has property" if a in model.columns else None
+    if kind == "drop_column":
+        query = f"ALTER TABLE Person DROP {a}"
+        return query, {}, None if a in model.columns else "does not have property"
+    if kind == "drop_table":
+        return (f"DROP TABLE T{a}", {}, None) if a in model.tables else None
+    if kind == "drop_macro":
+        return (f"DROP MACRO m{a}", {}, None) if a in model.macros else None
     if a not in model.persons:
         return None
     return "CREATE (:Person {id: $id})", dict(id=a), DUPLICATE_KEY
@@ -79,6 +92,19 @@ def apply(model: Model, kind: str, a, b) -> None:
         model.tables[a].append(b)
     elif kind == "create_macro":
         model.macros[a] = b
+    elif kind == "add_column":
+        model.columns[a] = b
+        model.persons = {id: {**p, a: b} for id, p in model.persons.items()}
+    elif kind == "drop_column":
+        del model.columns[a]
+        model.persons = {
+            id: {c: v for c, v in p.items() if c != a} for id, p in model.persons.items()
+        }
+        model.dropped_columns.add(a)
+    elif kind == "drop_table":
+        del model.tables[a]
+    elif kind == "drop_macro":
+        del model.macros[a]
 
 
 class TransactionRules(Session):
@@ -90,7 +116,19 @@ class TransactionRules(Session):
             + tuple(DDL_OPS)
             if not (kind in DDL_OPS and "txn_ddl" in skipped)
             and not (kind == "duplicate" and "txn_error" in skipped)
+            and not (kind == "drop_column" and "txn_drop_column" in skipped)
         ]
+
+    def runs(self, model: Model, kind: str, a) -> bool:
+        """Whether an op runs: its kind is allowed, and it re-adds no dropped column while that
+        bug is known."""
+        if kind not in self.allowed_ops():
+            return False
+        return not (
+            kind == "add_column"
+            and a in model.dropped_columns
+            and "readd_column" in self.options.skipped
+        )
 
     @enabled("transaction")
     @rule(ops=st.lists(op, min_size=1, max_size=12), data=st.data())
@@ -98,12 +136,13 @@ class TransactionRules(Session):
         """Runs ops in a transaction, checks that it sees its own writes, then ends it."""
         ends = [end for end in ENDS if f"txn_{end}" not in self.options.skipped]
         end = data.draw(st.sampled_from(ends or ["commit"]))
-        allowed = self.allowed_ops()
         pending = self.model.fork()  # what the transaction sees
         active = True
         self.ok("BEGIN TRANSACTION")
-        for kind, a, b in (o for o in ops if o[0] in allowed):
+        for kind, a, b in ops:
             target = pending if active else self.model
+            if not self.runs(target, kind, a):
+                continue
             step = statement(target, kind, a, b)
             if step is None:
                 continue
@@ -117,16 +156,14 @@ class TransactionRules(Session):
             self.model.persons_ever |= pending.persons_ever
             active = False
         if active:
-            self.check_own_writes(pending)
+            self.check_own_writes(pending, data)
         self.end(end, pending, active)
 
-    def check_own_writes(self, pending: Model) -> None:
-        actual = self.person_rows()
-        expected = pending.person_rows()
-        assert actual == expected, "inside the transaction: " + diff(actual, expected)
-        query = "MATCH (a:Person)-[k:Knows]->(b:Person) RETURN a.id, b.id, k.since"
-        actual = Counter(self.rows(query))
-        assert actual == pending.knows, "inside the transaction: " + diff(actual, pending.knows)
+    def check_own_writes(self, pending: Model, data) -> None:
+        """The query battery inside the transaction, against its own writes."""
+        x, limit = data.draw(st.integers(-200, 200)), data.draw(st.integers(1, 20))
+        id, cluster = data.draw(small_ids), data.draw(clusters)
+        self.check_view(pending, 0, x, id, limit, cluster, alone=True)
 
     def end(self, end: str, pending: Model, active: bool) -> None:
         if not active:

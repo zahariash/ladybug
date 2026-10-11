@@ -55,8 +55,13 @@ class DataRules(Session):
         self.model.forget(id)
 
     @enabled("persons")
-    @rule(src=small_ids, dst=small_ids, since=ints)
-    def insert_knows(self, src, dst, since):
+    @rule(data=st.data(), since=ints)
+    def insert_knows(self, data, since):
+        """Between existing persons about half the time, so that edges are common."""
+        endpoint = small_ids
+        if self.model.persons:
+            endpoint = st.one_of(st.sampled_from(sorted(self.model.persons)), small_ids)
+        src, dst = data.draw(endpoint), data.draw(endpoint)
         self.ok(
             "MATCH (a:Person {id: $a}), (b:Person {id: $b}) CREATE (a)-[:Knows {since: $s}]->(b)",
             dict(a=src, b=dst, s=since),

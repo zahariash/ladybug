@@ -7,12 +7,14 @@ import subprocess
 import sys
 
 from engine import (
+    GDB_WRAPPER,
     KEEP_MARKER,
     SCRATCH_PREFIX,
+    STRACE_WRAPPER,
     native_stacks,
     read_state,
     scratch_root,
-    strace_executable,
+    wrapper_executable,
 )
 from model import Model
 from rules.durability import STATE_QUERIES, race_state
@@ -71,10 +73,16 @@ def test_race_state_of_an_empty_model() -> None:
 
 
 def test_the_strace_wrapper_kills_at_the_requested_call() -> None:
-    path = strace_executable()
+    path = wrapper_executable("strace", STRACE_WRAPPER)
     assert os.access(path, os.X_OK)
     script = open(path).read()
     assert "signal=KILL:when=$SIM_STRACE_WHEN" in script and "exec strace" in script
+
+
+def test_the_gdb_wrapper_starts_the_worker_and_writes_stacks_to_a_file() -> None:
+    script = open(wrapper_executable("gdb", GDB_WRAPPER)).read()
+    assert "-ex run" in script and '--args "$SIM_PYTHON"' in script
+    assert script.rstrip().endswith('> "$SIM_GDB_OUT" 2>&1')
 
 
 def test_scratch_roots_of_dead_processes_are_removed(tmp_path) -> None:

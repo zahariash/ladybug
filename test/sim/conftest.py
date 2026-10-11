@@ -1,18 +1,21 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
-import tempfile
 from collections.abc import Iterator
 
 import machine  # noqa: F401  imports every rule module, so that RULE_NAMES is complete
 import pytest
 from engine import KEEP_MARKER, scratch_root
 from hypothesis import HealthCheck, settings
+from hypothesis.database import DirectoryBasedExampleDatabase
 from known import KNOWN_BUGS, known_rules
-from session import RULE_NAMES, Options
+from session import FAILURES, RULE_NAMES, Options
 
-DEFAULT_TRACES = os.path.join(tempfile.gettempdir(), f"lbug-sim-traces-{os.getpid()}")
+# Next to Hypothesis's own example database, which it already keeps out of git; not in the
+# temporary directory, which wrappers that clean up after a run delete.
+DEFAULT_TRACES = os.path.abspath(os.path.join(".hypothesis", "traces"))
 
 # Rule groups each focus turns off.
 FOCUS = {
@@ -32,6 +35,20 @@ FOCUS = {
         "pk_index",
         "race",
         "crash_during",
+    },
+    # Transactions on several connections over person and Knows writes and column DDL.
+    "sessions": {
+        "bulk_copy",
+        "partitions",
+        "macros",
+        "tables",
+        "rename_table",
+        "rel_columns",
+        "prepared_ddl",
+        "pk_index",
+        "race",
+        "crash_during",
+        "crash_at_syscall",
     },
 }
 
@@ -77,8 +94,8 @@ def pytest_addoption(parser) -> None:
     group.addoption(
         "--sim-trace-dir",
         default=DEFAULT_TRACES,
-        help="where the trace and files of the current workload go; after a failure, "
-        "<dir>/current/trace.json is the failing workload, for replay.py",
+        help="where traces go: each failing workload is kept as <dir>/failed/<signature>/, "
+        "for replay.py",
     )
 
 
@@ -111,10 +128,17 @@ def sim_options(pytestconfig) -> Iterator[Options]:
 
 
 @pytest.fixture(scope="session")
-def sim_settings(pytestconfig) -> settings:
+def sim_settings(pytestconfig, sim_options) -> settings:
+    # Failing examples are saved and replayed first next time, but only for the same rules:
+    # a run with another gate lifted must not start with this run's failures.
+    rules = sorted(sim_options.skipped) + list(sim_options.extensions)
+    rules.append(str(pytestconfig.getoption("sim_steps")))
+    key = hashlib.sha1("\n".join(rules).encode()).hexdigest()[:12]
     return settings(
         max_examples=pytestconfig.getoption("sim_examples"),
         stateful_step_count=pytestconfig.getoption("sim_steps"),
+        database=DirectoryBasedExampleDatabase(os.path.join(".hypothesis", "sim", key)),
+        print_blob=True,
         deadline=None,
         # Steps are slow (a worker process, real I/O) and data is drawn inside rules.
         suppress_health_check=[HealthCheck.too_slow, HealthCheck.data_too_large],
@@ -130,15 +154,18 @@ def pytest_report_header(config) -> list[str]:
 
 
 def pytest_terminal_summary(terminalreporter, exitstatus, config) -> None:
-    trace = os.path.join(config.getoption("sim_trace_dir"), "current", "trace.json")
-    if exitstatus != 0 and os.path.exists(trace):
-        terminalreporter.write_line(
-            f"trace of the failing workload: {trace}\n"
-            f"replay it with: python test/sim/replay.py {trace} --runs 5 [--minimize] [--gdb]"
-        )
+    """Each failure's kept trace and the command that starts its triage (docs/testing.md)."""
+    for kind, slug, kept in FAILURES:
+        trace = os.path.join(kept, "trace.json")
+        if kind == "wrong result":
+            command = "rerun it alone with the @reproduce_failure blob printed above"
+        else:
+            command = f"python test/sim/replay.py {trace} --runs 5 --minimize --emit"
+        terminalreporter.write_line(f"{kind} {slug}: {trace}\n  triage: {command}")
 
 
 def pytest_sessionfinish(session, exitstatus) -> None:
+    """Failed workloads stay under failed/ for triage; the workload in progress does not."""
     traces = session.config.getoption("sim_trace_dir", None)
-    if exitstatus == 0 and traces == DEFAULT_TRACES:
-        shutil.rmtree(traces, ignore_errors=True)
+    if traces:
+        shutil.rmtree(os.path.join(traces, f"current-{os.getpid()}"), ignore_errors=True)

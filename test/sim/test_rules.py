@@ -83,3 +83,29 @@ def test_prepared_reads_expect_what_the_model_holds() -> None:
     assert expected_rows(model, "person_by_id", 7, 0) == []
     assert expected_rows(model, "count_age", 0, 0) == [(1,)]
     assert expected_rows(model, "knows_from", 1, 0) == [(2,), (2,)]
+
+
+def test_transaction_ddl_ops_change_the_catalog_and_flag_conflicts() -> None:
+    model = small_model()
+    assert statement(model, "add_column", "c1", 3) == (
+        "ALTER TABLE Person ADD c1 INT64 DEFAULT 3",
+        {},
+        None,
+    )
+    apply(model, "add_column", "c1", 3)
+    assert model.columns["c1"] == 3 and all(p["c1"] == 3 for p in model.persons.values())
+    assert statement(model, "add_column", "c1", 0)[2] == "already has property"
+    apply(model, "drop_column", "c1", None)
+    assert "c1" not in model.columns and "c1" in model.dropped_columns
+    assert statement(model, "drop_column", "c1", None)[2] == "does not have property"
+    assert statement(model, "drop_table", 4, None) is None
+    model.tables[4] = [1]
+    assert statement(model, "drop_table", 4, None) == ("DROP TABLE T4", {}, None)
+
+
+def test_session_rules_are_rules_of_the_machine() -> None:
+    """A helper of the same name in an earlier mixin would shadow a rule."""
+    from machine import LadybugSim
+
+    for name in ("begin_read", "begin_write", "session_write", "session_read", "end_session"):
+        assert hasattr(getattr(LadybugSim, name), "hypothesis_stateful_rule"), name

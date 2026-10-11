@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 import tempfile
 
 import hypothesis.strategies as st
@@ -15,8 +16,10 @@ from rules.data import DataRules
 from rules.durability import DurabilityRules
 from rules.extensions import ExtensionRules
 from rules.prepared import PreparedRules
+from rules.sessions import SessionRules
 from rules.transactions import TransactionRules
 from search import SearchChecks
+from session import FAILURES
 
 SCHEMA = [
     "CREATE NODE TABLE Person(id INT64 PRIMARY KEY, name STRING, age INT64, score DOUBLE)",
@@ -31,6 +34,7 @@ class LadybugSim(
     TransactionRules,
     CatalogRules,
     PreparedRules,
+    SessionRules,
     ExtensionRules,
     DurabilityRules,
     SearchChecks,
@@ -48,7 +52,7 @@ class LadybugSim(
         self.dir = tempfile.mkdtemp(prefix="db-", dir=self.options.scratch)
         self.path = os.path.join(self.dir, "db")
         # The files of the current workload live with its trace, so a failure can be replayed.
-        self.files = os.path.join(self.options.traces or self.dir, "current")
+        self.files = os.path.join(self.options.traces or self.dir, f"current-{os.getpid()}")
         shutil.rmtree(self.files, ignore_errors=True)
         os.makedirs(self.files)
         self.config = dict(
@@ -63,9 +67,31 @@ class LadybugSim(
             self.ok(statement)
 
     def teardown(self):
+        # Hypothesis calls teardown in a finally block, so a failing step's error is in flight;
+        # its own exceptions, which end an example early, are not failures.
+        error = sys.exc_info()[1]
+        if not isinstance(error, Exception) or type(error).__module__.startswith("hypothesis"):
+            error = None
         if getattr(self, "trace", None) is not None:
+            record = self.record_failure(error) if error is not None else None
             self.save_trace()
+            if record:
+                self.keep_failure(record)
         if self.engine:
             self.engine.kill()
         if self.dir and not self.options.keep:
             shutil.rmtree(self.dir, ignore_errors=True)
+
+    def keep_failure(self, record: dict) -> None:
+        """Copies the failing workload's trace and files to failed/<signature>/, which a smaller
+        example of the same failure replaces while Hypothesis shrinks."""
+        slug = record["signature"]["slug"]
+        kept = os.path.join(self.options.traces or self.dir, "failed", slug)
+        copy = f"{kept}.{os.getpid()}"
+        shutil.rmtree(copy, ignore_errors=True)
+        shutil.copytree(self.files, copy)
+        shutil.rmtree(kept, ignore_errors=True)
+        os.replace(copy, kept)
+        failure = (record["kind"], slug, kept)
+        if failure not in FAILURES:
+            FAILURES.append(failure)

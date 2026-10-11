@@ -45,6 +45,7 @@ class Model:
     tables: dict = field(default_factory=dict)  # i -> values of T{i}.v, in insertion order
     partitioned: dict = field(default_factory=dict)  # id -> cluster, in L
     pk_index: str | None = "_PK"  # the name of Person's primary-key index, if any
+    dropped_columns: set = field(default_factory=set)  # Person columns dropped at some point
     docs: dict = field(default_factory=dict)  # id -> Doc
     doc_indexes: dict = field(default_factory=dict)  # "doc_fts"/"doc_vec" -> stemmer/metric
     next_bulk_id: int = BULK_ID_START
@@ -71,8 +72,9 @@ class Model:
             self.knows[(src, dst, since)] += count
 
     def fork(self) -> Model:
-        """A copy that transactions and races can change. They write only small ids, Knows,
-        macros and T tables, so bulk rows and docs are shared, not copied."""
+        """A copy that transactions and races can change, and that an open transaction keeps as
+        its snapshot. Writes change only small ids, and DDL replaces a person's dict rather than
+        changing it, so bulk rows and docs are shared, not copied."""
         persons = {id: dict(p) if id < BULK_ID_START else p for id, p in self.persons.items()}
         return replace(
             self,
@@ -81,6 +83,8 @@ class Model:
             knows=Counter(self.knows),
             macros=dict(self.macros),
             tables={i: list(values) for i, values in self.tables.items()},
+            partitioned=dict(self.partitioned),
+            dropped_columns=set(self.dropped_columns),
         )
 
     def take_bulk_ids(self, count: int) -> range:

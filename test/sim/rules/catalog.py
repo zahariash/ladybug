@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import hypothesis.strategies as st
 from hypothesis.stateful import precondition, rule
-from session import Session, enabled
+from session import Session, enabled, gated
 from strategies import EXTRA_COLUMNS, extra_columns, macro_ids, table_ids
+
+gated("readd_column")
 
 
 class CatalogRules(Session):
@@ -62,10 +64,11 @@ class CatalogRules(Session):
         if column in self.model.columns:
             self.fails(query, None, "already has property")
             return
+        if column in self.model.dropped_columns and "readd_column" in self.options.skipped:
+            return
         self.ok(query)
         self.model.columns[column] = default
-        for person in self.model.persons.values():
-            person[column] = default
+        self.model.persons = {id: {**p, column: default} for id, p in self.model.persons.items()}
 
     @enabled("columns")
     @rule(column=extra_columns)
@@ -76,8 +79,10 @@ class CatalogRules(Session):
             return
         self.ok(query)
         del self.model.columns[column]
-        for person in self.model.persons.values():
-            del person[column]
+        self.model.dropped_columns.add(column)
+        self.model.persons = {
+            id: {c: v for c, v in p.items() if c != column} for id, p in self.model.persons.items()
+        }
 
     @enabled("pk_index")
     @precondition(lambda self: self.model.pk_index is not None)

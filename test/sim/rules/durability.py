@@ -44,16 +44,17 @@ def race_state(model: Model) -> tuple:
 
 class DurabilityRules(Session):
     @enabled("checkpoint")
+    @precondition(lambda self: self.checkpoint_keeps_snapshots())
     @rule()
     def checkpoint(self):
         self.ok("CHECKPOINT")
 
-    @enabled("reopen")
+    @enabled("reopen", writes=False)
     @rule()
     def reopen(self):
         self.reopen_engine()
 
-    @enabled("crash")
+    @enabled("crash", writes=False)
     @rule()
     def crash(self):
         self.crash_engine()
@@ -144,7 +145,7 @@ class DurabilityRules(Session):
     )
     def race(self, ops, num_readers):
         """Writes race readers; every read transaction must see one committed state, in order."""
-        if "race_checkpoint" in self.options.skipped:
+        if "race_checkpoint" in self.options.skipped and self.checkpoint_keeps_snapshots():
             # Empties the WAL, so that the race's writes cannot trigger an automatic checkpoint.
             self.ok("CHECKPOINT")
         model = self.model.fork()
@@ -157,7 +158,9 @@ class DurabilityRules(Session):
         """The statements for `ops`, applied to `model`, and the state after each of them."""
         states, writes = [race_state(model)], []
         for op, id, value in ops:
-            if op == "checkpoint" and "race_checkpoint" in self.options.skipped:
+            if op == "checkpoint" and (
+                "race_checkpoint" in self.options.skipped or not self.checkpoint_keeps_snapshots()
+            ):
                 continue
             if op == "insert":
                 if id in model.persons:
