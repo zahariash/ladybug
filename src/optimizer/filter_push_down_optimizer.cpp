@@ -14,9 +14,11 @@
 #include "catalog/catalog_entry/index_catalog_entry.h"
 #include "catalog/catalog_entry/table_catalog_entry.h"
 #include "common/data_chunk/data_chunk_state.h"
+#include "common/exception/exception.h"
 #include "common/string_utils.h"
 #include "common/types/value/nested.h"
 #include "common/vector/value_vector.h"
+#include "expression_evaluator/expression_evaluator_utils.h"
 #include "function/list/vector_list_functions.h"
 #include "main/attached_database.h"
 #include "main/client_context.h"
@@ -436,13 +438,100 @@ static bool isListContains(const Expression& expression) {
     return name == function::ListContainsFunction::name || name == function::ListHasFunction::name;
 }
 
-// Pops `n.property IN <constant list>` for which canUseIndex(property, list) holds and returns the
-// list. The list must already have the property's type, so its elements are usable as index keys.
+static void collectOrOperands(const std::shared_ptr<Expression>& expression,
+    expression_vector& operands) {
+    if (expression->expressionType == ExpressionType::OR) {
+        for (auto& child : expression->getChildren()) {
+            collectOrOperands(child, operands);
+        }
+        return;
+    }
+    operands.push_back(expression);
+}
+
+static void collectParameters(const Expression& expression,
+    std::vector<const ParameterExpression*>& parameters) {
+    if (expression.expressionType == ExpressionType::PARAMETER) {
+        parameters.push_back(&expression.constCast<ParameterExpression>());
+    }
+    for (auto& child : expression.getChildren()) {
+        collectParameters(*child, parameters);
+    }
+}
+
+struct EqualityDisjunctionKeys {
+    std::shared_ptr<Expression> property;
+    std::shared_ptr<Expression> keys;
+    std::vector<const ParameterExpression*> parameters;
+};
+
+// For `n.p = c1 OR n.p = c2 OR ...` with constants of the property's type, returns the property and
+// a literal list of the non-NULL constants. A filter keeps a row only when the predicate is true,
+// so dropping the NULL constants doesn't change which rows match.
+static std::optional<EqualityDisjunctionKeys> getEqualityDisjunctionKeys(
+    const std::shared_ptr<Expression>& predicate, const Expression& nodeID,
+    main::ClientContext* context) {
+    if (predicate->expressionType != ExpressionType::OR) {
+        return std::nullopt;
+    }
+    expression_vector operands;
+    collectOrOperands(predicate, operands);
+    EqualityDisjunctionKeys result;
+    std::vector<std::unique_ptr<Value>> keys;
+    for (auto& operand : operands) {
+        if (operand->expressionType != ExpressionType::EQUALS) {
+            return std::nullopt;
+        }
+        auto lhs = operand->getChild(0);
+        auto rhs = operand->getChild(1);
+        if (!isNodeProperty(*lhs, nodeID)) {
+            std::swap(lhs, rhs);
+        }
+        if (!isNodeProperty(*lhs, nodeID) || !isConstantExpression(rhs) ||
+            rhs->getDataType() != lhs->getDataType() ||
+            (result.property != nullptr &&
+                lhs->getUniqueName() != result.property->getUniqueName())) {
+            return std::nullopt;
+        }
+        result.property = lhs;
+        collectParameters(*rhs, result.parameters);
+        std::optional<Value> key;
+        try {
+            key = evaluator::ExpressionEvaluatorUtils::evaluateConstantExpression(rhs, context);
+        } catch (const Exception&) {
+            // Leave a constant that fails to evaluate, e.g. a bad cast, to the filter.
+            return std::nullopt;
+        }
+        if (!key->isNull()) {
+            keys.push_back(std::make_unique<Value>(std::move(*key)));
+        }
+    }
+    auto list = Value(LogicalType::LIST(result.property->getDataType().copy()), std::move(keys));
+    result.keys =
+        std::make_shared<LiteralExpression>(std::move(list), predicate->getUniqueName() + "_keys");
+    return result;
+}
+
+// Pops `n.property IN <constant list>`, or an OR of equalities on the property, for which
+// canUseIndex(property, list) holds and returns the list. The list must already have the
+// property's type, so its elements are usable as index keys.
 static std::shared_ptr<Expression> popInListComparison(PredicateSet& predicateSet,
-    const Expression& nodeID,
+    const Expression& nodeID, main::ClientContext* context,
     const std::function<bool(const PropertyExpression&, const Expression&)>& canUseIndex) {
     auto& predicates = predicateSet.nonEqualityPredicates;
     for (auto i = 0u; i < predicates.size(); ++i) {
+        if (auto disjunction = getEqualityDisjunctionKeys(predicates[i], nodeID, context)) {
+            if (canUseIndex(disjunction->property->constCast<PropertyExpression>(),
+                    *disjunction->keys)) {
+                // The key list holds the parameters' current values.
+                for (auto* parameter : disjunction->parameters) {
+                    parameter->markBakedIntoPlan();
+                }
+                predicates.erase(predicates.begin() + i);
+                return disjunction->keys;
+            }
+            continue;
+        }
         if (!isListContains(*predicates[i])) {
             continue;
         }
@@ -508,7 +597,7 @@ std::shared_ptr<LogicalOperator> FilterPushDownOptimizer::visitScanNodeTableRepl
         if (pkIndex != nullptr && dynamic_cast<storage::ColumnarNodeTableBase*>(table) == nullptr) {
             const auto isHashIndex = pkIndex->getIndexInfo().indexType !=
                                      storage::ArtPrimaryKeyIndex::getIndexType().typeName;
-            primaryKeyList = popInListComparison(predicateSet, *nodeID,
+            primaryKeyList = popInListComparison(predicateSet, *nodeID, context,
                 [&](const PropertyExpression& property, const Expression& list) {
                     return property.isPrimaryKey(tableIDs[0]) &&
                            isPrimaryKeyLookupCheaper(tableIDs[0], getNumKeys(list), isHashIndex);
@@ -546,7 +635,7 @@ std::shared_ptr<LogicalOperator> FilterPushDownOptimizer::visitScanNodeTableRepl
             scan.computeFlatSchema();
         } else {
             std::string indexName;
-            auto keyList = popInListComparison(predicateSet, *nodeID,
+            auto keyList = popInListComparison(predicateSet, *nodeID, context,
                 [&](const PropertyExpression& property, const Expression& list) {
                     indexName = getSecondaryARTIndexName(property, tableIDs[0], context, dbName);
                     return !indexName.empty() &&

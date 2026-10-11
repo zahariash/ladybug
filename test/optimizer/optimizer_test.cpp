@@ -322,6 +322,43 @@ TEST_F(OptimizerTest, InListIndexScanTest) {
     ASSERT_EQ(result->getNext()->getValue(0)->getValue<int64_t>(), 1);
 }
 
+TEST_F(OptimizerTest, OrOfEqualitiesIndexScan) {
+    auto plan = [&](const std::string& predicate) {
+        return getEncodedPlan("MATCH (a:person) WHERE " + predicate + " RETURN a.ID;");
+    };
+    ASSERT_STREQ(plan("a.ID = 0 OR a.ID = 2").c_str(), "IndexScan(a)");
+    ASSERT_STREQ(plan("a.ID = 0 OR 2 = a.ID OR a.ID = 3").c_str(), "IndexScan(a)");
+    // Different properties, a non-constant or a non-equality operand: no single key list.
+    ASSERT_STREQ(plan("a.ID = 0 OR a.age = 35").c_str(), "Filter()S(a)");
+    ASSERT_STREQ(plan("a.ID = 0 OR a.ID = a.age").c_str(), "Filter()S(a)");
+    ASSERT_STREQ(plan("a.ID = 0 OR a.ID > 5").c_str(), "Filter()S(a)");
+    ASSERT_TRUE(
+        conn->query("CREATE ART INDEX person_fname FOR (a:person) ON (a.fName);")->isSuccess());
+    ASSERT_STREQ(plan("a.fName = 'Alice' OR a.fName = 'Bob'").c_str(), "IndexScan(a)");
+    // The binder casts these constants to the SERIAL key type.
+    ASSERT_TRUE(
+        conn->query("CREATE NODE TABLE serial_or(id SERIAL, PRIMARY KEY(id));")->isSuccess());
+    ASSERT_STREQ(
+        getEncodedPlan("MATCH (s:serial_or) WHERE s.id = 1 OR s.id = 3 RETURN s.id;").c_str(),
+        "IndexScan(s)");
+
+    auto prepared = conn->prepare("MATCH (a:person) WHERE a.ID = $x OR a.ID = $y RETURN count(*);");
+    auto count = [&](common::Value x, common::Value y) {
+        std::unordered_map<std::string, std::unique_ptr<common::Value>> params;
+        params["x"] = std::make_unique<common::Value>(std::move(x));
+        params["y"] = std::make_unique<common::Value>(std::move(y));
+        auto result = conn->executeWithParams(prepared.get(), std::move(params));
+        EXPECT_TRUE(result->isSuccess()) << result->getErrorMessage();
+        return result->getNext()->getValue(0)->getValue<int64_t>();
+    };
+    // Each execution is planned for its own parameter values.
+    ASSERT_EQ(count(common::Value(int64_t{0}), common::Value(int64_t{2})), 2);
+    ASSERT_EQ(count(common::Value(int64_t{3}), common::Value(int64_t{3})), 1);
+    ASSERT_EQ(count(common::Value(int64_t{5}),
+                  common::Value::createNullValue(common::LogicalType::INT64())),
+        1);
+}
+
 TEST_F(OptimizerTest, PlanAfterDropColumnWithUncommittedRows) {
     ASSERT_TRUE(
         conn->query("CREATE NODE TABLE dropped(id INT64, a STRING, name STRING, PRIMARY KEY(id));")
