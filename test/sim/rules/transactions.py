@@ -196,6 +196,7 @@ class TransactionRules(Session):
         try:
             self.run("UNWIND $ids AS i CREATE (:Person {id: i})", dict(ids=ids))
         except EngineError as e:
+            self.trace[-1]["expected"] = True
             assert DUPLICATE_KEY in str(e), e
             self.model.persons_ever = True
             return

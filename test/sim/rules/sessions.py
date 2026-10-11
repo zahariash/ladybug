@@ -169,6 +169,7 @@ class SessionRules(Session):
             self.ok("COMMIT", conn=conn)
             committed = True
         except EngineError as e:
+            self.trace[-1]["expected"] = True
             committed = COMMITTED_BUT in str(e)
             assert committed or POOL_FULL in str(e), e
         self.release_results()

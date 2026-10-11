@@ -136,6 +136,7 @@ class DataRules(Session):
             try:
                 self.ok(query)
             except EngineError as e:
+                self.trace[-1]["expected"] = True
                 assert NO_PK_INDEX in str(e), e
                 return
         else:

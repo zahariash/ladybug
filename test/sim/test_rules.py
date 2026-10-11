@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import ast
+import pathlib
+
 import conftest
 import pytest
 from known import known_rules
@@ -109,3 +112,14 @@ def test_session_rules_are_rules_of_the_machine() -> None:
 
     for name in ("begin_read", "begin_write", "session_write", "session_read", "end_session"):
         assert hasattr(getattr(LadybugSim, name), "hypothesis_stateful_rule"), name
+
+
+def test_rules_mark_the_errors_they_expect() -> None:
+    """Triage and replay take any unmarked error in a trace for the failure."""
+    for path in pathlib.Path(__file__).parent.glob("rules/*.py"):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.ExceptHandler) and ast.unparse(node.type) == "EngineError":
+                body = ast.unparse(node)
+                assert "['expected'] = True" in body or "raise" in body, (
+                    f"{path.name}:{node.lineno}"
+                )
