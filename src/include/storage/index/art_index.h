@@ -95,6 +95,7 @@ public:
     bool lookupAll(const transaction::Transaction* transaction, common::ValueVector* keyVector,
         uint64_t vectorPos, std::vector<common::offset_t>& results,
         visible_func isVisible) override;
+    std::optional<uint64_t> countKey(common::ValueVector* keyVector, uint64_t vectorPos) override;
     bool scanPrimaryKeyRange(common::ValueVector* lowerBoundVector, uint64_t lowerBoundPos,
         bool lowerInclusive, common::ValueVector* upperBoundVector, uint64_t upperBoundPos,
         bool upperInclusive, common::idx_t maxResults, std::vector<common::offset_t>& results,
@@ -180,6 +181,8 @@ private:
     Node* findOrCreateLeaf(const std::vector<uint8_t>& key);
     bool lookup(const ArtKey& key, common::offset_t& result, visible_func isVisible) const;
     const Node* findLeaf(const ArtKey& key) const;
+    // Offsets stored under the key in the on-disk tree, or nullopt if the key is absent.
+    std::optional<std::vector<common::offset_t>> findDiskLeafOffsets(const ArtKey& key) const;
     void appendVisibleOffsets(const Node& node, std::vector<common::offset_t>& results,
         visible_func isVisible) const;
     bool eraseInternal(Node& node, const std::vector<uint8_t>& key, uint64_t depth);
