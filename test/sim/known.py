@@ -61,13 +61,19 @@ KNOWN_BUGS = [
         "(#1185 family, not filed)",
     ),
     Known(
-        "txn_drop_column",
-        "dropping a middle column inside a write transaction mixes up the transaction's new rows: "
-        "wrong values after COMMIT, or a segfault reading them (not filed)",
+        "txn_column_gap",
+        "after a column is dropped and another added (or a middle one dropped in the transaction), "
+        "a transaction's new rows are misplaced until a checkpoint: wrong values after COMMIT, or "
+        "a segfault reading them (not filed)",
     ),
     Known(
         "pool_commit",
         "#1182: a COMMIT failing on a full buffer pool deletes checkpointed relationships (#1195)",
+    ),
+    Known(
+        "rollback_add",
+        "a rolled-back ALTER TABLE ADD leaves its column data behind; the next ADD reads it until "
+        "a checkpoint (not filed)",
     ),
     Known(
         "second_writer",

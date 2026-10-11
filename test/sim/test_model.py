@@ -80,3 +80,24 @@ def test_doc_text_is_null_without_words() -> None:
     assert Doc(None, None).text is None
     assert Doc([], None).text is None
     assert Doc(["apple", "grape"], None).text == "apple grape"
+
+
+def test_a_discarded_transaction_flags_columns_it_added_until_a_checkpoint() -> None:
+    model = Model()
+    view = model.fork()
+    view.add_column("c1", 3)
+    model.discarded(view)
+    assert model.rolled_back_add and "c1" not in model.columns
+    model.checkpointed()
+    assert not model.rolled_back_add
+
+
+def test_dropping_then_adding_a_column_marks_the_gap_until_a_checkpoint() -> None:
+    model = Model()
+    model.add_column("c1", 1)
+    assert not model.added_after_drop
+    model.drop_column("c1")
+    model.add_column("c2", 2)
+    assert model.dropped_since_checkpoint and model.added_after_drop
+    model.checkpointed()
+    assert not (model.dropped_since_checkpoint or model.added_after_drop)

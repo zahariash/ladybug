@@ -34,7 +34,7 @@ op = st.one_of(
     st.tuples(st.just("drop_macro"), macro_ids, st.none()),
 )
 DDL_OPS = {"create_table", "create_macro", "add_column", "drop_column", "drop_table", "drop_macro"}
-gated("txn_drop_column")
+gated("txn_column_gap", "rollback_add")
 
 
 def statement(model: Model, kind: str, a, b) -> tuple[str, dict, str | None] | None:
@@ -93,14 +93,9 @@ def apply(model: Model, kind: str, a, b) -> None:
     elif kind == "create_macro":
         model.macros[a] = b
     elif kind == "add_column":
-        model.columns[a] = b
-        model.persons = {id: {**p, a: b} for id, p in model.persons.items()}
+        model.add_column(a, b)
     elif kind == "drop_column":
-        del model.columns[a]
-        model.persons = {
-            id: {c: v for c, v in p.items() if c != a} for id, p in model.persons.items()
-        }
-        model.dropped_columns.add(a)
+        model.drop_column(a)
     elif kind == "drop_table":
         del model.tables[a]
     elif kind == "drop_macro":
@@ -116,21 +111,30 @@ class TransactionRules(Session):
             + tuple(DDL_OPS)
             if not (kind in DDL_OPS and "txn_ddl" in skipped)
             and not (kind == "duplicate" and "txn_error" in skipped)
-            and not (kind == "drop_column" and "txn_drop_column" in skipped)
+            and not (kind == "drop_column" and "txn_column_gap" in skipped)
         ]
 
     def runs(self, model: Model, kind: str, a) -> bool:
-        """Whether an op runs: its kind is allowed, and it re-adds no dropped column while that
-        bug is known."""
+        """Whether an op runs: its kind is allowed, and it hits no bug in known.py: re-adding a
+        dropped column, or adding one after a drop since the last checkpoint."""
         if kind not in self.allowed_ops():
             return False
-        return not (
-            kind == "add_column"
-            and a in model.dropped_columns
-            and "readd_column" in self.options.skipped
-        )
+        skipped = self.options.skipped
+        if kind != "add_column":
+            return True
+        if a in model.dropped_columns and "readd_column" in skipped:
+            return False
+        if model.rolled_back_add and "rollback_add" in skipped:
+            return False
+        return not (model.dropped_since_checkpoint and "txn_column_gap" in skipped)
+
+    def column_gap_safe(self) -> bool:
+        """A transaction's new rows are misplaced once a column was dropped and another added
+        since the last checkpoint."""
+        return "txn_column_gap" not in self.options.skipped or not self.model.added_after_drop
 
     @enabled("transaction")
+    @precondition(lambda self: self.column_gap_safe())
     @rule(ops=st.lists(op, min_size=1, max_size=12), data=st.data())
     def transaction(self, ops, data):
         """Runs ops in a transaction, checks that it sees its own writes, then ends it."""
@@ -153,7 +157,7 @@ class TransactionRules(Session):
                 continue
             self.fails(query, params, error)
             # The failed statement rolled the transaction back; later ones run on their own.
-            self.model.persons_ever |= pending.persons_ever
+            self.model.discarded(pending)
             active = False
         if active:
             self.check_own_writes(pending, data)
@@ -169,8 +173,7 @@ class TransactionRules(Session):
         if not active:
             self.fails("COMMIT" if end == "commit" else "ROLLBACK", None, NO_TRANSACTION)
             return
-        # Rolled-back inserts may still count as rows until compaction (see bulk_copy).
-        self.model.persons_ever |= pending.persons_ever
+        self.model.discarded(pending)
         if end == "commit":
             self.ok("COMMIT")
             self.model = pending

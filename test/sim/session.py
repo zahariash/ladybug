@@ -184,11 +184,12 @@ class Session:
     def open_engine(self, inject: tuple[str, int] | None = None) -> None:
         self.engine = None
         self.kept = {}
-        # A new worker has new connections, without transactions; rolled-back inserts may still
-        # count as rows until compaction (see bulk_copy).
+        # A new worker has new connections, without transactions.
         for txn in getattr(self, "txns", {}).values():
-            self.model.persons_ever |= txn.view.persons_ever
+            self.model.discarded(txn.view)
         self.txns = {}
+        if getattr(self, "model", None) is not None:
+            self.model.checkpointed()  # opening replays the WAL and checkpoints
         config = self.config
         if inject:
             # With one worker thread, the caller and the worker take turns, so the n-th call

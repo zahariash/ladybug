@@ -46,6 +46,35 @@ class Model:
     partitioned: dict = field(default_factory=dict)  # id -> cluster, in L
     pk_index: str | None = "_PK"  # the name of Person's primary-key index, if any
     dropped_columns: set = field(default_factory=set)  # Person columns dropped at some point
+    # Since the last checkpoint: a Person column was dropped, and then one was added. Column IDs
+    # have a gap until a checkpoint compacts them.
+    dropped_since_checkpoint: bool = False
+    added_after_drop: bool = False
+    # A transaction that added a column was rolled back since the last checkpoint.
+    rolled_back_add: bool = False
+
+    def drop_column(self, column: str) -> None:
+        del self.columns[column]
+        self.persons = {
+            id: {c: v for c, v in p.items() if c != column} for id, p in self.persons.items()
+        }
+        self.dropped_columns.add(column)
+        self.dropped_since_checkpoint = True
+
+    def add_column(self, column: str, default) -> None:
+        self.columns[column] = default
+        self.persons = {id: {**p, column: default} for id, p in self.persons.items()}
+        self.added_after_drop |= self.dropped_since_checkpoint
+
+    def checkpointed(self) -> None:
+        self.dropped_since_checkpoint = self.added_after_drop = self.rolled_back_add = False
+
+    def discarded(self, view: Model) -> None:
+        """A transaction that saw `view` ended without committing: its inserts may still count
+        as rows until compaction (see bulk_copy), and the columns it added leave data behind."""
+        self.persons_ever |= view.persons_ever
+        self.rolled_back_add |= bool(set(view.columns) - set(self.columns))
+
     docs: dict = field(default_factory=dict)  # id -> Doc
     doc_indexes: dict = field(default_factory=dict)  # "doc_fts"/"doc_vec" -> stemmer/metric
     next_bulk_id: int = BULK_ID_START

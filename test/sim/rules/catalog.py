@@ -64,11 +64,13 @@ class CatalogRules(Session):
         if column in self.model.columns:
             self.fails(query, None, "already has property")
             return
-        if column in self.model.dropped_columns and "readd_column" in self.options.skipped:
+        skipped = self.options.skipped
+        if column in self.model.dropped_columns and "readd_column" in skipped:
+            return
+        if self.model.rolled_back_add and "rollback_add" in skipped:
             return
         self.ok(query)
-        self.model.columns[column] = default
-        self.model.persons = {id: {**p, column: default} for id, p in self.model.persons.items()}
+        self.model.add_column(column, default)
 
     @enabled("columns")
     @rule(column=extra_columns)
@@ -78,11 +80,7 @@ class CatalogRules(Session):
             self.fails(query, None, "does not have property")
             return
         self.ok(query)
-        del self.model.columns[column]
-        self.model.dropped_columns.add(column)
-        self.model.persons = {
-            id: {c: v for c, v in p.items() if c != column} for id, p in self.model.persons.items()
-        }
+        self.model.drop_column(column)
 
     @enabled("pk_index")
     @precondition(lambda self: self.model.pk_index is not None)

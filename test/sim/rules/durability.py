@@ -48,6 +48,7 @@ class DurabilityRules(Session):
     @rule()
     def checkpoint(self):
         self.ok("CHECKPOINT")
+        self.model.checkpointed()
 
     @enabled("reopen", writes=False)
     @rule()

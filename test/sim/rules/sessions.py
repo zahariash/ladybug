@@ -58,7 +58,7 @@ class SessionRules(Session):
         self.txns[conn] = Txn("read", self.model.fork())
 
     @enabled("sessions")
-    @precondition(lambda self: self.free_sessions())
+    @precondition(lambda self: self.free_sessions() and self.column_gap_safe())
     @rule(data=st.data())
     def begin_write(self, data):
         conn = data.draw(st.sampled_from(self.free_sessions()))
@@ -85,7 +85,7 @@ class SessionRules(Session):
             return
         self.fails(query, params, error, conn)
         del self.txns[conn]
-        self.model.persons_ever |= txn.view.persons_ever
+        self.model.discarded(txn.view)
 
     # The two rules below write the id into the query: the driver caches a parameterized
     # statement even when preparing it failed, and would keep returning that error.
@@ -141,6 +141,7 @@ class SessionRules(Session):
     @rule(data=st.data())
     def session_checkpoint(self, data):
         self.ok("CHECKPOINT", conn=data.draw(st.sampled_from([0, *self.free_sessions()])))
+        self.model.checkpointed()
 
     @enabled("sessions", writes=False)
     @precondition(lambda self: self.txns)
@@ -150,8 +151,7 @@ class SessionRules(Session):
         txn = self.txns.pop(conn)
         self.ok("COMMIT" if commit else "ROLLBACK", conn=conn)
         if txn.kind == "write":
-            # Rolled-back inserts may still count as rows until compaction (see bulk_copy).
-            self.model.persons_ever |= txn.view.persons_ever
+            self.model.discarded(txn.view)
             if commit:
                 self.model = txn.view
 
@@ -172,6 +172,22 @@ class SessionRules(Session):
             committed = COMMITTED_BUT in str(e)
             assert committed or POOL_FULL in str(e), e
         self.release_results()
-        self.model.persons_ever |= txn.view.persons_ever
+        self.model.discarded(txn.view)
         if committed:
             self.model = txn.view
+
+    @enabled("sessions")
+    @precondition(lambda self: self.readers() and self.model.persons)
+    @rule(data=st.data(), kind=st.sampled_from(["knows", "knows", "insert", "set_age", "delete"]))
+    def commit_beside_snapshot(self, data, kind):
+        """An auto-commit write while a snapshot is open, between existing persons, which the
+        snapshot must not see."""
+        existing = st.sampled_from(sorted(self.model.persons))
+        a = data.draw(small_ids if kind == "insert" else existing)
+        b = data.draw(existing if kind == "knows" else st.integers(-100, 100))
+        step = statement(self.model, kind, a, b)
+        if step is None:
+            return
+        query, params, _ = step
+        self.ok(query, params)
+        apply(self.model, kind, a, b)
