@@ -6,6 +6,9 @@ namespace lbug {
 namespace main {
 class ClientContext;
 }
+namespace binder {
+class PropertyExpression;
+} // namespace binder
 namespace planner {
 class CardinalityEstimator;
 } // namespace planner
@@ -99,6 +102,18 @@ private:
 
     std::shared_ptr<planner::LogicalOperator> visitChildren(
         const std::shared_ptr<planner::LogicalOperator>& op);
+
+    // Whether looking up numKeys keys in an index is estimated to be cheaper than scanning the
+    // table. Without statistics the index is assumed cheaper.
+    bool isPrimaryKeyLookupCheaper(common::table_id_t tableID, uint64_t numKeys,
+        bool isHashIndex) const;
+    // keys is the equality operand, or the key list when isKeyList; literal keys are counted in
+    // the index.
+    bool isSecondaryARTLookupCheaper(common::table_id_t tableID, const std::string& dbName,
+        const binder::PropertyExpression& property, const std::string& indexName,
+        const binder::Expression& keys, bool isKeyList) const;
+    // numListKeys is the size of the IN list the scan would filter on, or 0 for a comparison.
+    double estimateScanCost(double numRows, uint64_t numListKeys) const;
 
 private:
     PredicateSet predicateSet;

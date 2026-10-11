@@ -304,6 +304,79 @@ TEST_F(OptimizerTest, ArithmeticIdentityEnablesIndexScan) {
     ASSERT_STREQ(getEncodedPlan(q6).c_str(), "Filter()S(a)");
 }
 
+TEST_F(OptimizerTest, IndexScanCostGuard) {
+    ASSERT_TRUE(conn->query("CREATE NODE TABLE guard(id INT64, u INT64, flag INT64, skew INT64, "
+                            "st INT64, PRIMARY KEY(id));")
+                    ->isSuccess());
+    // skew: half the rows share key 0, the rest are unique.
+    ASSERT_TRUE(
+        conn->query(
+                "COPY guard FROM (UNWIND range(0, 99999) AS i RETURN i, "
+                "(i * 7919) % 100000, i % 2, CASE WHEN i % 2 = 0 THEN 0 ELSE i END, i + 100000);")
+            ->isSuccess());
+    // st: the distinct-value estimate still counts the values overwritten here.
+    ASSERT_TRUE(conn->query("MATCH (g:guard) SET g.st = 1;")->isSuccess());
+    for (auto column : {"u", "flag", "skew", "st"}) {
+        ASSERT_TRUE(
+            conn->query(std::format("CREATE ART INDEX guard_{0} FOR (g:guard) ON (g.{0});", column))
+                ->isSuccess());
+    }
+    auto plan = [&](const std::string& predicate) {
+        return getEncodedPlan("MATCH (g:guard) WHERE " + predicate + " RETURN g.id;");
+    };
+    ASSERT_STREQ(plan("g.id IN [1, 2, 3]").c_str(), "IndexScan(g)");
+    ASSERT_STREQ(plan("g.u = 5").c_str(), "IndexScan(g)");
+    ASSERT_STREQ(plan("g.u IN [5, 6]").c_str(), "IndexScan(g)");
+    // Half the table matches, or too many keys: scanning is cheaper.
+    ASSERT_STREQ(plan("g.flag = 1").c_str(), "Filter()S(g)");
+    ASSERT_STREQ(plan("g.flag IN [1]").c_str(), "Filter()S(g)");
+    ASSERT_STREQ(plan("g.u IN range(1, 5000)").c_str(), "Filter()S(g)");
+    // Hash primary-key lookups stay cheaper than the scan even for long lists.
+    ASSERT_STREQ(plan("g.id IN range(1, 5000)").c_str(), "IndexScan(g)");
+    // Literal keys are counted in the index rather than estimated from an average.
+    ASSERT_STREQ(plan("g.skew = 7").c_str(), "IndexScan(g)");
+    ASSERT_STREQ(plan("g.skew IN [7, 9]").c_str(), "IndexScan(g)");
+    ASSERT_STREQ(plan("g.skew = 0").c_str(), "Filter()S(g)");
+    ASSERT_STREQ(plan("g.skew IN [0, 7]").c_str(), "Filter()S(g)");
+    ASSERT_STREQ(plan("g.st = 1").c_str(), "Filter()S(g)");
+}
+
+TEST_F(OptimizerTest, IndexScanCostGuardCountsUncommittedRows) {
+    ASSERT_TRUE(
+        conn->query("CREATE NODE TABLE pending(id INT64, u INT64, PRIMARY KEY(id));")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE ART INDEX pending_u FOR (p:pending) ON (p.u);")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE (:pending {id: 0, u: 0});")->isSuccess());
+    auto equality = "MATCH (p:pending) WHERE p.u = 5 RETURN p.id;";
+    auto inList = "MATCH (p:pending) WHERE p.u IN [5, 6] RETURN p.id;";
+    ASSERT_STREQ(getEncodedPlan(equality).c_str(), "IndexScan(p)");
+    ASSERT_TRUE(conn->query("BEGIN TRANSACTION;")->isSuccess());
+    ASSERT_TRUE(
+        conn->query("UNWIND range(1, 100000) AS i CREATE (:pending {id: i, u: i});")->isSuccess());
+    // Each ART lookup would also check all 100000 uncommitted rows.
+    ASSERT_STREQ(getEncodedPlan(equality).c_str(), "Filter()S(p)");
+    ASSERT_STREQ(getEncodedPlan(inList).c_str(), "Filter()S(p)");
+    ASSERT_TRUE(conn->query("ROLLBACK;")->isSuccess());
+    ASSERT_STREQ(getEncodedPlan(equality).c_str(), "IndexScan(p)");
+    ASSERT_STREQ(getEncodedPlan(inList).c_str(), "IndexScan(p)");
+}
+
+TEST_F(OptimizerTest, IndexScanCostGuardAfterDropColumn) {
+    ASSERT_TRUE(
+        conn->query("CREATE NODE TABLE dropped(id INT64, a STRING, name STRING, PRIMARY KEY(id));")
+            ->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE (:dropped {id: 1, a: 'x', name: 'n1'});")->isSuccess());
+    ASSERT_TRUE(
+        conn->query("CREATE ART INDEX dropped_name FOR (d:dropped) ON (d.name);")->isSuccess());
+    ASSERT_TRUE(conn->query("ALTER TABLE dropped DROP a;")->isSuccess());
+    ASSERT_TRUE(conn->query("BEGIN TRANSACTION;")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE (:dropped {id: 100, name: 'n1'});")->isSuccess());
+    // Planning merges this transaction's statistics, which lack the dropped column.
+    ASSERT_STREQ(
+        getEncodedPlan("MATCH (d:dropped) WHERE d.name IN ['n1', 'n2'] RETURN d.id;").c_str(),
+        "IndexScan(d)");
+    ASSERT_TRUE(conn->query("ROLLBACK;")->isSuccess());
+}
+
 TEST_F(OptimizerTest, RemoveUnnecessaryJoinTest) {
     auto q1 = "MATCH (a:person)-[e:knows]->(b:person) "
               "HINT (a JOIN e) JOIN b "

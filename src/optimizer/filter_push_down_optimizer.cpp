@@ -7,12 +7,16 @@
 #include <unordered_set>
 
 #include "binder/expression/literal_expression.h"
+#include "binder/expression/parameter_expression.h"
 #include "binder/expression/property_expression.h"
 #include "binder/expression/scalar_function_expression.h"
 #include "catalog/catalog.h"
 #include "catalog/catalog_entry/index_catalog_entry.h"
 #include "catalog/catalog_entry/table_catalog_entry.h"
+#include "common/data_chunk/data_chunk_state.h"
 #include "common/string_utils.h"
+#include "common/types/value/nested.h"
+#include "common/vector/value_vector.h"
 #include "function/list/vector_list_functions.h"
 #include "main/attached_database.h"
 #include "main/client_context.h"
@@ -24,7 +28,10 @@
 #include "planner/operator/logical_hash_join.h"
 #include "planner/operator/logical_table_function_call.h"
 #include "planner/operator/scan/logical_scan_node_table.h"
+#include "storage/buffer_manager/memory_manager.h"
 #include "storage/index/art_index.h"
+#include "storage/local_storage/local_storage.h"
+#include "storage/local_storage/local_table.h"
 #include "storage/storage_manager.h"
 #include "storage/table/columnar_node_table_base.h"
 #include "storage/table/node_table.h"
@@ -243,9 +250,163 @@ static std::string getSecondaryARTIndexName(const PropertyExpression& property, 
     return {};
 }
 
+static const TableStats* getStorageStats(const CardinalityEstimator* cardinalityEstimator,
+    table_id_t tableID) {
+    if (cardinalityEstimator == nullptr) {
+        return nullptr;
+    }
+    auto* stats = cardinalityEstimator->getTableStats(tableID);
+    return stats != nullptr && stats->storageStats.has_value() ? &*stats->storageStats : nullptr;
+}
+
+double FilterPushDownOptimizer::estimateScanCost(double numRows, uint64_t numListKeys) const {
+    const auto numThreads = std::max<uint64_t>(1, context->getClientConfig()->numThreads);
+    if (numListKeys == 0) {
+        return PlannerKnobs::SCAN_STARTUP_COST + numRows * PlannerKnobs::SCAN_ROW_COST / numThreads;
+    }
+    return PlannerKnobs::SCAN_STARTUP_COST +
+           numRows * PlannerKnobs::IN_LIST_SCAN_ROW_COST / numThreads +
+           static_cast<double>(numListKeys) * PlannerKnobs::IN_LIST_SCAN_KEY_COST;
+}
+
+bool FilterPushDownOptimizer::isPrimaryKeyLookupCheaper(table_id_t tableID, uint64_t numKeys,
+    bool isHashIndex) const {
+    // Without statistics, keep preferring the index.
+    auto* stats = getStorageStats(cardinalityEstimator, tableID);
+    if (stats == nullptr) {
+        return true;
+    }
+    const auto keyCost = isHashIndex ? PlannerKnobs::HASH_INDEX_KEY_LOOKUP_COST :
+                                       PlannerKnobs::ART_INDEX_KEY_LOOKUP_COST;
+    const auto indexCost = numKeys * (keyCost + PlannerKnobs::INDEX_ROW_FETCH_COST);
+    return indexCost < PlannerKnobs::INDEX_SCAN_COST_MARGIN *
+                           estimateScanCost(static_cast<double>(stats->getTableCard()), numKeys);
+}
+
+static uint64_t getNumKeys(const Expression& keys);
+
+// Adds the number of index entries under each literal key, for up to MAX_PROBED_INDEX_KEYS keys,
+// to numMatchedRows and returns how many keys were counted.
+static uint64_t countLiteralKeyEntries(Index& index, const Expression& keys, bool isKeyList,
+    const LogicalType& keyType, MemoryManager* memoryManager, double& numMatchedRows) {
+    if (keys.expressionType != ExpressionType::LITERAL) {
+        return 0;
+    }
+    auto value = keys.constCast<LiteralExpression>().getValue();
+    std::vector<const Value*> keyValues;
+    if (isKeyList) {
+        const auto numKeys =
+            std::min<uint64_t>(value.getChildrenSize(), PlannerKnobs::MAX_PROBED_INDEX_KEYS);
+        for (auto i = 0u; i < numKeys; ++i) {
+            keyValues.push_back(NestedVal::getChildVal(&value, i));
+        }
+    } else {
+        keyValues.push_back(&value);
+    }
+    ValueVector keyVector(keyType.copy(), memoryManager);
+    keyVector.state = DataChunkState::getSingleValueDataChunkState();
+    double numEntries = 0;
+    for (auto* keyValue : keyValues) {
+        if (keyValue->getDataType() != keyType) {
+            return 0;
+        }
+        if (keyValue->isNull()) {
+            continue;
+        }
+        keyVector.copyFromValue(0, *keyValue);
+        const auto count = index.countKey(&keyVector, 0);
+        if (!count.has_value()) {
+            return 0;
+        }
+        numEntries += static_cast<double>(*count);
+    }
+    numMatchedRows += numEntries;
+    return keyValues.size();
+}
+
+bool FilterPushDownOptimizer::isSecondaryARTLookupCheaper(table_id_t tableID,
+    const std::string& dbName, const PropertyExpression& property, const std::string& indexName,
+    const Expression& keys, bool isKeyList) const {
+    // Without statistics, keep preferring the index.
+    auto* stats = getStorageStats(cardinalityEstimator, tableID);
+    if (stats == nullptr) {
+        return true;
+    }
+    const auto numKeys = isKeyList ? getNumKeys(keys) : 1;
+    const auto numRows = static_cast<double>(stats->getTableCard());
+    auto transaction = transaction::Transaction::Get(*context);
+    auto [cat, sm] = main::DatabaseManager::resolveTableStorage(*context, tableID, dbName);
+    // Literal keys are counted in the index: a per-key average misjudges hot keys and columns
+    // whose distinct-value estimate is stale.
+    double numMatchedRows = 0;
+    uint64_t numCountedKeys = 0;
+    if (auto index = sm->getTable(tableID)->ptrCast<NodeTable>()->getIndex(indexName)) {
+        numCountedKeys = countLiteralKeyEntries(*index.value(), keys, isKeyList,
+            property.getDataType(), MemoryManager::Get(*context), numMatchedRows);
+    }
+    if (numCountedKeys < numKeys) {
+        auto entry = cat->getTableCatalogEntry(transaction, tableID);
+        if (!entry->containsProperty(property.getPropertyName())) {
+            return true;
+        }
+        const auto columnID = entry->getColumnID(property.getPropertyName());
+        if (columnID == INVALID_COLUMN_ID || columnID == ROW_IDX_COLUMN_ID) {
+            return true;
+        }
+        const auto numDistinct = stats->getNumDistinctValues(columnID);
+        if (numDistinct == 0) {
+            return true;
+        }
+        const auto rowsPerKey = std::max(1.0, numRows / static_cast<double>(numDistinct));
+        numMatchedRows += static_cast<double>(numKeys - numCountedKeys) * rowsPerKey;
+    }
+    numMatchedRows = std::min(numRows, numMatchedRows);
+    // The ART index lacks this transaction's inserts, so each lookup also checks all of the
+    // transaction's uncommitted rows.
+    double numUncommittedRows = 0;
+    if (auto* localStorage = transaction->getLocalStorage()) {
+        if (auto* localTable = localStorage->getLocalTable(tableID)) {
+            numUncommittedRows = static_cast<double>(localTable->getNumTotalRows());
+        }
+    }
+    const auto indexCost = numKeys * PlannerKnobs::ART_INDEX_KEY_LOOKUP_COST +
+                           numMatchedRows * PlannerKnobs::INDEX_ROW_FETCH_COST +
+                           numUncommittedRows * PlannerKnobs::UNCOMMITTED_ROW_MATCH_COST;
+    return indexCost < PlannerKnobs::INDEX_SCAN_COST_MARGIN *
+                           estimateScanCost(numRows, isKeyList ? numKeys : 0);
+}
+
+// Number of keys in a constant key list: a literal, a parameter, or a cast of either.
+static uint64_t getNumKeys(const Expression& keys) {
+    switch (keys.expressionType) {
+    case ExpressionType::LITERAL: {
+        auto value = keys.constCast<LiteralExpression>().getValue();
+        return value.getDataType().getLogicalTypeID() == LogicalTypeID::LIST ?
+                   value.getChildrenSize() :
+                   1;
+    }
+    case ExpressionType::PARAMETER: {
+        auto& parameter = keys.constCast<ParameterExpression>();
+        // The index-or-scan choice depends on the list size, so the plan can't be reused for
+        // other values.
+        parameter.markBakedIntoPlan();
+        auto value = parameter.getValue();
+        return value.getDataType().getLogicalTypeID() == LogicalTypeID::LIST ?
+                   value.getChildrenSize() :
+                   1;
+    }
+    case ExpressionType::FUNCTION:
+        return getNumKeys(*keys.getChild(0));
+    default:
+        return 1;
+    }
+}
+
 static std::optional<std::pair<std::shared_ptr<Expression>, std::string>>
 popSecondaryARTEqualityComparison(PredicateSet& predicateSet, const Expression& nodeID,
-    table_id_t tableID, main::ClientContext* context, const std::string& dbName) {
+    table_id_t tableID, main::ClientContext* context, const std::string& dbName,
+    const std::function<bool(const PropertyExpression&, const Expression&, const std::string&)>&
+        isIndexCheaper) {
     for (auto i = 0u; i < predicateSet.equalityPredicates.size(); ++i) {
         auto predicate = predicateSet.equalityPredicates[i];
         auto lhs = predicate->getChild(0);
@@ -256,9 +417,9 @@ popSecondaryARTEqualityComparison(PredicateSet& predicateSet, const Expression& 
         if (!isNodeProperty(*lhs, nodeID) || !isConstantExpression(rhs)) {
             continue;
         }
-        auto indexName = getSecondaryARTIndexName(lhs->constCast<PropertyExpression>(), tableID,
-            context, dbName);
-        if (indexName.empty()) {
+        auto& property = lhs->constCast<PropertyExpression>();
+        auto indexName = getSecondaryARTIndexName(property, tableID, context, dbName);
+        if (indexName.empty() || !isIndexCheaper(property, *rhs, indexName)) {
             continue;
         }
         predicateSet.equalityPredicates.erase(predicateSet.equalityPredicates.begin() + i);
@@ -275,10 +436,11 @@ static bool isListContains(const Expression& expression) {
     return name == function::ListContainsFunction::name || name == function::ListHasFunction::name;
 }
 
-// Pops `n.property IN <constant list>` for a property accepted by canUseIndex and returns the
+// Pops `n.property IN <constant list>` for which canUseIndex(property, list) holds and returns the
 // list. The list must already have the property's type, so its elements are usable as index keys.
 static std::shared_ptr<Expression> popInListComparison(PredicateSet& predicateSet,
-    const Expression& nodeID, const std::function<bool(const PropertyExpression&)>& canUseIndex) {
+    const Expression& nodeID,
+    const std::function<bool(const PropertyExpression&, const Expression&)>& canUseIndex) {
     auto& predicates = predicateSet.nonEqualityPredicates;
     for (auto i = 0u; i < predicates.size(); ++i) {
         if (!isListContains(*predicates[i])) {
@@ -289,7 +451,7 @@ static std::shared_ptr<Expression> popInListComparison(PredicateSet& predicateSe
         if (!isNodeProperty(*element, nodeID) || !isConstantExpression(list) ||
             list->getDataType().getLogicalTypeID() != LogicalTypeID::LIST ||
             ListType::getChildType(list->getDataType()) != element->getDataType() ||
-            !canUseIndex(element->constCast<PropertyExpression>())) {
+            !canUseIndex(element->constCast<PropertyExpression>(), *list)) {
             continue;
         }
         predicates.erase(predicates.begin() + i);
@@ -317,8 +479,11 @@ std::shared_ptr<LogicalOperator> FilterPushDownOptimizer::visitScanNodeTableRepl
         auto [cat, sm] = main::DatabaseManager::resolveTableStorage(*context, id, dbName);
         return sm->getTable(id)->ptrCast<storage::NodeTable>();
     };
+    std::string dbName;
     if (tableIDs.size() == 1) {
         primaryKeyEqualityComparison = predicateSet.popNodePKEqualityComparison(*nodeID);
+        auto dbIt = dbMap.find(tableIDs[0]);
+        dbName = dbIt != dbMap.end() ? dbIt->second : std::string{};
     }
     if (primaryKeyEqualityComparison != nullptr) { // Try rewrite index scan
         auto* table = getResolvedTable(tableIDs[0]);
@@ -341,9 +506,12 @@ std::shared_ptr<LogicalOperator> FilterPushDownOptimizer::visitScanNodeTableRepl
         auto* pkIndex = table->tryGetPrimaryKeyIndex();
         std::shared_ptr<Expression> primaryKeyList = nullptr;
         if (pkIndex != nullptr && dynamic_cast<storage::ColumnarNodeTableBase*>(table) == nullptr) {
-            primaryKeyList =
-                popInListComparison(predicateSet, *nodeID, [&](const PropertyExpression& property) {
-                    return property.isPrimaryKey(tableIDs[0]);
+            const auto isHashIndex = pkIndex->getIndexInfo().indexType !=
+                                     storage::ArtPrimaryKeyIndex::getIndexType().typeName;
+            primaryKeyList = popInListComparison(predicateSet, *nodeID,
+                [&](const PropertyExpression& property, const Expression& list) {
+                    return property.isPrimaryKey(tableIDs[0]) &&
+                           isPrimaryKeyLookupCheaper(tableIDs[0], getNumKeys(list), isHashIndex);
                 });
         }
         if (primaryKeyList != nullptr) {
@@ -364,10 +532,13 @@ std::shared_ptr<LogicalOperator> FilterPushDownOptimizer::visitScanNodeTableRepl
         }
     }
     if (scan.getScanType() == LogicalScanNodeTableType::SCAN && tableIDs.size() == 1) {
-        auto dbIt = dbMap.find(tableIDs[0]);
-        auto dbName = dbIt != dbMap.end() ? dbIt->second : std::string{};
         auto secondaryIndexComparison =
-            popSecondaryARTEqualityComparison(predicateSet, *nodeID, tableIDs[0], context, dbName);
+            popSecondaryARTEqualityComparison(predicateSet, *nodeID, tableIDs[0], context, dbName,
+                [&](const PropertyExpression& property, const Expression& key,
+                    const std::string& indexName) {
+                    return isSecondaryARTLookupCheaper(tableIDs[0], dbName, property, indexName,
+                        key, false /* isKeyList */);
+                });
         if (secondaryIndexComparison.has_value()) {
             scan.setScanType(LogicalScanNodeTableType::SECONDARY_INDEX_SCAN);
             scan.setExtraInfo(std::make_unique<SecondaryIndexScanInfo>(
@@ -375,10 +546,12 @@ std::shared_ptr<LogicalOperator> FilterPushDownOptimizer::visitScanNodeTableRepl
             scan.computeFlatSchema();
         } else {
             std::string indexName;
-            auto keyList =
-                popInListComparison(predicateSet, *nodeID, [&](const PropertyExpression& property) {
+            auto keyList = popInListComparison(predicateSet, *nodeID,
+                [&](const PropertyExpression& property, const Expression& list) {
                     indexName = getSecondaryARTIndexName(property, tableIDs[0], context, dbName);
-                    return !indexName.empty();
+                    return !indexName.empty() &&
+                           isSecondaryARTLookupCheaper(tableIDs[0], dbName, property, indexName,
+                               list, true /* isKeyList */);
                 });
             if (keyList != nullptr) {
                 scan.setScanType(LogicalScanNodeTableType::SECONDARY_INDEX_SCAN);
