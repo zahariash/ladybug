@@ -120,9 +120,21 @@ later runs reach new bugs. Steps that call a parameterized statement a second ti
 the Python driver's cache of prepared statements; rule the driver out before blaming the
 engine.
 
-Wrong results cannot be minimized by replay: dropping an earlier step changes the right answer.
-The step list Hypothesis prints is already shrunk, and the trace maps each step to its
-statements.
+Wrong results have no engine failure to replay, so the oracle is the wrong answer itself: the
+failure record holds the query that showed it and the rows it returned, and the run's summary
+prints the command, e.g.
+
+```bash
+python test/sim/replay.py <trace> --probe "MATCH (p:Person) RETURN p.id, p.c2" \
+    --rows '[[1, 0]]' --pin "ADD c2 INT64 DEFAULT 1" --minimize
+```
+
+which keeps the steps for which the probe still returns one of those rows and writes
+`trace.probe.min.json` and `trace.probe.min.cypher`. Dropping a step can change the right answer
+too, so `--pin` keeps the steps that define it (here the default the rows should have), and the
+minimized steps need a check by hand that the rows are still wrong for them. Statements keep their
+parameters in the listing: drivers reuse a parameterized statement's plan, which some failures
+need.
 
 The simulator's own logic (model, search oracles, trace minimization, rule helpers) has unit
 tests next to it that need no database: `pytest test/sim -k "not simulation"`.

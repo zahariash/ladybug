@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from engine import Engine, EngineError
 from hypothesis.stateful import precondition
 from model import Model, canonical
-from triage import signature
+from triage import probe_of, signature
 
 # Every name rules are gated on, so --sim-skip can reject names that match nothing. Rules add
 # theirs when their module is imported.
@@ -80,8 +80,9 @@ def diff(actual: Counter, expected: Counter) -> str:
 
 
 RULE_MARKERS = ("hypothesis_stateful_rule", "hypothesis_stateful_invariant")
-# Every failure this process recorded, for the terminal summary: (kind, slug, directory).
-FAILURES: list[tuple[str, str, str]] = []
+# Every failure this process recorded, for the terminal summary: kind, slug, directory, and for a
+# wrong result the probe and its wrong rows.
+FAILURES: list[tuple] = []
 
 
 def failure_kind(error: BaseException) -> str:
@@ -162,6 +163,8 @@ class Session:
         )
         record = dict(op="failure", kind=kind, message=message[:8000])
         record["signature"] = signature(kind, step, message)
+        if kind == "wrong result" and (probe := probe_of(step, message)):
+            record["probe"], record["rows"] = probe
         self.trace.append(record)
         return record
 

@@ -52,6 +52,8 @@ class Model:
     added_after_drop: bool = False
     # A transaction that added a column was rolled back since the last checkpoint.
     rolled_back_add: bool = False
+    # In a transaction's view: it already ran a statement that prepared statements may reuse.
+    wrote: bool = False
 
     def drop_column(self, column: str) -> None:
         del self.columns[column]
@@ -114,6 +116,7 @@ class Model:
             tables={i: list(values) for i, values in self.tables.items()},
             partitioned=dict(self.partitioned),
             dropped_columns=set(self.dropped_columns),
+            wrote=False,
         )
 
     def take_bulk_ids(self, count: int) -> range:

@@ -9,6 +9,7 @@ failing trace; replay.py --emit writes the rest after minimizing.
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import math
@@ -70,6 +71,22 @@ def signature(kind: str, op: dict, message: str) -> dict:
     return {**fields, "key": key, "slug": f"{slug}-{key}"}
 
 
+def probe_of(op: dict, message: str) -> tuple[str, list] | None:
+    """For a wrong result: the query that shows it and the wrong rows it returned, from the
+    check's assertion (Session.check's tuple, or a data check's missing/unexpected diff)."""
+    try:
+        if message.startswith("("):
+            query, params, _, actual, expected = ast.literal_eval(message)
+            return inline(query, params), [list(r) for r in actual if r not in expected]
+        unexpected = re.search(r"unexpected=(\[.*\])\s*$", message, re.S)
+        if unexpected and op.get("query"):
+            rows = [list(row) for row, _ in ast.literal_eval(unexpected[1])]
+            return inline(op["query"], op.get("params") or {}), rows
+    except (ValueError, SyntaxError):
+        pass
+    return None
+
+
 def literal(value) -> str:
     """A Cypher literal for a parameter value."""
     if value is None:
@@ -94,6 +111,12 @@ def inline(query: str, params: dict) -> str:
     return query
 
 
+def terminated(statement: str) -> str:
+    """The statement with its semicolon before a trailing comment."""
+    query, _, comment = statement.partition("  // ")
+    return f"{query};  // {comment}" if comment else f"{query};"
+
+
 def cypher(trace: list, failing: int, failure: str, config: dict) -> str:
     """The steps up to the failing one as Cypher, with comments for everything that is not a
     statement: connections, crashes, reopens and the step that fails."""
@@ -104,11 +127,17 @@ def cypher(trace: list, failing: int, failure: str, config: dict) -> str:
     for i, op in enumerate(trace[1 : failing + 1], start=1):
         kind, conn = op["op"], op.get("conn", 0)
         where = f"// [connection {conn}]\n" if conn else ""
-        statement = inline(op["query"], op.get("params") or {}) if op.get("query") else ""
+        # Parameters stay parameters: a driver reuses a parameterized statement's prepared plan,
+        # which some failures need. Their values follow in a comment.
+        params = op.get("params") or {}
+        statement = op.get("query") or ""
+        if params:
+            values = ", ".join(f"${k} = {literal(v)}" for k, v in params.items())
+            statement = f"{statement}  // {values}"
         if kind == "execute":
-            text = f"{where}{statement};"
+            text = f"{where}{terminated(statement)}"
         elif kind == "prepared":
-            text = f"{where}// prepared, then executed twice:\n{statement};"
+            text = f"{where}// prepared, then executed twice:\n{terminated(statement)}"
         elif kind == "prepare":
             text = f"// prepare {op['name']}: {op['query']}"
         elif kind == "run":
@@ -118,9 +147,9 @@ def cypher(trace: list, failing: int, failure: str, config: dict) -> str:
         elif kind == "reopen":
             text = "// close the database and open it again"
         elif kind == "crash_during":
-            text = f"{statement};  // killed {op['delay']:.2f} s after it started; open again"
+            text = f"{terminated(statement)}  // killed {op['delay']:.2f} s after it started"
         elif kind == "crash_at":
-            text = f"{statement};  // killed at {op['syscall']} call {op['n']}; open again"
+            text = f"{terminated(statement)}  // killed at {op['syscall']} call {op['n']}"
         elif kind == "race":
             text = f"// race: {len(op['writes'])} writes against {op['readers']} readers"
         elif kind == "hold":

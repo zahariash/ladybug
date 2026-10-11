@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
 from collections.abc import Iterator
@@ -155,12 +156,16 @@ def pytest_report_header(config) -> list[str]:
 
 def pytest_terminal_summary(terminalreporter, exitstatus, config) -> None:
     """Each failure's kept trace and the command that starts its triage (docs/testing.md)."""
-    for kind, slug, kept in FAILURES:
+    for kind, slug, kept, probe, rows in FAILURES:
         trace = os.path.join(kept, "trace.json")
+        command = f"python test/sim/replay.py {trace} --runs 5 --minimize --emit"
         if kind == "wrong result":
             command = "rerun it alone with the @reproduce_failure blob printed above"
-        else:
-            command = f"python test/sim/replay.py {trace} --runs 5 --minimize --emit"
+            if probe:
+                command = (
+                    f"python test/sim/replay.py {trace} --probe {json.dumps(probe)} "
+                    f"--rows '{json.dumps(rows)}' --minimize --pin '<steps that set the answer>'"
+                )
         terminalreporter.write_line(f"{kind} {slug}: {trace}\n  triage: {command}")
 
 

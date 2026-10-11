@@ -76,6 +76,11 @@ KNOWN_BUGS = [
         "a checkpoint (not filed)",
     ),
     Known(
+        "txn_prepared_ddl",
+        "a statement prepared with parameters in a transaction is not rebound after ALTER TABLE "
+        "ADD in the same transaction: the new column gets 0, not its default (not filed)",
+    ),
+    Known(
         "second_writer",
         "after a refused BEGIN TRANSACTION, the connection's next statement segfaults (not filed)",
     ),

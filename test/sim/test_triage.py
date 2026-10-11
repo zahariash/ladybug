@@ -57,10 +57,10 @@ def test_signatures_ignore_literals_and_follow_frames() -> None:
     assert error["error"] == "Table T? does not exist" and error["frames"] == []
 
 
-def test_cypher_inlines_parameters_and_marks_lifetimes() -> None:
+def test_cypher_keeps_parameters_and_marks_lifetimes() -> None:
     text = triage.cypher(TRACE, 6, "died: CHECKPOINT", TRACE[0]["config"])
     assert "// database: compression=False, max_num_threads=7" in text
-    assert "// [connection 2]\nCREATE (:T3 {id: 1, s: 'a\\'b'});" in text
+    assert "// [connection 2]\nCREATE (:T3 {id: $id, s: $s});  // $id = 1, $s = 'a\\'b'" in text
     assert "// kill the process (SIGKILL), then open the database again" in text
     assert "CREATE (:T3 {id: 1});  // fails, as expected" in text
     assert text.rstrip().endswith("CHECKPOINT;\n// ^ died: CHECKPOINT")
@@ -100,3 +100,20 @@ def test_scripts_load_steps_with_nan_and_infinity() -> None:
     params = namespace["STAGES"][0]["steps"][0]["params"]
     assert params["x"] != params["x"] and params["y"] == float("-inf")
     assert triage.literal(float("nan")) == "CAST('nan' AS DOUBLE)"
+
+
+def test_probes_come_from_either_assertion_format() -> None:
+    check = (
+        "('MATCH (p:Person) WHERE p.c1 = $d RETURN count(*)', {'d': -1}, 'driver', [(0,)], [(2,)])"
+    )
+    assert triage.probe_of({}, check) == (
+        "MATCH (p:Person) WHERE p.c1 = -1 RETURN count(*)",
+        [[0]],
+    )
+    diff = "missing=[((1, None, 1), 1)] unexpected=[((1, None, 0), 1)]"
+    op = dict(op="execute", query="MATCH (p:Person) RETURN p.id, p.name, p.c2", params={})
+    assert triage.probe_of(op, diff) == (
+        "MATCH (p:Person) RETURN p.id, p.name, p.c2",
+        [[1, None, 0]],
+    )
+    assert triage.probe_of(op, "something else") is None

@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -158,6 +159,26 @@ def minimize(trace: list, fails) -> list:
     return trace[:1] + steps
 
 
+def probe_fails(trace: list, probe: str, wrong: list[tuple], conn: int) -> bool:
+    """Replays the trace, ignoring statement errors, then runs `probe` on `conn`: true while it
+    returns any of the `wrong` rows. A crash or hang counts as not failing this way."""
+    replayer = Replayer(trace, False)
+    try:
+        for op in trace:
+            try:
+                replayer.step(op)
+            except (EngineError, RaceError):
+                pass
+        rows = replayer.engine.execute(probe, {}, conn)
+    except (EngineError, AssertionError):
+        return False
+    finally:
+        if replayer.engine:
+            replayer.engine.kill()
+        shutil.rmtree(replayer.dir, ignore_errors=True)
+    return any(tuple(row) in wrong for row in rows)
+
+
 def simplifications(op: dict) -> list[list[dict]]:
     """Simpler steps that could replace `op`, simplest first."""
     options = []
@@ -235,6 +256,34 @@ def emit(trace: list, failure: tuple, needed: dict | None, out: str) -> str:
     )
 
 
+def minimize_wrong_result(trace: list, args) -> None:
+    """--probe: wrong results have no engine failure to replay, so the oracle is the probe
+    returning the recorded wrong rows; --pin keeps the steps that define the right answer."""
+    wrong = [tuple(row) for row in json.loads(args.rows)]
+    if not probe_fails(trace, args.probe, wrong, args.conn):
+        print("The probe does not return those rows on replay.")
+        return
+    print("The probe returns the wrong rows on replay.")
+    if not args.minimize:
+        return
+    pins = [op for op in trace if any(re.search(p, op.get("query") or "") for p in args.pin)]
+
+    def fails(candidate: list) -> bool:
+        kept = all(op in candidate for op in pins)
+        return kept and probe_fails(candidate, args.probe, wrong, args.conn)
+
+    trace = simplify(minimize(trace, fails), fails)
+    trace, needed = reduce_config(trace, fails)
+    out = os.path.dirname(os.path.abspath(args.trace))
+    with open(os.path.join(out, "trace.probe.min.json"), "w") as f:
+        json.dump(trace, f, indent=1, default=str)
+    probe = dict(op="execute", conn=args.conn, query=args.probe, params={})
+    listing = triage.cypher(trace + [probe], len(trace), f"returns {wrong}", needed)
+    with open(os.path.join(out, "trace.probe.min.cypher"), "w") as f:
+        f.write(listing)
+    print(f"\nMinimized to {len(trace)} steps (trace.probe.min.json):\n{listing}")
+
+
 def describe(op: dict) -> str:
     detail = op.get("query") or op.get("name") or ""
     if op["op"] == "crash_at":
@@ -253,9 +302,18 @@ def main() -> None:
     parser.add_argument(
         "--emit", action="store_true", help="write trace.min.cypher, trace.min.py, finding.json"
     )
+    parser.add_argument("--probe", help="for a wrong result: the query that returns it")
+    parser.add_argument("--rows", help="the wrong rows the probe returns, as a JSON list of lists")
+    parser.add_argument("--conn", type=int, default=0, help="the connection to probe on")
+    parser.add_argument(
+        "--pin", action="append", default=[], help="regex of steps --minimize must keep"
+    )
     args = parser.parse_args()
     with open(args.trace) as f:
-        trace = json.load(f)
+        trace = [op for op in json.load(f) if op["op"] != "failure"]
+    if args.probe:
+        minimize_wrong_result(trace, args)
+        return
     target = original_failure(trace)
     if target is None:
         print("The original run failed a model check; replay reports engine failures only.")

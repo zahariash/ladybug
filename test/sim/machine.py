@@ -92,6 +92,6 @@ class LadybugSim(
         shutil.copytree(self.files, copy)
         shutil.rmtree(kept, ignore_errors=True)
         os.replace(copy, kept)
-        failure = (record["kind"], slug, kept)
+        failure = (record["kind"], slug, kept, record.get("probe"), record.get("rows"))
         if failure not in FAILURES:
             FAILURES.append(failure)

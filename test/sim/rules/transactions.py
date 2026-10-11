@@ -34,7 +34,7 @@ op = st.one_of(
     st.tuples(st.just("drop_macro"), macro_ids, st.none()),
 )
 DDL_OPS = {"create_table", "create_macro", "add_column", "drop_column", "drop_table", "drop_macro"}
-gated("txn_column_gap", "rollback_add")
+gated("txn_column_gap", "rollback_add", "txn_prepared_ddl")
 
 
 def statement(model: Model, kind: str, a, b) -> tuple[str, dict, str | None] | None:
@@ -78,6 +78,7 @@ def statement(model: Model, kind: str, a, b) -> tuple[str, dict, str | None] | N
 
 
 def apply(model: Model, kind: str, a, b) -> None:
+    model.wrote |= kind not in DDL_OPS
     if kind == "insert":
         model.add_persons({a: model.new_person(age=b)})
     elif kind == "set_age" and a in model.persons:
@@ -120,6 +121,8 @@ class TransactionRules(Session):
         if kind not in self.allowed_ops():
             return False
         skipped = self.options.skipped
+        if kind in ("add_column", "drop_column") and model.wrote and "txn_prepared_ddl" in skipped:
+            return False
         if kind != "add_column":
             return True
         if a in model.dropped_columns and "readd_column" in skipped:
