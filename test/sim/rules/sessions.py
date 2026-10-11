@@ -163,8 +163,9 @@ class SessionRules(Session):
         committed (also when only the checkpoint after it failed) or rolled back, and nothing
         else changes."""
         conn = self.session_writer()
+        holder = data.draw(st.sampled_from([0, *self.free_sessions()]))
         txn = self.txns.pop(conn)
-        self.hold_results(data.draw(st.sampled_from([0, *self.free_sessions()])))
+        self.hold_results(holder)
         try:
             self.ok("COMMIT", conn=conn)
             committed = True
