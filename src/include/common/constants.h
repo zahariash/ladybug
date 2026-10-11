@@ -189,7 +189,7 @@ struct PlannerKnobs {
     static constexpr uint64_t MAX_PROBED_INDEX_KEYS = 64;
     static constexpr double SCAN_STARTUP_COST = 1000000;
     // Per row and thread, for a scan filtering on a comparison or on an IN list.
-    static constexpr double SCAN_ROW_COST = 6;
+    static constexpr double SCAN_ROW_COST = 3;
     static constexpr double IN_LIST_SCAN_ROW_COST = 22;
     // Per list element, for a scan filtering on an IN list.
     static constexpr double IN_LIST_SCAN_KEY_COST = 2000;
