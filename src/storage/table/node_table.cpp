@@ -1,6 +1,8 @@
 #include "storage/table/node_table.h"
 
 #include <algorithm>
+#include <optional>
+#include <set>
 
 #include "catalog/catalog.h"
 #include "catalog/catalog_entry/node_table_catalog_entry.h"
@@ -11,6 +13,7 @@
 #include "common/type_utils.h"
 #include "common/types/types.h"
 #include "main/client_context.h"
+#include "storage/index/art_index.h"
 #include "storage/local_storage/local_node_table.h"
 #include "storage/local_storage/local_storage.h"
 #include "storage/local_storage/local_table.h"
@@ -963,6 +966,30 @@ bool NodeTable::lookupPK(const Transaction* transaction, ValueVector* keyVector,
     return scanPKColumn(transaction, *keyToLookup, std::move(predicateSets), result);
 }
 
+static std::optional<ArtKey> encodeBound(ValueVector* vector, uint64_t pos) {
+    if (vector == nullptr) {
+        return std::nullopt;
+    }
+    return ArtKey::encode(vector, pos);
+}
+
+static bool isWithinBounds(const ArtKey& key, const std::optional<ArtKey>& lowerBound,
+    bool lowerInclusive, const std::optional<ArtKey>& upperBound, bool upperInclusive) {
+    if (lowerBound.has_value()) {
+        const auto order = key.getBytes() <=> lowerBound->getBytes();
+        if (order < 0 || (order == 0 && !lowerInclusive)) {
+            return false;
+        }
+    }
+    if (upperBound.has_value()) {
+        const auto order = key.getBytes() <=> upperBound->getBytes();
+        if (order > 0 || (order == 0 && !upperInclusive)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool NodeTable::lookupPKRange(const Transaction* transaction, ValueVector* lowerBoundVector,
     uint64_t lowerBoundPos, bool lowerInclusive, ValueVector* upperBoundVector,
     uint64_t upperBoundPos, bool upperInclusive, idx_t maxResults,
@@ -971,9 +998,19 @@ bool NodeTable::lookupPKRange(const Transaction* transaction, ValueVector* lower
     if (pkIndex == nullptr) {
         return false;
     }
-    return pkIndex->scanPrimaryKeyRange(lowerBoundVector, lowerBoundPos, lowerInclusive,
-        upperBoundVector, upperBoundPos, upperInclusive, maxResults, results,
+    const auto firstResult = results.size();
+    pkIndex->scanPrimaryKeyRange(lowerBoundVector, lowerBoundPos, lowerInclusive, upperBoundVector,
+        upperBoundPos, upperInclusive, maxResults, results,
         [&](offset_t offset) { return isVisibleNoLock(transaction, offset); });
+    const auto lowerBound = encodeBound(lowerBoundVector, lowerBoundPos);
+    const auto upperBound = encodeBound(upperBoundVector, upperBoundPos);
+    lookupUncommittedRows(
+        transaction, *pkIndex, firstResult,
+        [&](const ArtKey& key) {
+            return isWithinBounds(key, lowerBound, lowerInclusive, upperBound, upperInclusive);
+        },
+        results);
+    return !results.empty();
 }
 
 bool NodeTable::lookupIndexRange(const Transaction* transaction, const std::string& indexName,
@@ -984,19 +1021,102 @@ bool NodeTable::lookupIndexRange(const Transaction* transaction, const std::stri
     if (!index.has_value()) {
         return false;
     }
-    return index.value()->scanPrimaryKeyRange(lowerBoundVector, lowerBoundPos, lowerInclusive,
+    const auto firstResult = results.size();
+    index.value()->scanPrimaryKeyRange(lowerBoundVector, lowerBoundPos, lowerInclusive,
         upperBoundVector, upperBoundPos, upperInclusive, maxResults, results,
         [&](offset_t offset) { return isVisibleNoLock(transaction, offset); });
+    const auto lowerBound = encodeBound(lowerBoundVector, lowerBoundPos);
+    const auto upperBound = encodeBound(upperBoundVector, upperBoundPos);
+    lookupUncommittedRows(
+        transaction, *index.value(), firstResult,
+        [&](const ArtKey& key) {
+            return isWithinBounds(key, lowerBound, lowerInclusive, upperBound, upperInclusive);
+        },
+        results);
+    return !results.empty();
 }
 
 bool NodeTable::lookupIndex(const Transaction* transaction, const std::string& indexName,
     ValueVector* keyVector, uint64_t keyPos, std::vector<offset_t>& results) const {
+    return lookupIndex(transaction, indexName, keyVector, std::span<const uint64_t>(&keyPos, 1),
+        results);
+}
+
+bool NodeTable::lookupIndex(const Transaction* transaction, const std::string& indexName,
+    ValueVector* keyVector, std::span<const uint64_t> keyPositions,
+    std::vector<offset_t>& results) const {
     auto index = getIndex(indexName);
     if (!index.has_value()) {
         return false;
     }
-    return index.value()->lookupAll(transaction, keyVector, keyPos, results,
-        [&](offset_t offset) { return isVisibleNoLock(transaction, offset); });
+    const auto firstResult = results.size();
+    std::set<std::vector<uint8_t>> keys;
+    for (const auto keyPos : keyPositions) {
+        index.value()->lookupAll(transaction, keyVector, keyPos, results,
+            [&](offset_t offset) { return isVisibleNoLock(transaction, offset); });
+        keys.insert(ArtKey::encode(keyVector, keyPos).getBytes());
+    }
+    lookupUncommittedRows(
+        transaction, *index.value(), firstResult,
+        [&](const ArtKey& key) { return keys.contains(key.getBytes()); }, results);
+    return !results.empty();
+}
+
+void NodeTable::lookupUncommittedRows(const Transaction* transaction, const Index& index,
+    size_t firstResult, const std::function<bool(const ArtKey&)>& matches,
+    std::vector<offset_t>& results) const {
+    // ART indexes receive this transaction's inserts only at commit, so scan its local rows
+    // instead, matching on the encoded key exactly as the index would.
+    if (index.getIndexInfo().indexType != ArtPrimaryKeyIndex::getIndexType().typeName ||
+        transaction->getLocalStorage() == nullptr) {
+        return;
+    }
+    auto* localTable = transaction->getLocalStorage()->getLocalTable(*this);
+    if (localTable == nullptr) {
+        return;
+    }
+    // Updates of uncommitted rows do reach the index, but the local rows are authoritative.
+    results.erase(std::remove_if(results.begin() + firstResult, results.end(),
+                      [&](offset_t offset) { return transaction->isUnCommitted(*this, offset); }),
+        results.end());
+    DASSERT(index.getIndexInfo().columnIDs.size() == 1);
+    const auto columnID = index.getIndexInfo().columnIDs[0];
+    auto& localNodeGroups = localTable->cast<LocalNodeTable>().getNodeGroups();
+    auto dataChunk = constructDataChunkForColumns({columnID});
+    std::vector<ValueVector*> outVectors = {&dataChunk.getValueVectorMutable(0)};
+    auto scanState =
+        std::make_unique<NodeTableScanState>(nullptr, std::move(outVectors), dataChunk.state);
+    scanState->source = TableScanSource::UNCOMMITTED;
+    scanState->setToTable(transaction, const_cast<NodeTable*>(this), {columnID}, {});
+    for (node_group_idx_t nodeGroupIdx = 0; nodeGroupIdx < localNodeGroups.getNumNodeGroups();
+         ++nodeGroupIdx) {
+        auto* nodeGroup = localNodeGroups.getNodeGroupNoLock(nodeGroupIdx);
+        if (nodeGroup->getNumChunkedGroups() == 0) {
+            continue;
+        }
+        scanState->nodeGroup = nodeGroup;
+        scanState->nodeGroupIdx = nodeGroupIdx;
+        nodeGroup->initializeScanState(transaction, *scanState);
+        while (true) {
+            const auto scanResult = nodeGroup->scan(transaction, *scanState);
+            if (scanResult == NODE_GROUP_SCAN_EMPTY_RESULT) {
+                break;
+            }
+            auto* scannedVector = scanState->outputVectors[0];
+            for (idx_t i = 0; i < scannedVector->state->getSelSize(); ++i) {
+                const auto pos = scannedVector->state->getSelVector()[i];
+                if (scannedVector->isNull(pos) || !matches(ArtKey::encode(scannedVector, pos))) {
+                    continue;
+                }
+                const auto offset = transaction->getUncommittedOffset(*this,
+                    StorageUtils::getStartOffsetOfNodeGroup(nodeGroupIdx) + scanResult.startRow +
+                        pos);
+                if (isVisibleNoLock(transaction, offset)) {
+                    results.push_back(offset);
+                }
+            }
+        }
+    }
 }
 
 bool NodeTable::scanPKColumn(const Transaction* transaction, const Value& keyToLookup,
