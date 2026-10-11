@@ -1241,6 +1241,66 @@ bool ArtPrimaryKeyIndex::scanPrimaryKeyRange(ValueVector* lowerBoundVector, uint
     return true;
 }
 
+// Bytes of the serialized tree taken by entries with keys below the bound. Small nodes store their
+// children in insertion order, so every child is compared rather than relying on its position.
+static uint64_t countDiskBytesBelow(ArtPageRangeReader& reader, const std::vector<uint8_t>& bound) {
+    std::vector<uint8_t> path;
+    uint64_t numBytes = 0;
+    while (true) {
+        const auto nodeOffset = reader.getOffset();
+        const auto header = readArtDiskNodeHeader(reader);
+        path.insert(path.end(), header.prefix.begin(), header.prefix.end());
+        const auto length = std::min(path.size(), bound.size());
+        const auto order = std::lexicographical_compare_three_way(path.begin(),
+            path.begin() + length, bound.begin(), bound.begin() + length);
+        if (order > 0 || (order == 0 && path.size() >= bound.size())) {
+            return numBytes;
+        }
+        std::optional<uint64_t> nextNodeOffset;
+        uint64_t numBytesNotBelow = 0;
+        for (auto i = 0u; i < header.numChildren; ++i) {
+            uint8_t byte = 0;
+            reader.read(&byte, 1);
+            uint64_t childSize = 0;
+            reader.read(reinterpret_cast<uint8_t*>(&childSize), sizeof(childSize));
+            if (order == 0 && byte == bound[path.size()]) {
+                nextNodeOffset = reader.getOffset();
+                numBytesNotBelow += childSize;
+            } else if (order == 0 && byte > bound[path.size()]) {
+                numBytesNotBelow += sizeof(byte) + sizeof(childSize) + childSize;
+            }
+            reader.skip(childSize);
+        }
+        numBytes += reader.getOffset() - nodeOffset - numBytesNotBelow;
+        if (!nextNodeOffset.has_value()) {
+            return numBytes;
+        }
+        reader.setOffset(*nextNodeOffset);
+        path.push_back(bound[path.size()]);
+    }
+}
+
+// Each entry is weighed by its bytes in the serialized tree, so a range of longer keys reads as
+// larger than one with as many shorter keys.
+std::optional<double> ArtPrimaryKeyIndex::estimateRangeFraction(ValueVector* lowerBoundVector,
+    uint64_t lowerBoundPos, ValueVector* upperBoundVector, uint64_t upperBoundPos) {
+    std::lock_guard lck{mutex};
+    if (!diskBacked || diskTreeSize == 0) {
+        return std::nullopt;
+    }
+    DASSERT(diskFileHandle != nullptr);
+    auto countBytesBelow = [&](ValueVector* boundVector, uint64_t boundPos, uint64_t unbounded) {
+        if (boundVector == nullptr) {
+            return unbounded;
+        }
+        ArtPageRangeReader reader{*diskFileHandle, diskTreePageRange, diskTreeSize};
+        return countDiskBytesBelow(reader, ArtKey::encode(boundVector, boundPos).getBytes());
+    };
+    const auto begin = countBytesBelow(lowerBoundVector, lowerBoundPos, 0);
+    const auto end = countBytesBelow(upperBoundVector, upperBoundPos, diskTreeSize);
+    return end > begin ? static_cast<double>(end - begin) / static_cast<double>(diskTreeSize) : 0.0;
+}
+
 void ArtPrimaryKeyIndex::discardPrimaryKey(ValueVector* keyVector) {
     std::lock_guard lck{mutex};
     materializeDiskTree();

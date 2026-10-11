@@ -366,22 +366,39 @@ TEST_F(OptimizerTest, IndexScanCostGuardPrimaryKeyRange) {
     ASSERT_TRUE(conn->query("CREATE ART INDEX ranged_pk FOR (r:ranged) ON (r.id);")->isSuccess());
     ASSERT_TRUE(
         conn->query("COPY ranged FROM (UNWIND range(0, 99999) AS i RETURN i);")->isSuccess());
+    // Inserted out of key order: 'p9_9' comes before 'p9_19'.
+    ASSERT_TRUE(conn->query("CREATE NODE TABLE named(id STRING, PRIMARY KEY(id));")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE ART INDEX named_pk FOR (n:named) ON (n.id);")->isSuccess());
+    ASSERT_TRUE(conn->query("COPY named FROM (UNWIND range(0, 99999) AS i "
+                            "RETURN 'p' + string(i % 10) + '_' + string(i));")
+                    ->isSuccess());
     auto plan = [&](const std::string& predicate) {
         return getEncodedPlan("MATCH (r:ranged) WHERE " + predicate + " RETURN r.id;");
     };
-    ASSERT_STREQ(plan("r.id < 100").c_str(), "IndexScan(r)");
-    ASSERT_STREQ(plan("r.id >= 99900").c_str(), "IndexScan(r)");
-    ASSERT_STREQ(plan("r.id >= 5000 AND r.id < 5100").c_str(), "IndexScan(r)");
-    // Half the table matches: scanning is cheaper.
-    ASSERT_STREQ(plan("r.id >= 50000").c_str(), "Filter()S(r)");
-    ASSERT_STREQ(plan("r.id > 0 AND r.id <= 50000").c_str(), "Filter()Filter()S(r)");
+    auto checkPlans = [&]() {
+        ASSERT_STREQ(plan("r.id < 100").c_str(), "IndexScan(r)");
+        ASSERT_STREQ(plan("r.id >= 99900").c_str(), "IndexScan(r)");
+        ASSERT_STREQ(plan("r.id >= 5000 AND r.id < 5100").c_str(), "IndexScan(r)");
+        // Half the table matches: scanning is cheaper.
+        ASSERT_STREQ(plan("r.id >= 50000").c_str(), "Filter()S(r)");
+        ASSERT_STREQ(plan("r.id > 0 AND r.id <= 50000").c_str(), "Filter()Filter()S(r)");
+        auto namedPlan = [&](const std::string& predicate) {
+            return getEncodedPlan("MATCH (n:named) WHERE " + predicate + " RETURN n.id;");
+        };
+        ASSERT_STREQ(namedPlan("n.id > 'p9_9'").c_str(), "IndexScan(n)");
+        ASSERT_STREQ(namedPlan("n.id >= 'p5'").c_str(), "Filter()S(n)");
+    };
+    checkPlans();
     ASSERT_TRUE(conn->query("BEGIN TRANSACTION;")->isSuccess());
     ASSERT_TRUE(
         conn->query("UNWIND range(100000, 199999) AS i CREATE (:ranged {id: i});")->isSuccess());
     // The range lookup would also check all 100000 uncommitted rows.
     ASSERT_STREQ(plan("r.id < 100").c_str(), "Filter()S(r)");
     ASSERT_TRUE(conn->query("ROLLBACK;")->isSuccess());
-    ASSERT_STREQ(plan("r.id < 100").c_str(), "IndexScan(r)");
+    // After a reopen the index is read from disk, where the range is estimated instead of counted.
+    ASSERT_TRUE(conn->query("CHECKPOINT;")->isSuccess());
+    createDBAndConn();
+    checkPlans();
 }
 
 TEST_F(OptimizerTest, IndexScanCostGuardAfterDropColumn) {

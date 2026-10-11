@@ -177,6 +177,13 @@ public:
         std::vector<common::offset_t>& /*results*/, visible_func /*isVisible*/) {
         return false;
     }
+    // Share of the index's entries between the bounds, estimated without visiting them, or nullopt
+    // if the index can't estimate it.
+    virtual std::optional<double> estimateRangeFraction(common::ValueVector* /*lowerBoundVector*/,
+        uint64_t /*lowerBoundPos*/, common::ValueVector* /*upperBoundVector*/,
+        uint64_t /*upperBoundPos*/) {
+        return std::nullopt;
+    }
     virtual void discardPrimaryKey(common::ValueVector* /*keyVector*/) {
         // DO NOTHING.
     }
