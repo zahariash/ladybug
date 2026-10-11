@@ -3,6 +3,7 @@
 #include "api_test/api_test.h"
 #include "api_test/private_api_test.h"
 #include "common/exception/runtime.h"
+#include "common/exception/transaction_manager.h"
 #include "graph_test/private_graph_test.h"
 #include "storage/buffer_manager/buffer_manager.h"
 #include "storage/storage_utils.h"
@@ -43,6 +44,18 @@ TEST_F(PrivateApiTest, TransactionModes) {
     // Test rollback automatically switches the mode to AUTO_COMMIT write transaction
     conn->query("ROLLBACK;");
     ASSERT_EQ(TransactionMode::AUTO, getTransactionMode(*conn));
+}
+
+TEST_F(PrivateApiTest, RefusedBeginKeepsAutoMode) {
+    auto conn2 = std::make_unique<lbug::main::Connection>(database.get());
+    ASSERT_TRUE(conn->query("BEGIN TRANSACTION;")->isSuccess());
+    ASSERT_FALSE(conn2->query("BEGIN TRANSACTION;")->isSuccess());
+    ASSERT_EQ(TransactionMode::AUTO, getTransactionMode(*conn2));
+    EXPECT_THROW(TransactionContext::Get(*getClientContext(*conn2))->beginRecoveryTransaction(),
+        TransactionManagerException);
+    ASSERT_EQ(TransactionMode::AUTO, getTransactionMode(*conn2));
+    ASSERT_TRUE(conn2->query("RETURN 1;")->isSuccess());
+    ASSERT_TRUE(conn->query("COMMIT;")->isSuccess());
 }
 
 TEST_F(PrivateApiTest, MultipleCallsFromSameTransaction) {
