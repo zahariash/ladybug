@@ -25,6 +25,8 @@ struct ExtraScanNodeTableInfo {
 
 struct PrimaryKeyScanInfo final : ExtraScanNodeTableInfo {
     std::shared_ptr<binder::Expression> key;
+    // Constant list of keys, from `n.pk IN <list>`.
+    std::shared_ptr<binder::Expression> keyList;
     std::shared_ptr<binder::Expression> lowerBound;
     std::shared_ptr<binder::Expression> upperBound;
     bool lowerInclusive = true;
@@ -37,10 +39,22 @@ struct PrimaryKeyScanInfo final : ExtraScanNodeTableInfo {
         : lowerBound{std::move(lowerBound)}, upperBound{std::move(upperBound)},
           lowerInclusive{lowerInclusive}, upperInclusive{upperInclusive}, isRange{true} {}
 
+    static std::unique_ptr<PrimaryKeyScanInfo> createKeyList(
+        std::shared_ptr<binder::Expression> keyList) {
+        auto info = std::make_unique<PrimaryKeyScanInfo>(nullptr);
+        info->keyList = std::move(keyList);
+        return info;
+    }
+
+    bool isSingleKey() const { return key != nullptr; }
+
     std::unique_ptr<ExtraScanNodeTableInfo> copy() const override {
         if (isRange) {
             return std::make_unique<PrimaryKeyScanInfo>(lowerBound, lowerInclusive, upperBound,
                 upperInclusive);
+        }
+        if (keyList != nullptr) {
+            return createKeyList(keyList);
         }
         return std::make_unique<PrimaryKeyScanInfo>(key);
     }
@@ -49,12 +63,15 @@ struct PrimaryKeyScanInfo final : ExtraScanNodeTableInfo {
 struct SecondaryIndexScanInfo final : ExtraScanNodeTableInfo {
     std::string indexName;
     std::shared_ptr<binder::Expression> key;
+    // The key is a constant list, from `n.property IN <list>`.
+    bool isKeyList;
 
-    SecondaryIndexScanInfo(std::string indexName, std::shared_ptr<binder::Expression> key)
-        : indexName{std::move(indexName)}, key{std::move(key)} {}
+    SecondaryIndexScanInfo(std::string indexName, std::shared_ptr<binder::Expression> key,
+        bool isKeyList = false)
+        : indexName{std::move(indexName)}, key{std::move(key)}, isKeyList{isKeyList} {}
 
     std::unique_ptr<ExtraScanNodeTableInfo> copy() const override {
-        return std::make_unique<SecondaryIndexScanInfo>(indexName, key);
+        return std::make_unique<SecondaryIndexScanInfo>(indexName, key, isKeyList);
     }
 };
 

@@ -1,5 +1,6 @@
 #include "processor/operator/scan/primary_key_scan_node_table.h"
 
+#include <algorithm>
 #include <limits>
 
 #include "binder/expression/expression_util.h"
@@ -57,7 +58,7 @@ void PrimaryKeyScanNodeTable::initGlobalStateInternal(ExecutionContext* /*contex
 }
 
 bool PrimaryKeyScanNodeTable::getNextTuplesInternal(ExecutionContext* context) {
-    if (isRange) {
+    if (isRange || isKeyList) {
         return lookupRange(context);
     }
     auto transaction = transaction::Transaction::Get(*context->clientContext);
@@ -97,7 +98,13 @@ bool PrimaryKeyScanNodeTable::lookupRange(ExecutionContext* context) {
     while (currentRangeTableIdx < tableInfos.size()) {
         auto& tableInfo = tableInfos[currentRangeTableIdx];
         auto& table = tableInfo.table->cast<NodeTable>();
-        if (rangeOffsets.empty()) {
+        if (rangeOffsets.empty() && isKeyList) {
+            lookupKeyList(transaction, table);
+            if (rangeOffsets.empty()) {
+                currentRangeTableIdx++;
+                continue;
+            }
+        } else if (rangeOffsets.empty()) {
             ValueVector* lowerBoundVector = nullptr;
             uint64_t lowerPos = 0;
             if (indexEvaluator != nullptr) {
@@ -164,6 +171,40 @@ bool PrimaryKeyScanNodeTable::lookupRange(ExecutionContext* context) {
         return true;
     }
     return false;
+}
+
+void PrimaryKeyScanNodeTable::lookupKeyList(const transaction::Transaction* transaction,
+    const NodeTable& table) {
+    indexEvaluator->evaluate();
+    auto listVector = indexEvaluator->resultVector.get();
+    auto& selVector = listVector->state->getSelVector();
+    DASSERT(selVector.getSelSize() == 1);
+    auto pos = selVector.getSelectedPositions()[0];
+    if (listVector->isNull(pos)) {
+        return;
+    }
+    auto& list = listVector->getValue<list_entry_t>(pos);
+    auto keyVector = ListVector::getDataVector(listVector);
+    std::vector<uint64_t> keyPositions;
+    for (auto i = list.offset; i < list.offset + list.size; ++i) {
+        if (keyVector->isNull(i)) {
+            continue;
+        }
+        if (indexName.empty()) {
+            offset_t offset = 0;
+            if (table.lookupPK(transaction, keyVector, i, offset)) {
+                rangeOffsets.push_back(offset);
+            }
+        } else {
+            keyPositions.push_back(i);
+        }
+    }
+    if (!keyPositions.empty()) {
+        table.lookupIndex(transaction, indexName, keyVector, keyPositions, rangeOffsets);
+    }
+    // Repeated keys must not repeat rows; sorted offsets also read the table in storage order.
+    std::sort(rangeOffsets.begin(), rangeOffsets.end());
+    rangeOffsets.erase(std::unique(rangeOffsets.begin(), rangeOffsets.end()), rangeOffsets.end());
 }
 
 } // namespace processor

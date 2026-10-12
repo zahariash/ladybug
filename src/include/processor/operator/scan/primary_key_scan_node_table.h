@@ -55,15 +55,15 @@ public:
     PrimaryKeyScanNodeTable(ScanOpInfo opInfo, std::vector<ScanNodeTableInfo> tableInfos,
         std::unique_ptr<evaluator::ExpressionEvaluator> indexEvaluator,
         std::unique_ptr<evaluator::ExpressionEvaluator> upperBoundEvaluator, bool isRange,
-        bool isIndexEquality, bool lowerInclusive, bool upperInclusive, std::string indexName,
-        std::shared_ptr<PrimaryKeyScanSharedState> sharedState, physical_op_id id,
-        std::unique_ptr<OPPrintInfo> printInfo)
+        bool isIndexEquality, bool isKeyList, bool lowerInclusive, bool upperInclusive,
+        std::string indexName, std::shared_ptr<PrimaryKeyScanSharedState> sharedState,
+        physical_op_id id, std::unique_ptr<OPPrintInfo> printInfo)
         : ScanTable{type_, std::move(opInfo), id, std::move(printInfo)}, scanState{nullptr},
           tableInfos{std::move(tableInfos)}, indexEvaluator{std::move(indexEvaluator)},
           upperBoundEvaluator{std::move(upperBoundEvaluator)}, sharedState{std::move(sharedState)},
-          isRange{isRange}, isIndexEquality{isIndexEquality}, lowerInclusive{lowerInclusive},
-          upperInclusive{upperInclusive}, indexName{std::move(indexName)}, currentRangeTableIdx{0},
-          rangeOffsetCursor{0} {}
+          isRange{isRange}, isIndexEquality{isIndexEquality}, isKeyList{isKeyList},
+          lowerInclusive{lowerInclusive}, upperInclusive{upperInclusive},
+          indexName{std::move(indexName)}, currentRangeTableIdx{0}, rangeOffsetCursor{0} {}
 
     bool isSource() const override { return true; }
 
@@ -79,12 +79,14 @@ public:
         return std::make_unique<PrimaryKeyScanNodeTable>(opInfo.copy(), copyVector(tableInfos),
             indexEvaluator == nullptr ? nullptr : indexEvaluator->copy(),
             upperBoundEvaluator == nullptr ? nullptr : upperBoundEvaluator->copy(), isRange,
-            isIndexEquality, lowerInclusive, upperInclusive, indexName, sharedState, id,
+            isIndexEquality, isKeyList, lowerInclusive, upperInclusive, indexName, sharedState, id,
             printInfo->copy());
     }
 
 private:
     bool lookupRange(ExecutionContext* context);
+    void lookupKeyList(const transaction::Transaction* transaction,
+        const storage::NodeTable& table);
 
 private:
     std::unique_ptr<storage::NodeTableScanState> scanState;
@@ -94,6 +96,7 @@ private:
     std::shared_ptr<PrimaryKeyScanSharedState> sharedState;
     bool isRange;
     bool isIndexEquality;
+    bool isKeyList;
     bool lowerInclusive;
     bool upperInclusive;
     std::string indexName;
