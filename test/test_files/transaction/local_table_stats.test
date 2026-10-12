@@ -1,0 +1,25 @@
+-DATASET CSV empty
+
+--
+
+-CASE AddColumnAfterUncommittedInsert
+-STATEMENT CREATE NODE TABLE P (ID INT64, name STRING, PRIMARY KEY(ID));
+---- ok
+-STATEMENT UNWIND range(1, 5) AS i CREATE (:P {ID: i, name: 'n' + cast(i AS STRING)});
+---- ok
+-STATEMENT BEGIN TRANSACTION;
+---- ok
+-STATEMENT CREATE (:P {ID: 100, name: 'n1'});
+---- ok
+-STATEMENT ALTER TABLE P ADD extra STRING;
+---- ok
+-STATEMENT MATCH (p:P) WHERE p.name = 'n1' RETURN p.ID ORDER BY p.ID;
+---- 2
+1
+100
+-STATEMENT COMMIT;
+---- ok
+-STATEMENT MATCH (p:P) WHERE p.name = 'n1' RETURN p.ID ORDER BY p.ID;
+---- 2
+1
+100

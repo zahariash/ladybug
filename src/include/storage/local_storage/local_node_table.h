@@ -40,6 +40,8 @@ public:
         common::sel_t pos, common::offset_t& result) const;
 
     TableStats getStats() const { return nodeGroups.getStats(); }
+    // The table column ID of each local column; local columns follow the table's properties.
+    const std::vector<common::column_id_t>& getColumnIDs() const { return columnIDs; }
     common::offset_t getStartOffset() const { return startOffset; }
     bool isVisible(const transaction::Transaction* transaction, common::offset_t offset) const;
 
@@ -56,6 +58,7 @@ private:
     std::unique_ptr<OverflowFile> overflowFile;
     OverflowFileHandle* overflowFileHandle;
     std::unique_ptr<LocalHashIndex> hashIndex;
+    std::vector<common::column_id_t> columnIDs;
     NodeGroupCollection nodeGroups;
 };
 
