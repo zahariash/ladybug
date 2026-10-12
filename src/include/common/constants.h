@@ -187,6 +187,8 @@ struct PlannerKnobs {
     static constexpr double UNCOMMITTED_ROW_MATCH_COST = 75;
     // Literal keys whose index entries are counted when costing a secondary index lookup.
     static constexpr uint64_t MAX_PROBED_INDEX_KEYS = 64;
+    // Entries counted when costing an ART primary-key range; past it the index is kept.
+    static constexpr uint64_t MAX_PROBED_RANGE_ENTRIES = 100000;
     static constexpr double SCAN_STARTUP_COST = 1000000;
     // Per row and thread, for a scan filtering on a comparison or on an IN list.
     static constexpr double SCAN_ROW_COST = 3;

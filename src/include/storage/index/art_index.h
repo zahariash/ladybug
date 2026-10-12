@@ -100,6 +100,9 @@ public:
         bool lowerInclusive, common::ValueVector* upperBoundVector, uint64_t upperBoundPos,
         bool upperInclusive, common::idx_t maxResults, std::vector<common::offset_t>& results,
         visible_func isVisible) override;
+    std::optional<double> estimateRangeFraction(common::ValueVector* lowerBoundVector,
+        uint64_t lowerBoundPos, common::ValueVector* upperBoundVector,
+        uint64_t upperBoundPos) override;
     void discardPrimaryKey(common::ValueVector* keyVector) override;
 
     void checkpoint(main::ClientContext*, PageAllocator&, ShadowFile&) override;
