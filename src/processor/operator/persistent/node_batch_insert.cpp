@@ -844,12 +844,12 @@ NodeBatchInsertErrorHandler NodeBatchInsert::createErrorHandler(ExecutionContext
         duplicatePKSkipResult};
 }
 
-static void commitPrimaryKeyIndexInsertions(Transaction* transaction, NodeTable& nodeTable,
-    Index& index, const ColumnChunkData& pkChunk, offset_t nodeOffset, length_t numRows,
+static void commitIndexInsertions(Transaction* transaction, NodeTable& nodeTable, Index& index,
+    const ColumnChunkData& keyChunk, offset_t nodeOffset, length_t numRows,
     main::ClientContext* context) {
     auto state = std::make_shared<DataChunkState>();
     ValueVector nodeIDVector{LogicalType::INTERNAL_ID()};
-    ValueVector pkVector{pkChunk.getDataType().copy(), MemoryManager::Get(*context), state};
+    ValueVector keyVector{keyChunk.getDataType().copy(), MemoryManager::Get(*context), state};
     nodeIDVector.setState(state);
     auto insertState = index.initInsertState(context, [&nodeTable, transaction](offset_t offset) {
         return nodeTable.isVisible(transaction, offset);
@@ -857,11 +857,11 @@ static void commitPrimaryKeyIndexInsertions(Transaction* transaction, NodeTable&
     for (auto start = 0u; start < numRows; start += DEFAULT_VECTOR_CAPACITY) {
         const auto size = std::min<length_t>(DEFAULT_VECTOR_CAPACITY, numRows - start);
         state->getSelVectorUnsafe().setToUnfiltered(size);
-        pkChunk.scan(pkVector, start, size);
+        keyChunk.scan(keyVector, start, size);
         for (auto i = 0u; i < size; ++i) {
             nodeIDVector.setValue<nodeID_t>(i, {nodeOffset + start + i, nodeTable.getTableID()});
         }
-        index.commitInsert(transaction, nodeIDVector, {&pkVector}, *insertState);
+        index.commitInsert(transaction, nodeIDVector, {&keyVector}, *insertState);
     }
 }
 
@@ -921,12 +921,24 @@ void NodeBatchInsert::writeAndResetNodeGroup(transaction::Transaction* transacti
     } else if (sharedTarget.usePrimaryKeyIndexCommitInsert) {
         auto* index = nodeTable->tryGetPrimaryKeyIndex();
         DASSERT(index != nullptr);
-        commitPrimaryKeyIndexInsertions(transaction, *nodeTable, *index,
+        commitIndexInsertions(transaction, *nodeTable, *index,
             nodeGroup->getColumnChunk(nodeSharedState->pkColumnID), nodeOffset, numRowsWritten,
             transaction->getClientContext());
     } else if (sharedTarget.noIndexPKValidator) {
         sharedTarget.noIndexPKValidator->validate(
             nodeGroup->getColumnChunk(nodeSharedState->pkColumnID), 0, numRowsWritten);
+    }
+    // COPY appends directly to the table instead of going through NodeTable::commit, so
+    // secondary indexes that insert at commit are maintained here.
+    for (auto& holder : nodeTable->getIndexes()) {
+        if (!holder.isLoaded() || !holder.needCommitInsert() || holder.getIndex()->isPrimary()) {
+            continue;
+        }
+        auto& index = *holder.getIndex();
+        DASSERT(index.getIndexInfo().columnIDs.size() == 1);
+        commitIndexInsertions(transaction, *nodeTable, index,
+            nodeGroup->getColumnChunk(index.getIndexInfo().columnIDs[0]), nodeOffset,
+            numRowsWritten, transaction->getClientContext());
     }
     if (numRowsWritten == nodeGroup->getNumRows()) {
         nodeGroup->resetToEmpty();
