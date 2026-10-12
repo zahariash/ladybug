@@ -122,7 +122,11 @@ class TransactionRules(Session):
         if kind not in self.allowed_ops():
             return False
         skipped = self.options.skipped
-        if kind in ("add_column", "drop_column") and model.wrote and "txn_prepared_ddl" in skipped:
+        if (
+            kind in ("add_column", "drop_column", "drop_table", "create_table")
+            and model.wrote
+            and "txn_prepared_ddl" in skipped
+        ):
             return False
         if kind == "insert" and model.added_in_txn and "txn_prepared_ddl" in skipped:
             return False

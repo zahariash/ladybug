@@ -79,7 +79,9 @@ KNOWN_BUGS = [
     Known(
         "txn_prepared_ddl",
         "a statement prepared with parameters in a transaction is not rebound after ALTER TABLE "
-        "ADD in the same transaction: the new column gets 0, not its default (not filed)",
+        "ADD in the same transaction: the new column gets 0, not its default; after DROP and "
+        "CREATE TABLE of the same name, an insert into the new table hits the old table's keys "
+        "(not filed)",
     ),
     Known(
         "second_writer",
