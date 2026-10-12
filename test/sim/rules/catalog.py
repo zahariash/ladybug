@@ -96,6 +96,20 @@ class CatalogRules(Session):
         self.ok("CREATE INDEX person_pk FOR (p:Person) ON (p.id)")
         self.model.pk_index = "person_pk"
 
+    @enabled("secondary_index")
+    @precondition(lambda self: self.model.age_index is None and self.checkpoint_keeps_snapshots())
+    @rule()
+    def create_age_index(self):
+        self.ok("CREATE ART INDEX person_age FOR (p:Person) ON (p.age)")
+        self.model.age_index = "person_age"
+
+    @enabled("secondary_index")
+    @precondition(lambda self: self.model.age_index is not None)
+    @rule()
+    def drop_age_index(self):
+        self.ok(f"DROP INDEX Person.{self.model.age_index}")
+        self.model.age_index = None
+
     @enabled("columns")
     @precondition(lambda self: any(c in self.model.columns for c in EXTRA_COLUMNS))
     @rule(data=st.data())

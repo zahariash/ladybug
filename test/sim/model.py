@@ -45,6 +45,7 @@ class Model:
     tables: dict = field(default_factory=dict)  # i -> values of T{i}.v, in insertion order
     partitioned: dict = field(default_factory=dict)  # id -> cluster, in L
     pk_index: str | None = "_PK"  # the name of Person's primary-key index, if any
+    age_index: str | None = None  # the name of the ART index on Person.age, if any
     dropped_columns: set = field(default_factory=set)  # Person columns dropped at some point
     # Since the last checkpoint: a Person column was dropped, and then one was added. Column IDs
     # have a gap until a checkpoint compacts them.
@@ -54,6 +55,9 @@ class Model:
     rolled_back_add: bool = False
     # In a transaction's view: it already ran a statement that prepared statements may reuse.
     wrote: bool = False
+    # In a transaction's view: it added a Person column, which a Person insert prepared before it
+    # (the driver caches prepared statements across steps) does not see.
+    added_in_txn: bool = False
 
     def drop_column(self, column: str) -> None:
         del self.columns[column]

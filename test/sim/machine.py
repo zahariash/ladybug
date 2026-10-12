@@ -63,8 +63,16 @@ class LadybugSim(
         )
         self.model = Model()
         self.start_trace()
+        # SIM_ART_PK=1 gives Person an ART primary key instead of the default hash index, so that
+        # primary-key ranges are index lookups.
+        art_pk = bool(os.environ.get("SIM_ART_PK"))
+        if art_pk:
+            self.ok("CALL enable_default_hash_index=false")
         for statement in SCHEMA + (EXTENSION_SCHEMA if self.options.loaded else []):
             self.ok(statement)
+        if art_pk:
+            self.ok("CREATE ART INDEX person_pk FOR (p:Person) ON (p.id)")
+            self.model.pk_index = "person_pk"
 
     def teardown(self):
         # Hypothesis calls teardown in a finally block, so a failing step's error is in flight;

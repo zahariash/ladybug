@@ -95,6 +95,7 @@ def apply(model: Model, kind: str, a, b) -> None:
         model.macros[a] = b
     elif kind == "add_column":
         model.add_column(a, b)
+        model.added_in_txn = True
     elif kind == "drop_column":
         model.drop_column(a)
     elif kind == "drop_table":
@@ -122,6 +123,8 @@ class TransactionRules(Session):
             return False
         skipped = self.options.skipped
         if kind in ("add_column", "drop_column") and model.wrote and "txn_prepared_ddl" in skipped:
+            return False
+        if kind == "insert" and model.added_in_txn and "txn_prepared_ddl" in skipped:
             return False
         if kind != "add_column":
             return True

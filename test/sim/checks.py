@@ -8,10 +8,12 @@ from contextlib import contextmanager
 import hypothesis.strategies as st
 from hypothesis.stateful import invariant, precondition, rule
 from model import Model
-from session import Session, diff
+from session import Session, diff, gated
 from strategies import clusters, small_ids
 
 USER_TABLES = {"Person", "Knows", "L"}
+
+gated("in_lists", "in_list_nulls", "count_restricted", "txn_index_lookups", "pk_ranges")
 
 
 class Checks(Session):
@@ -61,7 +63,7 @@ class Checks(Session):
         self.check_macros()
         indexes = self.rows("CALL show_indexes() RETURN table_name, index_name")
         person = {name for table, name in indexes if table == "Person"}
-        assert person == ({self.model.pk_index} - {None}), person
+        assert person == ({self.model.pk_index, self.model.age_index} - {None}), person
         if self.options.loaded:
             docs = {name for table, name in indexes if table == "Doc"} - {"_PK"}
             assert docs == set(self.model.doc_indexes), docs
@@ -89,6 +91,83 @@ class Checks(Session):
         """The query battery on the committed state, with the optimizer on or off."""
         with self.optimizer(optimizer, 0, 1):
             self.check_view(self.model, 0, x, id, limit, cluster)
+
+    def check_index_paths(
+        self, view: Model, conn: int, x: int, id: int, degrees: Counter, alone: bool
+    ) -> None:
+        """Queries that the IN, count, secondary-index and primary-key-range rewrites answer,
+        each under a gate so that a build is only held to the paths it has fixed."""
+
+        def check(query, params, expected):
+            self.check(query, params, expected, False, conn, alone)
+
+        skipped = self.options.skipped
+        persons, knows = view.persons, view.knows
+        ages = [p["age"] for p in persons.values() if p["age"] is not None]
+        if "in_lists" not in skipped:
+            listed = list(range(x, x + 19))
+            # Before the list_contains fix a NULL element matched a NULL property.
+            null = [] if "in_list_nulls" in skipped else [None]
+            check(
+                "MATCH (p:Person) WHERE p.age IN $ages RETURN count(*)",
+                dict(ages=listed + null),
+                [(sum(a in listed for a in ages),)],
+            )
+            literal = "[" + ", ".join(map(str, listed)) + (", NULL]" if null else "]")
+            check(
+                f"MATCH (p:Person) WHERE p.age IN {literal} RETURN count(*)",
+                {},
+                [(sum(a in listed for a in ages),)],
+            )
+            check(
+                "MATCH (q:Person) WHERE q.age % 2 = 0 WITH collect(q.age) AS ages "
+                "MATCH (p:Person) WHERE p.age IN ages RETURN count(*)",
+                {},
+                [(sum(a % 2 == 0 for a in ages),)],
+            )
+            check(
+                "MATCH (p:Person) WHERE p.id = $a OR p.id = $b RETURN p.id",
+                dict(a=id, b=id + 1),
+                [(i,) for i in (id, id + 1) if i in persons],
+            )
+        if "count_restricted" not in skipped:
+            check(
+                "MATCH (a:Person)-[:Knows]->(:Person) WHERE a.id = $id "
+                "RETURN count(*), count(DISTINCT a.id)",
+                dict(id=id),
+                [(degrees[id], 1 if degrees[id] else 0)],
+            )
+            check(
+                "MATCH (a:Person)-[:Knows]->(:Person) WHERE a.age = $x RETURN count(*)",
+                dict(x=x),
+                [(sum(n for (src, _, _), n in knows.items() if persons.get(src, {}).get("age") == x),)],
+            )
+        # `alone` is a transaction's own view; its uncommitted rows reach index lookups only with
+        # the secondary ART consistency fix.
+        txn = self.txns.get(conn)
+        if (alone or (txn and txn.kind == "write")) and "txn_index_lookups" in skipped:
+            return
+        check(
+            "MATCH (p:Person) WHERE p.age = $x RETURN count(*)",
+            dict(x=x),
+            [(sum(a == x for a in ages),)],
+        )
+        check(
+            "MATCH (p:Person) WHERE p.age IN $pair RETURN p.id",
+            dict(pair=[x, x + 1]),
+            [(i,) for i, p in persons.items() if p["age"] in (x, x + 1)],
+        )
+        if "pk_ranges" not in skipped:
+            check(
+                "MATCH (p:Person) WHERE p.id >= $lo AND p.id < $hi RETURN count(*)",
+                dict(lo=id, hi=id + 10),
+                [(sum(id <= i < id + 10 for i in persons),)],
+            )
+            check(
+                "MATCH (p:Person) WHERE p.id > $lo RETURN count(*)",
+                dict(lo=id),
+                [(sum(i > id for i in persons),)],
+            )
 
     @contextmanager
     def optimizer(self, enabled: bool, *conns: int):
@@ -205,6 +284,7 @@ class Checks(Session):
             dict(c=cluster),
             [(sum(c == cluster for c in view.partitioned.values()),)],
         )
+        self.check_index_paths(view, conn, x, id, degrees, alone)
         for column, default in view.columns.items():
             if column.startswith("c"):
                 check(
