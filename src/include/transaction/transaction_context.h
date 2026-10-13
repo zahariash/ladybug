@@ -56,6 +56,7 @@ public:
 
 private:
     void beginTransactionInternal(TransactionType transactionType);
+    void beginManualTransaction(TransactionType transactionType);
 
 private:
     std::mutex mtx;
