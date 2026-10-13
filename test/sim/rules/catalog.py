@@ -90,7 +90,7 @@ class CatalogRules(Session):
         self.model.pk_index = None
 
     @enabled("pk_index")
-    @precondition(lambda self: self.model.pk_index is None)
+    @precondition(lambda self: self.model.pk_index is None and self.checkpoint_keeps_snapshots())
     @rule()
     def create_pk_index(self):
         self.ok("CREATE INDEX person_pk FOR (p:Person) ON (p.id)")

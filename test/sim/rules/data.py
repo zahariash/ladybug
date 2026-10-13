@@ -89,7 +89,7 @@ class DataRules(Session):
         self.model.set_since(src, dst, since)
 
     @enabled("knows")
-    @precondition(lambda self: self.model.persons)
+    @precondition(lambda self: self.model.persons and self.checkpoint_keeps_snapshots())
     @rule(data=st.data(), count=st.integers(1, 200), missing=st.booleans())
     def copy_knows(self, data, count, missing):
         """COPYs edges between existing persons; with an unknown endpoint the whole COPY
@@ -124,6 +124,7 @@ class DataRules(Session):
         return csv, added
 
     @enabled("bulk_copy")
+    @precondition(lambda self: self.checkpoint_keeps_snapshots())
     @rule(rows=st.lists(st.tuples(csv_names, st.integers(-1000, 1000)), min_size=1, max_size=3000))
     def bulk_copy(self, rows):
         csv, added = self.write_bulk_csv(rows)

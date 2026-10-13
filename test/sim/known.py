@@ -45,7 +45,8 @@ KNOWN_BUGS = [
     ),
     Known(
         "snapshot_checkpoint",
-        "#1184: a CHECKPOINT on another connection breaks open read-only transactions",
+        "#1184: a CHECKPOINT on another connection, also the one COPY or CREATE INDEX forces, "
+        "breaks open read-only transactions",
     ),
     Known(
         "snapshot_rel_count",

@@ -62,7 +62,9 @@ class ExtensionRules(Session):
         self.model.docs.pop(id, None)
 
     @with_extension("bulk_docs")
-    @precondition(lambda self: len(self.model.docs) <= MAX_DOCS - 6000)
+    @precondition(
+        lambda self: len(self.model.docs) <= MAX_DOCS - 6000 and self.checkpoint_keeps_snapshots()
+    )
     @rule(count=st.integers(500, 6000), rng=st.randoms(use_true_random=False))
     def bulk_docs(self, count, rng):
         """COPYs docs with random words and embeddings, some of them NULL, into Doc and every

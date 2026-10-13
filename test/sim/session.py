@@ -126,7 +126,7 @@ class Session:
 
     def checkpoint_keeps_snapshots(self) -> bool:
         """Whether a CHECKPOINT now leaves the sessions' snapshots alone: a checkpoint breaks
-        open read-only transactions (#1184)."""
+        open read-only transactions (#1184), also the one COPY and CREATE INDEX force."""
         return "snapshot_checkpoint" not in self.options.skipped or not self.txns
 
     # Engine lifecycle
