@@ -230,5 +230,45 @@ TEST_F(EmptyBufferManagerTest, CSRScanStateHeaderIsTwoPlainUInt64Buffers) {
     }
 }
 
+// Spilling a buffer manager page unpins it but keeps it, so loading it back must use the page
+// again: a buffer malloc'd for the load was never freed, its memory never returned, and the page
+// was unpinned a second time when the chunk was destroyed.
+TEST_F(EmptyBufferManagerTest, SpilledPageIsLoadedBackIntoItsPage) {
+    if (inMemMode) {
+        GTEST_SKIP();
+    }
+    auto bm = getBufferManager(*database);
+    auto mm = getMemoryManager(*database);
+    constexpr auto numValues = TEMP_PAGE_SIZE / sizeof(int64_t);
+    uint64_t usedMemoryWithChunk = 0;
+    {
+        std::vector<std::unique_ptr<ColumnChunkData>> chunks;
+        chunks.push_back(std::make_unique<ColumnChunkData>(*mm, LogicalType(LogicalTypeID::INT64),
+            numValues, false, ResidencyState::IN_MEMORY, false));
+        auto* chunk = chunks[0].get();
+        for (auto i = 0u; i < numValues; i++) {
+            chunk->getData<int64_t>()[i] = i;
+        }
+        auto chunkedNodeGroup = InMemChunkedNodeGroup(std::move(chunks), 0);
+        chunkedNodeGroup.setUnused(*mm);
+        usedMemoryWithChunk = bm->getUsedMemory();
+        SpillResult memorySpilled{};
+        bm->getSpillerOrSkip([&](auto& spiller) {
+            spiller.addUnusedChunk(&chunkedNodeGroup);
+            memorySpilled = spiller.claimNextGroup();
+        });
+        ASSERT_EQ(memorySpilled.memoryNowEvictable, TEMP_PAGE_SIZE);
+        chunkedNodeGroup.loadFromDisk(*mm);
+        ASSERT_EQ(bm->getUsedMemory(), usedMemoryWithChunk);
+        for (auto i = 0u; i < numValues; i++) {
+            ASSERT_EQ(chunk->getData<int64_t>()[i], i);
+        }
+    }
+    // The page stays resident on the free list and serves the next allocation.
+    ASSERT_EQ(bm->getUsedMemory(), usedMemoryWithChunk);
+    auto buffer = mm->allocateBuffer(true, TEMP_PAGE_SIZE);
+    ASSERT_EQ(bm->getUsedMemory(), usedMemoryWithChunk);
+}
+
 } // namespace testing
 } // namespace lbug

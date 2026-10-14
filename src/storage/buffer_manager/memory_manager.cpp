@@ -42,7 +42,13 @@ SpillResult MemoryBuffer::setSpilledToDisk(uint64_t filePosition) {
 
 void MemoryBuffer::prepareLoadFromDisk() {
     DASSERT(buffer.data() == nullptr && evicted);
-    buffer = mm->mallocBuffer(false, buffer.size());
+    if (pageIdx == INVALID_PAGE_IDX) {
+        buffer = mm->mallocBuffer(false, buffer.size());
+    } else {
+        // Spilling unpinned this buffer's page but kept it, so the destructor still unpins and
+        // frees it as a page: load into the page again.
+        buffer = mm->pinPage(pageIdx);
+    }
     evicted = false;
 }
 
@@ -87,6 +93,10 @@ std::unique_ptr<MemoryBuffer> MemoryManager::allocateBuffer(bool initializeToZer
         memset(memoryBuffer->getBuffer().data(), 0, pageSize);
     }
     return memoryBuffer;
+}
+
+std::span<uint8_t> MemoryManager::pinPage(page_idx_t pageIdx) {
+    return std::span(bm->pin(*fh, pageIdx, PageReadPolicy::DONT_READ_PAGE), pageSize);
 }
 
 void MemoryManager::freeBlock(page_idx_t pageIdx, std::span<uint8_t> buffer) {

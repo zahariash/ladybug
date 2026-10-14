@@ -97,6 +97,8 @@ private:
     void freeBlock(common::page_idx_t pageIdx, std::span<uint8_t> buffer);
     void updateUsedMemoryForFreedBlock(common::page_idx_t pageIdx, std::span<uint8_t> buffer);
     std::span<uint8_t> mallocBuffer(bool initializeToZero, uint64_t size);
+    // Pins a page of this MM's file that a MemoryBuffer already owns.
+    std::span<uint8_t> pinPage(common::page_idx_t pageIdx);
 
 private:
     // EXTENSION ABI: extensions ship once per minor version and must keep working with
