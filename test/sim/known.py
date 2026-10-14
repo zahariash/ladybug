@@ -24,7 +24,12 @@ KNOWN_BUGS = [
     ),
     Known(
         "partitions",
-        "#1186: partitioned tables lose rows after a crash and accept duplicate primary keys",
+        "a crash after a CHECKPOINT taken while a read-only transaction is open leaves a database "
+        "with a partitioned table unopenable: the partition shadow file is missing (not filed)",
+    ),
+    Known(
+        "txn_index_lookups",
+        "a transaction's uncommitted rows are missing from secondary ART index lookups (not filed)",
     ),
     Known("pk_index", "DROP INDEX on the primary-key index ignores the transaction (not filed)"),
     Known("crash_create", "a kill mid-write can leave a WAL that fails its checksum on reopen"),
@@ -50,7 +55,8 @@ KNOWN_BUGS = [
     ),
     Known(
         "snapshot_rel_count",
-        "#1197: a relationship count(*) in a read-only transaction counts later commits (#1198)",
+        "a relationship count(*) in a read-only transaction counts relationships another "
+        "connection COPYs in after it began (not filed)",
     ),
     Known(
         "snapshot_prepared",
@@ -69,7 +75,8 @@ KNOWN_BUGS = [
     ),
     Known(
         "pool_commit",
-        "#1182: a COMMIT failing on a full buffer pool deletes checkpointed relationships (#1195)",
+        "after the buffer pool has been filled with results and released, rel scans fail with "
+        "'buffer pool is full' until restart (not filed)",
     ),
     Known(
         "rollback_add",

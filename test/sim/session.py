@@ -129,6 +129,11 @@ class Session:
         open read-only transactions (#1184), also the one COPY and CREATE INDEX force."""
         return "snapshot_checkpoint" not in self.options.skipped or not self.txns
 
+    def has_partitions(self) -> bool:
+        """Whether the partitioned table L exists: only while its rules run, so that a gated
+        partition bug cannot end workloads that never touch it."""
+        return "partitions" not in self.options.skipped
+
     # Engine lifecycle
 
     def start_trace(self) -> None:

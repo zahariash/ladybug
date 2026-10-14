@@ -43,7 +43,8 @@ class Model:
     knows_w: int | None = None  # the default of Knows.w, while the property exists
     macros: dict = field(default_factory=dict)  # i -> k, for m{i}(x) = x + k
     tables: dict = field(default_factory=dict)  # i -> values of T{i}.v, in insertion order
-    partitioned: dict = field(default_factory=dict)  # id -> cluster, in L
+    # (id, cluster) rows of L; each cluster is its own partition, keys are unique per partition
+    partitioned: set = field(default_factory=set)
     pk_index: str | None = "_PK"  # the name of Person's primary-key index, if any
     age_index: str | None = None  # the name of the ART index on Person.age, if any
     dropped_columns: set = field(default_factory=set)  # Person columns dropped at some point
@@ -118,7 +119,7 @@ class Model:
             knows=Counter(self.knows),
             macros=dict(self.macros),
             tables={i: list(values) for i, values in self.tables.items()},
-            partitioned=dict(self.partitioned),
+            partitioned=set(self.partitioned),
             dropped_columns=set(self.dropped_columns),
             wrote=False,
         )

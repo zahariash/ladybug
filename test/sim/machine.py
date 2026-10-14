@@ -24,6 +24,8 @@ from session import FAILURES
 SCHEMA = [
     "CREATE NODE TABLE Person(id INT64 PRIMARY KEY, name STRING, age INT64, score DOUBLE)",
     "CREATE REL TABLE Knows(FROM Person TO Person, since INT64)",
+]
+PARTITIONED_SCHEMA = [
     "CREATE NODE TABLE L(id INT64, cluster INT64, PRIMARY KEY(id)) PARTITION BY LIST (cluster)",
 ]
 EXTENSION_SCHEMA = ["CREATE NODE TABLE Doc(id INT64 PRIMARY KEY, text STRING, emb FLOAT[3])"]
@@ -68,7 +70,8 @@ class LadybugSim(
         art_pk = bool(os.environ.get("SIM_ART_PK"))
         if art_pk:
             self.ok("CALL enable_default_hash_index=false")
-        for statement in SCHEMA + (EXTENSION_SCHEMA if self.options.loaded else []):
+        schema = SCHEMA + (PARTITIONED_SCHEMA if self.has_partitions() else [])
+        for statement in schema + (EXTENSION_SCHEMA if self.options.loaded else []):
             self.ok(statement)
         if art_pk:
             self.ok("CREATE ART INDEX person_pk FOR (p:Person) ON (p.id)")

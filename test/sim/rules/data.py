@@ -148,14 +148,14 @@ class DataRules(Session):
     @rule(id=small_ids, cluster=clusters)
     def insert_partitioned(self, id, cluster):
         query = "CREATE (:L {id: $id, cluster: $c})"
-        if id in self.model.partitioned:
+        if (id, cluster) in self.model.partitioned:
             self.fails(query, dict(id=id, c=cluster), DUPLICATE_KEY)
             return
         self.ok(query, dict(id=id, c=cluster))
-        self.model.partitioned[id] = cluster
+        self.model.partitioned.add((id, cluster))
 
     @enabled("partitions")
     @rule(id=small_ids)
     def delete_partitioned(self, id):
         self.ok("MATCH (n:L {id: $id}) DELETE n", dict(id=id))
-        self.model.partitioned.pop(id, None)
+        self.model.partitioned = {(i, c) for i, c in self.model.partitioned if i != id}

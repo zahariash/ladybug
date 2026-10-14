@@ -11,7 +11,7 @@ from model import Model
 from session import Session, diff, gated
 from strategies import clusters, small_ids
 
-USER_TABLES = {"Person", "Knows", "L"}
+USER_TABLES = {"Person", "Knows"}
 
 gated("in_lists", "in_list_nulls", "count_restricted", "txn_index_lookups", "pk_ranges")
 
@@ -33,9 +33,10 @@ class Checks(Session):
             query = "MATCH (:Person)-[k:Knows]->(:Person) RETURN k.w, count(*)"
             actual = self.rows(query)
             assert actual == ([(self.model.knows_w, total)] if total else []), actual
-        expected = Counter(self.model.partitioned.items())
-        actual = Counter(self.rows("MATCH (n:L) RETURN n.id, n.cluster"))
-        assert actual == expected, diff(actual, expected)
+        if self.has_partitions():
+            expected = Counter(self.model.partitioned)
+            actual = Counter(self.rows("MATCH (n:L) RETURN n.id, n.cluster"))
+            assert actual == expected, diff(actual, expected)
         for i, values in self.model.tables.items():
             # SERIAL ids must be unique; values are compared as a multiset.
             rows = self.rows(f"MATCH (t:T{i}) RETURN t.id, t.v")
@@ -57,6 +58,8 @@ class Checks(Session):
         names = {name for (name,) in self.rows("CALL show_tables() RETURN name")}
         tables = {name for name in names if not name.startswith("L_p")}
         expected = USER_TABLES | {f"T{i}" for i in self.model.tables}
+        if self.has_partitions():
+            expected.add("L")
         if self.options.loaded:
             expected.add("Doc")
         assert tables == expected, tables
@@ -279,11 +282,12 @@ class Checks(Session):
             {},
             [(sum(knows.values()) + two_hop,)],
         )
-        check(
-            "MATCH (n:L) WHERE n.cluster = $c RETURN count(*)",
-            dict(c=cluster),
-            [(sum(c == cluster for c in view.partitioned.values()),)],
-        )
+        if self.has_partitions():
+            check(
+                "MATCH (n:L) WHERE n.cluster = $c RETURN count(*)",
+                dict(c=cluster),
+                [(sum(c == cluster for _, c in view.partitioned),)],
+            )
         self.check_index_paths(view, conn, x, id, degrees, alone)
         for column, default in view.columns.items():
             if column.startswith("c"):
