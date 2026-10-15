@@ -15,6 +15,8 @@ public:
 
     common::ZoneMapCheckResult checkZoneMap(const MergedColumnChunkStats& stats) const override;
 
+    void filter(const common::ValueVector& vector, common::SelectionVector& sel) const override;
+
     std::string toString() override;
 
     std::unique_ptr<ColumnPredicate> copy() const override {

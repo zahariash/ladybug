@@ -306,6 +306,36 @@ static ZoneMapCheckResult getZoneMapResult(const TableScanState& scanState,
     return ZoneMapCheckResult::ALWAYS_SCAN;
 }
 
+static bool isScannedColumn(column_id_t columnID) {
+    return columnID != INVALID_COLUMN_ID && columnID != ROW_IDX_COLUMN_ID;
+}
+
+static bool isString(const ValueVector& vector) {
+    const auto physicalType = vector.dataType.getPhysicalType();
+    return physicalType == PhysicalTypeID::STRING || physicalType == PhysicalTypeID::JSON;
+}
+
+// A non-string column whose predicates can drop rows before the string columns are read.
+static bool filtersBeforeStrings(const TableScanState& scanState, idx_t columnIdx) {
+    return isScannedColumn(scanState.columnIDs[columnIdx]) &&
+           !scanState.columnPredicateSets[columnIdx].isEmpty() &&
+           !isString(*scanState.outputVectors[columnIdx]);
+}
+
+static bool canFilterBeforeStrings(const TableScanState& scanState) {
+    if (scanState.columnPredicateSets.empty()) {
+        return false;
+    }
+    bool hasFilter = false;
+    bool hasString = false;
+    for (auto i = 0u; i < scanState.columnIDs.size(); i++) {
+        hasFilter |= filtersBeforeStrings(scanState, i);
+        hasString |=
+            isScannedColumn(scanState.columnIDs[i]) && isString(*scanState.outputVectors[i]);
+    }
+    return hasFilter && hasString;
+}
+
 void ChunkedNodeGroup::scan(const Transaction* transaction, const TableScanState& scanState,
     const NodeGroupScanState& nodeGroupScanState, offset_t rowIdxInGroup,
     length_t numRowsToScan) const {
@@ -336,23 +366,52 @@ void ChunkedNodeGroup::scan(const Transaction* transaction, const TableScanState
         NodeTable::applySemiMaskFilter(scanState, startNodeOffset, numRowsToScan, anchorSelVector);
     }
 
+    auto scanColumn = [&](idx_t columnIdx) {
+        const auto columnID = scanState.columnIDs[columnIdx];
+        if (columnID == INVALID_COLUMN_ID) {
+            scanState.outputVectors[columnIdx]->setAllNull();
+            return;
+        }
+        if (columnID == ROW_IDX_COLUMN_ID) {
+            for (auto rowIdx = 0u; rowIdx < numRowsToScan; rowIdx++) {
+                scanState.rowIdxVector->setValue<row_idx_t>(rowIdx,
+                    rowIdx + rowIdxInGroup + startRowIdx);
+            }
+            return;
+        }
+        DASSERT(columnID < chunks.size());
+        chunks[columnID]->scan(transaction, nodeGroupScanState.chunkStates[columnIdx],
+            *scanState.outputVectors[columnIdx], rowIdxInGroup, numRowsToScan);
+    };
+
+    // Columns with a predicate are read and filtered first, so string columns are decoded only
+    // for the rows the predicates keep. The FILTER operator still evaluates the whole predicate,
+    // so a selection that keeps many rows can go back to all visible rows.
+    const bool filterBeforeStrings = canFilterBeforeStrings(scanState);
+    if (filterBeforeStrings && anchorSelVector.getSelSize() > 0) {
+        const bool wasUnfiltered = anchorSelVector.isUnfiltered();
+        const auto numVisible = anchorSelVector.getSelSize();
+        for (auto i = 0u; i < scanState.columnIDs.size(); i++) {
+            if (filtersBeforeStrings(scanState, i)) {
+                scanColumn(i);
+            }
+        }
+        for (auto i = 0u; i < scanState.columnIDs.size(); i++) {
+            if (filtersBeforeStrings(scanState, i)) {
+                scanState.columnPredicateSets[i].filter(*scanState.outputVectors[i],
+                    anchorSelVector);
+            }
+        }
+        if (wasUnfiltered && anchorSelVector.getSelSize() * 16 >= numVisible) {
+            anchorSelVector.setToUnfiltered(numVisible);
+        }
+    }
+
     if (anchorSelVector.getSelSize() > 0) {
         for (auto i = 0u; i < scanState.columnIDs.size(); i++) {
-            const auto columnID = scanState.columnIDs[i];
-            if (columnID == INVALID_COLUMN_ID) {
-                scanState.outputVectors[i]->setAllNull();
-                continue;
+            if (!filterBeforeStrings || !filtersBeforeStrings(scanState, i)) {
+                scanColumn(i);
             }
-            if (columnID == ROW_IDX_COLUMN_ID) {
-                for (auto rowIdx = 0u; rowIdx < numRowsToScan; rowIdx++) {
-                    scanState.rowIdxVector->setValue<row_idx_t>(rowIdx,
-                        rowIdx + rowIdxInGroup + startRowIdx);
-                }
-                continue;
-            }
-            DASSERT(columnID < chunks.size());
-            chunks[columnID]->scan(transaction, nodeGroupScanState.chunkStates[i],
-                *scanState.outputVectors[i], rowIdxInGroup, numRowsToScan);
         }
     }
     if (semiMaskEnabled && !maskBeforeColumns && anchorSelVector.getSelSize() > 0) {

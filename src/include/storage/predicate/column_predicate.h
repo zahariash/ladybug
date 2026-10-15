@@ -2,12 +2,36 @@
 
 #include "binder/expression/expression.h"
 #include "common/cast.h"
+#include "common/data_chunk/sel_vector.h"
 #include "common/enums/zone_map_check_result.h"
 
 namespace lbug {
 namespace storage {
 
 struct MergedColumnChunkStats;
+
+// Keeps the selected positions for which keep(pos) is true.
+template<typename Keep>
+void filterSelection(common::SelectionVector& sel, Keep&& keep) {
+    auto buffer = sel.getMutableBuffer();
+    const auto selSize = sel.getSelSize();
+    common::sel_t numKept = 0;
+    if (sel.isUnfiltered()) {
+        for (common::sel_t pos = 0; pos < selSize; pos++) {
+            buffer[numKept] = pos;
+            numKept += keep(pos);
+        }
+    } else {
+        for (common::sel_t i = 0; i < selSize; i++) {
+            const auto pos = sel[i];
+            buffer[numKept] = pos;
+            numKept += keep(pos);
+        }
+    }
+    if (numKept < selSize) {
+        sel.setToFiltered(numKept);
+    }
+}
 
 class LBUG_API ColumnPredicate {
 public:
@@ -17,6 +41,9 @@ public:
     virtual ~ColumnPredicate() = default;
 
     virtual common::ZoneMapCheckResult checkZoneMap(const MergedColumnChunkStats& stats) const = 0;
+
+    // Drops the selected rows of a scanned vector that fail the predicate.
+    virtual void filter(const common::ValueVector& vector, common::SelectionVector& sel) const = 0;
 
     virtual std::string toString();
 
@@ -44,6 +71,8 @@ public:
     bool isEmpty() const { return predicates.empty(); }
 
     common::ZoneMapCheckResult checkZoneMap(const MergedColumnChunkStats& stats) const;
+
+    void filter(const common::ValueVector& vector, common::SelectionVector& sel) const;
 
     std::string toString() const;
 
