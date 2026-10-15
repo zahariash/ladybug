@@ -174,8 +174,7 @@ class DurabilityRules(Session):
             elif op in ("set_age", "clear_age"):
                 age = value if op == "set_age" else None
                 writes.append(("MATCH (p:Person {id: $id}) SET p.age = $v", dict(id=id, v=age)))
-                if id in model.persons:
-                    model.persons[id]["age"] = age
+                model.update(id, "age", age)
             else:
                 writes.append(("CHECKPOINT", {}))
             states.append(race_state(model))

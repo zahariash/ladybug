@@ -62,11 +62,11 @@ class SessionRules(Session):
         return set.intersection(*map(set, views)) if views else set(self.model.persons)
 
     def no_pending_update(self) -> bool:
-        """A snapshot that begins before a write transaction's update commits sees it moved
-        (snapshot_update), as one that was open when the update ran does."""
-        return "snapshot_update" not in self.options.skipped or not any(
-            txn.updated for txn in self.txns.values()
-        )
+        """A checkpoint while a snapshot is open moves updates made since the last checkpoint to
+        other rows (snapshot_update), also ones committed before the snapshot began or by a write
+        transaction still open."""
+        pending = self.model.updated_since_checkpoint or any(t.updated for t in self.txns.values())
+        return "snapshot_update" not in self.options.skipped or not pending
 
     @enabled("sessions", writes=False)
     @precondition(

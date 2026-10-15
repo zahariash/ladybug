@@ -111,7 +111,7 @@ class PreparedRules(Session):
             assert Counter(actual) == Counter(expected), (name, params, actual, expected)
         elif name == "insert_person":
             self.model.add_persons({id: self.model.new_person(age=v)})
-        elif name == "set_age" and id in self.model.persons:
-            self.model.persons[id]["age"] = v
+        elif name == "set_age":
+            self.model.update(id, "age", v)
         elif name == "insert_t0":
             self.model.tables[0].append(v)

@@ -81,8 +81,8 @@ def apply(model: Model, kind: str, a, b) -> None:
     model.wrote |= kind not in DDL_OPS
     if kind == "insert":
         model.add_persons({a: model.new_person(age=b)})
-    elif kind == "set_age" and a in model.persons:
-        model.persons[a]["age"] = b
+    elif kind == "set_age":
+        model.update(a, "age", b)
     elif kind == "delete":
         model.forget(a)
     elif kind == "knows" and a in model.persons and b in model.persons:

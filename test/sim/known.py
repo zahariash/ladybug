@@ -60,8 +60,8 @@ KNOWN_BUGS = [
     ),
     Known(
         "snapshot_update",
-        "an update committed while a read-only transaction is open lands on another row at the "
-        "next checkpoint, durably (not filed)",
+        "a checkpoint while a read-only transaction is open puts updates made since the last "
+        "checkpoint on other rows, durably (not filed)",
     ),
     Known(
         "snapshot_insert_delete",

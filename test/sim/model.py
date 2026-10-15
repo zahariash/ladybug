@@ -53,6 +53,8 @@ class Model:
     dropped_since_checkpoint: bool = False
     added_after_drop: bool = False
     middle_dropped: bool = False
+    # Since the last checkpoint, an existing person was updated.
+    updated_since_checkpoint: bool = False
     # A transaction that added a column was rolled back since the last checkpoint.
     rolled_back_add: bool = False
     # In a transaction's view: it already ran a statement that prepared statements may reuse.
@@ -77,7 +79,7 @@ class Model:
 
     def checkpointed(self) -> None:
         self.dropped_since_checkpoint = self.added_after_drop = self.middle_dropped = False
-        self.rolled_back_add = False
+        self.rolled_back_add = self.updated_since_checkpoint = False
 
     def discarded(self, view: Model) -> None:
         """A transaction that saw `view` ended without committing: its inserts may still count
@@ -126,6 +128,12 @@ class Model:
             dropped_columns=set(self.dropped_columns),
             wrote=False,
         )
+
+    def update(self, id: int, field: str, value) -> None:
+        """Sets a field of an existing person. Replaces the person's dict, which forks may share."""
+        if id in self.persons:
+            self.persons[id] = {**self.persons[id], field: value}
+            self.updated_since_checkpoint = True
 
     def take_bulk_ids(self, count: int) -> range:
         ids = range(self.next_bulk_id, self.next_bulk_id + count)

@@ -56,8 +56,7 @@ class DataRules(Session):
         if not self.snapshot_write_safe("update", id):
             return
         self.ok(f"MATCH (p:Person {{id: $id}}) SET p.{field} = $v", dict(id=id, v=value))
-        if id in self.model.persons:
-            self.model.persons[id][field] = value
+        self.model.update(id, field, value)
 
     @enabled("persons")
     @precondition(lambda self: len(self.model.persons) > VECTOR_CAPACITY // 2)
@@ -69,7 +68,7 @@ class DataRules(Session):
         if not self.snapshot_write_safe("update", id):
             return
         self.ok("MATCH (p:Person {id: $id}) SET p.age = $v", dict(id=id, v=age))
-        self.model.persons[id]["age"] = age
+        self.model.update(id, "age", age)
 
     @enabled("persons")
     @rule(id=small_ids)
