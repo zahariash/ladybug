@@ -129,6 +129,22 @@ class Session:
         open read-only transactions (#1184), also the one COPY and CREATE INDEX force."""
         return "snapshot_checkpoint" not in self.options.skipped or not self.txns
 
+    def snapshot_write_safe(self, kind: str, id) -> bool:
+        """Whether a committed update or delete of Person `id` stays clear of two bugs that an
+        open read-only snapshot hits at the next checkpoint: the updated value lands on another
+        row (snapshot_update), and a row inserted after the snapshot began and then deleted
+        becomes visible to it (snapshot_insert_delete)."""
+        readers = [txn.view for txn in self.txns.values() if txn.kind == "read"]
+        if not readers or id not in self.model.persons:
+            return True
+        skipped = self.options.skipped
+        if kind in ("set_age", "update"):
+            return "snapshot_update" not in skipped
+        if kind == "delete":
+            hidden = any(id not in view.persons for view in readers)
+            return not (hidden and "snapshot_insert_delete" in skipped)
+        return True
+
     def has_partitions(self) -> bool:
         """Whether the partitioned table L exists: only while its rules run, so that a gated
         partition bug cannot end workloads that never touch it."""
@@ -189,15 +205,17 @@ class Session:
         op["outcome"] = "ok"
         return result
 
-    def open_engine(self, inject: tuple[str, int] | None = None) -> None:
+    def open_engine(self, inject: tuple[str, int] | None = None, crashed: bool = False) -> None:
         self.engine = None
         self.kept = {}
         # A new worker has new connections, without transactions.
         for txn in getattr(self, "txns", {}).values():
             self.model.discarded(txn.view)
         self.txns = {}
-        if getattr(self, "model", None) is not None:
-            self.model.checkpointed()  # opening replays the WAL and checkpoints
+        # Closing checkpoints, so a clean reopen starts from a checkpoint; recovery after a crash
+        # replays the WAL but leaves the column-ID gaps it found.
+        if getattr(self, "model", None) is not None and not crashed:
+            self.model.checkpointed()
         config = self.config
         if inject:
             # With one worker thread, the caller and the worker take turns, so the n-th call
@@ -211,7 +229,7 @@ class Session:
         self.traced(dict(op="reopen"), lambda: (self.engine.close(), self.open_engine()))
 
     def crash_engine(self) -> None:
-        self.traced(dict(op="crash"), lambda: (self.engine.kill(), self.open_engine()))
+        self.traced(dict(op="crash"), lambda: (self.engine.kill(), self.open_engine(crashed=True)))
 
     def crash_during_statement(self, query: str, delay: float) -> None:
         """Sends a statement, kills the engine `delay` seconds later and opens it again."""
@@ -220,7 +238,7 @@ class Session:
             self.engine.start(query)
             time.sleep(delay)
             self.engine.kill()
-            self.open_engine()
+            self.open_engine(crashed=True)
 
         self.traced(dict(op="crash_during", query=query, delay=delay), call)
 
@@ -239,7 +257,7 @@ class Session:
                     raise
             except EngineError:
                 pass  # a statement killed during open fails, which is the crash being tested
-            self.open_engine()
+            self.open_engine(crashed=True)
 
         self.traced(dict(op="crash_at", query=query, syscall=syscall, n=n), call)
 

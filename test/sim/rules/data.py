@@ -9,7 +9,16 @@ import hypothesis.strategies as st
 from hypothesis.stateful import precondition, rule
 from engine import EngineError
 from session import DUPLICATE_KEY, Session, enabled
-from strategies import clusters, csv_names, doubles, ints, names, small_ids
+from strategies import (
+    VECTOR_CAPACITY,
+    clusters,
+    csv_names,
+    doubles,
+    ints,
+    names,
+    near_boundaries,
+    small_ids,
+)
 
 NO_PK_INDEX = "COPY into a non-empty primary-key node table without a hash index"
 
@@ -44,13 +53,29 @@ class DataRules(Session):
     @rule(id=small_ids, field=st.sampled_from(["name", "age", "score"]), data=st.data())
     def update_person(self, id, field, data):
         value = data.draw({"name": names, "age": ints, "score": doubles}[field])
+        if not self.snapshot_write_safe("update", id):
+            return
         self.ok(f"MATCH (p:Person {{id: $id}}) SET p.{field} = $v", dict(id=id, v=value))
         if id in self.model.persons:
             self.model.persons[id][field] = value
 
     @enabled("persons")
+    @precondition(lambda self: len(self.model.persons) > VECTOR_CAPACITY // 2)
+    @rule(data=st.data(), age=ints)
+    def update_near_boundary(self, data, age):
+        """An update of a person by a vector boundary, which update_person's small ids never
+        reach."""
+        id = data.draw(near_boundaries(list(self.model.persons)))
+        if not self.snapshot_write_safe("update", id):
+            return
+        self.ok("MATCH (p:Person {id: $id}) SET p.age = $v", dict(id=id, v=age))
+        self.model.persons[id]["age"] = age
+
+    @enabled("persons")
     @rule(id=small_ids)
     def delete_person(self, id):
+        if not self.snapshot_write_safe("delete", id):
+            return
         self.ok("MATCH (p:Person {id: $id}) DETACH DELETE p", dict(id=id))
         self.model.forget(id)
 
@@ -122,6 +147,17 @@ class DataRules(Session):
                 values = [csv_field(v) for v in added[id].values()]
                 f.write(",".join([str(id), *values]) + "\n")
         return csv, added
+
+    @enabled("bulk_rows")
+    @precondition(lambda self: len(self.model.persons) < 3 * VECTOR_CAPACITY)
+    @rule(size=st.integers(VECTOR_CAPACITY // 2, VECTOR_CAPACITY + 200))
+    def add_bulk_persons(self, size):
+        """Adds bulk persons in one statement, so that rows past vector boundaries exist for the
+        other rules, also under --sim-focus sessions, where bulk_copy is off."""
+        ids = self.model.take_bulk_ids(size)
+        query = "UNWIND range($lo, $hi) AS i CREATE (:Person {id: i, age: i % 1000})"
+        self.ok(query, dict(lo=ids.start, hi=ids.stop - 1))
+        self.model.add_persons({id: self.model.new_person(age=id % 1000) for id in ids})
 
     @enabled("bulk_copy")
     @precondition(lambda self: self.checkpoint_keeps_snapshots())

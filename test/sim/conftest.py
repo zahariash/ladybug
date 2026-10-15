@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import glob
 import hashlib
+import importlib.util
 import json
 import os
 import shutil
@@ -23,6 +25,7 @@ FOCUS = {
     "extensions": {
         "persons",
         "bulk_copy",
+        "bulk_rows",
         "transaction",
         "atomic_statement",
         "knows",
@@ -128,12 +131,28 @@ def sim_options(pytestconfig) -> Iterator[Options]:
         shutil.rmtree(scratch, ignore_errors=True)
 
 
+def engine_build() -> str:
+    """The engine library the workers load, by path, size and modification time; empty when it
+    cannot be found without importing it."""
+    if os.environ.get("LBUG_PYTHON_BACKEND") == "capi":
+        libs = [os.environ.get("LBUG_C_API_LIB_PATH", "")]
+    else:
+        spec = importlib.util.find_spec("ladybug")
+        if spec is None or spec.origin is None:
+            return ""
+        libs = sorted(glob.glob(os.path.join(os.path.dirname(spec.origin), "_lbug*.so")))
+    stats = [(lib, os.stat(lib)) for lib in libs if os.path.exists(lib)]
+    return "\n".join(f"{lib} {st.st_size} {st.st_mtime_ns}" for lib, st in stats)
+
+
 @pytest.fixture(scope="session")
 def sim_settings(pytestconfig, sim_options) -> settings:
-    # Failing examples are saved and replayed first next time, but only for the same rules:
-    # a run with another gate lifted must not start with this run's failures.
+    # Failing examples are saved and replayed first next time, but only for the same rules and
+    # the same engine build: a run with another gate lifted, or on another build, must not
+    # start with (and stop on) this run's failures.
     rules = sorted(sim_options.skipped) + list(sim_options.extensions)
     rules.append(str(pytestconfig.getoption("sim_steps")))
+    rules.append(engine_build())
     key = hashlib.sha1("\n".join(rules).encode()).hexdigest()[:12]
     return settings(
         max_examples=pytestconfig.getoption("sim_examples"),

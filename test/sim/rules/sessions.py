@@ -17,7 +17,7 @@ from hypothesis.stateful import precondition, rule
 from model import Model
 from rules.transactions import apply, op, statement
 from session import Session, enabled, gated
-from strategies import clusters, small_ids
+from strategies import clusters, near_boundaries, small_ids
 
 SESSIONS = (2, 3, 4)
 READ_ONLY = "Can not execute a write query inside a read-only transaction"
@@ -25,13 +25,20 @@ ONE_WRITER = "Only one write transaction at a time"
 POOL_FULL = "Buffer manager exception"
 # The commit succeeded; the automatic checkpoint after it did not.
 COMMITTED_BUT = "Transaction committed successfully, but the post-commit checkpoint failed"
-gated("snapshot_checkpoint", "snapshot_rel_count", "snapshot_prepared")
+gated(
+    "snapshot_checkpoint",
+    "snapshot_rel_count",
+    "snapshot_prepared",
+    "snapshot_update",
+    "snapshot_insert_delete",
+)
 
 
 @dataclass
 class Txn:
     kind: str  # "read" or "write"
     view: Model  # what the transaction sees
+    updated: bool = False  # a write transaction that updated an existing person
 
 
 class SessionRules(Session):
@@ -49,8 +56,22 @@ class SessionRules(Session):
             or self.config["checkpoint_threshold"] == -1
         )
 
+    def seen_by_all_readers(self) -> set:
+        """The persons every open read-only transaction sees."""
+        views = [txn.view.persons for txn in self.txns.values() if txn.kind == "read"]
+        return set.intersection(*map(set, views)) if views else set(self.model.persons)
+
+    def no_pending_update(self) -> bool:
+        """A snapshot that begins before a write transaction's update commits sees it moved
+        (snapshot_update), as one that was open when the update ran does."""
+        return "snapshot_update" not in self.options.skipped or not any(
+            txn.updated for txn in self.txns.values()
+        )
+
     @enabled("sessions", writes=False)
-    @precondition(lambda self: self.free_sessions() and self.snapshots_safe())
+    @precondition(
+        lambda self: self.free_sessions() and self.snapshots_safe() and self.no_pending_update()
+    )
     @rule(data=st.data())
     def begin_read(self, data):
         conn = data.draw(st.sampled_from(self.free_sessions()))
@@ -81,6 +102,7 @@ class SessionRules(Session):
         query, params, error = step
         if error is None:
             self.ok(query, params, conn)
+            txn.updated |= kind == "set_age" and a in self.model.persons
             apply(txn.view, kind, a, b)
             return
         self.fails(query, params, error, conn)
@@ -185,8 +207,15 @@ class SessionRules(Session):
         """An auto-commit write while a snapshot is open, between existing persons, which the
         snapshot must not see."""
         existing = st.sampled_from(sorted(self.model.persons))
-        a = data.draw(small_ids if kind == "insert" else existing)
+        target = near_boundaries(list(self.model.persons))
+        hidden = sorted(set(self.model.persons) - self.seen_by_all_readers())
+        if kind == "delete" and hidden:
+            # A row a snapshot must not see, the case retention of deletes gets wrong.
+            target = st.one_of(target, st.sampled_from(hidden))
+        a = data.draw(small_ids if kind == "insert" else target)
         b = data.draw(existing if kind == "knows" else st.integers(-100, 100))
+        if not self.snapshot_write_safe(kind, a):
+            return
         step = statement(self.model, kind, a, b)
         if step is None:
             return

@@ -87,6 +87,8 @@ class PreparedRules(Session):
     def execute_prepared(self, data, id, v):
         """Runs a kept statement; it must act as if prepared now."""
         name = data.draw(st.sampled_from(sorted(self.kept)))
+        if name == "set_age" and not self.snapshot_write_safe("set_age", id):
+            return
         template, params = TEMPLATES[name], params_for(name, id, v)
         if not template.binds(self.model):
             try:

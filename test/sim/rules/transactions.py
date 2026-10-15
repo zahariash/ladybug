@@ -130,6 +130,8 @@ class TransactionRules(Session):
             return False
         if kind == "insert" and model.added_in_txn and "txn_prepared_ddl" in skipped:
             return False
+        if not self.snapshot_write_safe(kind, a):
+            return False
         if kind != "add_column":
             return True
         if a in model.dropped_columns and "readd_column" in skipped:
@@ -139,9 +141,10 @@ class TransactionRules(Session):
         return not (model.dropped_since_checkpoint and "txn_column_gap" in skipped)
 
     def column_gap_safe(self) -> bool:
-        """A transaction's new rows are misplaced once a column was dropped and another added
-        since the last checkpoint."""
-        return "txn_column_gap" not in self.options.skipped or not self.model.added_after_drop
+        """A transaction's new rows are misplaced once a column was dropped and another added,
+        or a column other than the last dropped, since the last checkpoint."""
+        gap = self.model.added_after_drop or self.model.middle_dropped
+        return "txn_column_gap" not in self.options.skipped or not gap
 
     @enabled("transaction")
     @precondition(lambda self: self.column_gap_safe())

@@ -48,10 +48,11 @@ class Model:
     pk_index: str | None = "_PK"  # the name of Person's primary-key index, if any
     age_index: str | None = None  # the name of the ART index on Person.age, if any
     dropped_columns: set = field(default_factory=set)  # Person columns dropped at some point
-    # Since the last checkpoint: a Person column was dropped, and then one was added. Column IDs
-    # have a gap until a checkpoint compacts them.
+    # Since the last checkpoint: a Person column was dropped, and then one was added; or a column
+    # other than the last was dropped. Column IDs have a gap until a checkpoint compacts them.
     dropped_since_checkpoint: bool = False
     added_after_drop: bool = False
+    middle_dropped: bool = False
     # A transaction that added a column was rolled back since the last checkpoint.
     rolled_back_add: bool = False
     # In a transaction's view: it already ran a statement that prepared statements may reuse.
@@ -61,6 +62,7 @@ class Model:
     added_in_txn: bool = False
 
     def drop_column(self, column: str) -> None:
+        self.middle_dropped |= column != list(self.columns)[-1]
         del self.columns[column]
         self.persons = {
             id: {c: v for c, v in p.items() if c != column} for id, p in self.persons.items()
@@ -74,7 +76,8 @@ class Model:
         self.added_after_drop |= self.dropped_since_checkpoint
 
     def checkpointed(self) -> None:
-        self.dropped_since_checkpoint = self.added_after_drop = self.rolled_back_add = False
+        self.dropped_since_checkpoint = self.added_after_drop = self.middle_dropped = False
+        self.rolled_back_add = False
 
     def discarded(self, view: Model) -> None:
         """A transaction that saw `view` ended without committing: its inserts may still count

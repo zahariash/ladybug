@@ -9,6 +9,17 @@ INT64_MIN, INT64_MAX = -(2**63), 2**63 - 1
 BULK_ID_START = 1_000_000
 
 small_ids = st.integers(0, 40)
+VECTOR_CAPACITY = 2048
+
+
+def near_boundaries(ids: list) -> st.SearchStrategy:
+    """One of `ids`, half of the time one at the rows on either side of a half or full vector
+    boundary (1023/1024, 2047/2048, ...), where per-vector bookkeeping changes and few writes
+    reach. Row positions follow `ids`' order, the insertion order, so deletes shift them."""
+    half = VECTOR_CAPACITY // 2
+    edges = [id for i, id in enumerate(ids) if i > 2 and i % half in (half - 2, half - 1, 0, 1)]
+    anywhere = st.sampled_from(ids)
+    return st.one_of(anywhere, st.sampled_from(edges)) if edges else anywhere
 macro_ids = st.integers(0, 3)
 table_ids = st.integers(0, 2)
 EXTRA_COLUMNS = ["c0", "c1", "c2"]

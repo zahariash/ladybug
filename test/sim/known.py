@@ -59,6 +59,16 @@ KNOWN_BUGS = [
         "connection COPYs in after it began (not filed)",
     ),
     Known(
+        "snapshot_update",
+        "an update committed while a read-only transaction is open lands on another row at the "
+        "next checkpoint, durably (not filed)",
+    ),
+    Known(
+        "snapshot_insert_delete",
+        "a row inserted and deleted after a read-only transaction began becomes visible to it "
+        "at the next checkpoint (not filed)",
+    ),
+    Known(
         "snapshot_prepared",
         "a prepared statement run inside an older snapshot is not rebound after DDL (not filed)",
     ),

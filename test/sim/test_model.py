@@ -101,3 +101,15 @@ def test_dropping_then_adding_a_column_marks_the_gap_until_a_checkpoint() -> Non
     assert model.dropped_since_checkpoint and model.added_after_drop
     model.checkpointed()
     assert not (model.dropped_since_checkpoint or model.added_after_drop)
+
+
+def test_dropping_a_middle_column_marks_the_gap_until_a_checkpoint() -> None:
+    model = Model()
+    for column in ("c0", "c1", "c2"):
+        model.add_column(column, 0)
+    model.drop_column("c2")
+    assert not model.middle_dropped
+    model.drop_column("c0")
+    assert model.middle_dropped
+    model.checkpointed()
+    assert not model.middle_dropped
