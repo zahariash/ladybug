@@ -429,12 +429,6 @@ offset_t InMemChunkedCSRHeader::getStartCSROffset(offset_t nodeOffset) const {
         return offset->getValue<offset_t>(0);
     }
     DASSERT(coversNode(nodeOffset));
-    if (headerLimit > 0 && nodeOffset >= headerLimit) {
-        const auto stored = headerLimit - 1 - indexBase;
-        return offset->getValue<offset_t>(stored >= numValues ? (numValues - 1) : stored);
-    }
-    // A header decoded for a span is only read inside it.
-    DASSERT(indexBase == 0 || (nodeOffset > indexBase && nodeOffset - 1 - indexBase < numValues));
     const auto stored = nodeOffset - 1 - indexBase;
     return offset->getValue<offset_t>(stored >= numValues ? (numValues - 1) : stored);
 }
@@ -450,11 +444,6 @@ offset_t InMemChunkedCSRHeader::getEndCSROffset(offset_t nodeOffset) const {
         return offset->getValue<offset_t>(nodeOffset == 0 ? 0 : 1);
     }
     DASSERT(coversNode(nodeOffset));
-    if (headerLimit > 0 && nodeOffset >= headerLimit) {
-        const auto stored = headerLimit - 1 - indexBase;
-        return offset->getValue<offset_t>(stored >= numValues ? (numValues - 1) : stored);
-    }
-    DASSERT(indexBase == 0 || nodeOffset - indexBase < numValues);
     const auto stored = nodeOffset - indexBase;
     return offset->getValue<offset_t>(stored >= numValues ? (numValues - 1) : stored);
 }
@@ -464,10 +453,6 @@ length_t InMemChunkedCSRHeader::getCSRLength(offset_t nodeOffset) const {
         return length->getNumValues() == 0 ? 0 : length->getValue<length_t>(0);
     }
     DASSERT(coversNode(nodeOffset));
-    if (headerLimit > 0 && nodeOffset >= headerLimit) {
-        return 0;
-    }
-    DASSERT(indexBase == 0 || nodeOffset - indexBase < length->getNumValues());
     const auto stored = nodeOffset - indexBase;
     return stored >= length->getNumValues() ? 0 : length->getValue<length_t>(stored);
 }

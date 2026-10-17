@@ -178,6 +178,11 @@ struct CSRNodeGroupScanState final : NodeGroupScanState {
     // node vector's chunk state, which holds the served parents in its selection vector. See
     // docs/multi_parent_lifetime.md.
     bool tryScanCachedTuplesPacked(RelTableScanState& tableScanState);
+
+    // Copies the rows of the current bound node's list into the cache, or moves past that node
+    // when its list is empty or already scanned. False once the batch has no rows left.
+    bool refillCache(const transaction::Transaction* transaction,
+        RelTableScanState& tableScanState);
 };
 
 struct CSRNodeGroupCheckpointState final : NodeGroupCheckpointState {

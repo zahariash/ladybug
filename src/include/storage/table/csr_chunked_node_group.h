@@ -65,7 +65,8 @@ struct LBUG_API InMemChunkedCSRHeader {
     // Logical header index stored at position 0. A full-group header uses 0.
     common::offset_t indexBase = 0;
     // Scan-private cache: a full on-disk header, or the [start, end) index ranges last decoded
-    // for a bound-node batch. Checkpoint headers leave these at the defaults.
+    // for a bound-node batch. Nodes at or past headerLimit, the on-disk header size, have no
+    // lists and read as empty. Checkpoint headers leave these at the defaults.
     bool wholeHeader = false;
     common::offset_t headerLimit = 0;
     std::vector<std::pair<common::offset_t, common::offset_t>> decodedRanges;

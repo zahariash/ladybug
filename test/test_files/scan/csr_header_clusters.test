@@ -15,10 +15,10 @@
 ---- ok
 -STATEMENT MATCH (a:N), (b:N) WHERE b.id = (a.id + 1) % 8000 CREATE (a)-[:E]->(b);
 ---- ok
-# Hub 0: four far clusters, including node 0 and the last node.
+# Hub 0: three clusters: node 0 with node 100, a middle node, and the last node.
 -STATEMENT MATCH (h:N), (a:N) WHERE h.id = 0 AND a.id IN [0, 100, 4000, 7999] CREATE (h)-[:F]->(a);
 ---- ok
-# Hub 1: one tight cluster.
+# Hub 1: one tight cluster, decoded as a packed span.
 -STATEMENT MATCH (h:N), (a:N) WHERE h.id = 1 AND a.id IN [50, 51, 52] CREATE (h)-[:F]->(a);
 ---- ok
 # Hub 2: two clusters with a large gap (nodes in the gap must not be read).
@@ -28,7 +28,7 @@
 ---- ok
 -STATEMENT MATCH (h:N), (a:N) WHERE h.id = 4 AND a.id = 7999 CREATE (h)-[:F]->(a);
 ---- ok
-# Hub 5: a dense run that should stay on the contiguous-span path.
+# Hub 5: a dense run, decoded as a packed span.
 -STATEMENT MATCH (h:N), (a:N) WHERE h.id = 5 AND a.id >= 1000 AND a.id < 1100 CREATE (h)-[:F]->(a);
 ---- ok
 -STATEMENT MATCH (h:N), (a:N) WHERE h.id = 6 AND a.id IN [10, 11, 5000, 5001] CREATE (h)-[:F]->(a);
