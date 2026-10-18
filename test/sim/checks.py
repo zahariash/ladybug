@@ -365,6 +365,15 @@ class Checks(Session):
                 list(walks.items()),
             )
 
+    def check_csr_degree(self, src: int) -> None:
+        """One node's CK count right after a committed write to its edges, the moment a count
+        from storage and the edges it has to subtract or add are most likely to disagree."""
+        n = sum(k for (s, _), k in self.model.ck.items() if s == src)
+        for counted in ("*", "b.id"):
+            self.check(
+                f"MATCH (a:C)-[:CK]->(b:C) WHERE a.id = {src} RETURN count({counted})", {}, [(n,)]
+            )
+
     def check_top_degrees(self, counted: str, degrees: Counter, conn: int) -> None:
         """The three nodes with the most CK edges; ties may come back in any order."""
         query = (

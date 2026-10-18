@@ -203,12 +203,19 @@ class DataRules(Session):
             "MATCH (a:C {id: $a}), (b:C {id: $b}) CREATE (a)-[:CK]->(b)", dict(a=src, b=dst)
         )
         self.model.ck[(src, dst)] += 1
+        self.check_csr_degree(src)
 
     @enabled("csr")
-    @rule(src=csr_ids, dst=csr_ids)
-    def delete_ck(self, src, dst):
+    @rule(data=st.data())
+    def delete_ck(self, data):
+        """An existing edge's endpoints about half the time."""
+        pair = st.tuples(csr_ids, csr_ids)
+        if self.model.ck:
+            pair = st.one_of(st.sampled_from(sorted(self.model.ck)), pair)
+        src, dst = data.draw(pair)
         self.ok("MATCH (a:C {id: $a})-[k:CK]->(b:C {id: $b}) DELETE k", dict(a=src, b=dst))
         self.model.ck.pop((src, dst), None)
+        self.check_csr_degree(src)
 
     @enabled("csr")
     @precondition(lambda self: self.checkpoint_keeps_snapshots())
@@ -220,3 +227,4 @@ class DataRules(Session):
             f.writelines(f"{s},{d}\n" for s, d in edges)
         self.ok(f'COPY CK FROM "{csv}"')
         self.model.ck.update(edges)
+        self.check_csr_degree(edges[0][0])
