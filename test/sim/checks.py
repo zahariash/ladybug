@@ -14,7 +14,13 @@ from strategies import clusters, small_ids
 USER_TABLES = {"Person", "Knows"}
 
 gated(
-    "in_lists", "in_list_nulls", "count_restricted", "txn_index_lookups", "pk_ranges", "lookup_join"
+    "in_lists",
+    "in_list_nulls",
+    "count_restricted",
+    "txn_index_lookups",
+    "pk_ranges",
+    "lookup_join",
+    "count_keys",
 )
 
 
@@ -231,6 +237,70 @@ class Checks(Session):
             second,
         )
 
+    def check_key_counts(
+        self, view: Model, check, conn: int, x: int, id: int, degrees: Counter
+    ) -> None:
+        """count() and count(DISTINCT) over primary keys and id(), which the binder may count as
+        the internal ID: a whole table, filtered, both ends of an edge, an OPTIONAL MATCH end
+        that is null when unbound, a bound node, a renamed variable and a two-hop end."""
+        persons, knows = view.persons, view.knows
+        n = len(persons)
+        ages = [p["age"] for p in persons.values() if p["age"] is not None]
+        check(
+            "MATCH (p:Person) "
+            "RETURN count(p.id), count(DISTINCT p.id), count(id(p)), count(p.age)",
+            {},
+            [(n, n, n, len(ages))],
+        )
+        older = sum(a > x for a in ages)
+        check(
+            "MATCH (p:Person) WHERE p.age > $x RETURN count(p.id), count(DISTINCT p.id)",
+            dict(x=x),
+            [(older, older)],
+        )
+        check("MATCH (p:Person) WITH p AS q RETURN count(q.id)", {}, [(n,)])
+        edges = [(src, dst) for (src, dst, _), k in knows.items() for _ in range(k)]
+        txn = self.txns.get(conn)
+        if not (txn and txn.kind == "read" and "snapshot_rel_count" in self.options.skipped):
+            check(
+                "MATCH (a:Person)-[:Knows]->(b:Person) "
+                "RETURN count(b.id), count(DISTINCT b.id), count(DISTINCT a.id)",
+                {},
+                [(len(edges), len({d for _, d in edges}), len({s for s, _ in edges}))],
+            )
+        out = {d for s, d in edges if s == id}
+        check(
+            "MATCH (a:Person) OPTIONAL MATCH (a)-[:Knows]->(b:Person) "
+            "RETURN a.id, count(b.id), count(DISTINCT b.id)",
+            {},
+            [(i, degrees[i], len({d for s, d in edges if s == i})) for i in persons],
+        )
+        bound = 1 if degrees[id] else 0
+        check(
+            "MATCH (a:Person)-[:Knows]->(b:Person) WHERE a.id = $id RETURN count(a.id), "
+            "count(DISTINCT a.id), count(DISTINCT id(a)), count(DISTINCT b.id)",
+            dict(id=id),
+            [(degrees[id], bound, bound, len(out))],
+        )
+        reach = out | {d for s, d in edges if s in out}
+        check(
+            "MATCH (a:Person)-[:Knows*1..2]->(b:Person) WHERE a.id = $id "
+            "RETURN count(DISTINCT b.id)",
+            dict(id=id),
+            [(len(reach),)],
+        )
+        if self.has_partitions():
+            ids = {i for i, _ in view.partitioned}
+            check(
+                "MATCH (n:L) RETURN count(n.id), count(DISTINCT n.id)", {}, [(len(ids), len(ids))]
+            )
+        for i, values in view.tables.items():
+            check(
+                f"MATCH (t:T{i}) RETURN count(t.id), count(DISTINCT t.id)",
+                {},
+                [(len(values), len(values))],
+            )
+
     def check_view(
         self,
         view: Model,
@@ -339,6 +409,8 @@ class Checks(Session):
         self.check_index_paths(view, conn, x, id, degrees, alone)
         if "lookup_join" not in self.options.skipped:
             self.check_lookup_joins(view, check, id)
+        if "count_keys" not in self.options.skipped:
+            self.check_key_counts(view, check, conn, x, id, degrees)
         for column, default in view.columns.items():
             if column.startswith("c"):
                 check(
