@@ -13,7 +13,9 @@ from strategies import clusters, small_ids
 
 USER_TABLES = {"Person", "Knows"}
 
-gated("in_lists", "in_list_nulls", "count_restricted", "txn_index_lookups", "pk_ranges")
+gated(
+    "in_lists", "in_list_nulls", "count_restricted", "txn_index_lookups", "pk_ranges", "lookup_join"
+)
 
 
 class Checks(Session):
@@ -183,6 +185,52 @@ class Checks(Session):
             for conn in conns:
                 self.ok("CALL enable_plan_optimizer=true", conn=conn)
 
+    def check_lookup_joins(self, view: Model, check, id: int) -> None:
+        """Joins on a node ID whose other side is a bare scan of that node, the shape a lookup
+        join fetches by offset instead of a scan and hash join: a few outer rows (the edges of
+        one person) and the payload of the rows they reach, also columns added later."""
+        persons, knows = view.persons, view.knows
+        out = [(dst, n) for (src, dst, _), n in knows.items() if src == id]
+        into = [(src, n) for (src, dst, _), n in knows.items() if dst == id]
+
+        def payload(i):
+            p = persons[i]
+            return (i, p["name"], p["age"], p["score"])
+
+        check(
+            "MATCH (a:Person)-[:Knows]->(b:Person) WHERE a.id = $id "
+            "MATCH (b) RETURN b.id, b.name, b.age, b.score",
+            dict(id=id),
+            [payload(dst) for dst, n in out for _ in range(n)],
+        )
+        check(
+            "MATCH (a:Person)<-[:Knows]-(b:Person) WHERE a.id = $id "
+            "MATCH (b) RETURN b.id, b.name, b.age, b.score",
+            dict(id=id),
+            [payload(src) for src, n in into for _ in range(n)],
+        )
+        for column in view.columns:
+            check(
+                f"MATCH (a:Person)-[:Knows]->(b:Person) WHERE a.id = $id MATCH (b) "
+                f"RETURN b.id, b.{column}",
+                dict(id=id),
+                [(dst, persons[dst][column]) for dst, n in out for _ in range(n)],
+            )
+        # Two patterns sharing a node, as in LDBC's Q1.
+        second = [
+            (persons[b]["age"], c, persons[c]["age"])
+            for b, n1 in out
+            for (src, c, _), n2 in knows.items()
+            if src == b
+            for _ in range(n1 * n2)
+        ]
+        check(
+            "MATCH (a:Person)-[:Knows]->(b:Person), (b)-[:Knows]->(c:Person) WHERE a.id = $id "
+            "RETURN b.age, c.id, c.age",
+            dict(id=id),
+            second,
+        )
+
     def check_view(
         self,
         view: Model,
@@ -289,6 +337,8 @@ class Checks(Session):
                 [(sum(c == cluster for _, c in view.partitioned),)],
             )
         self.check_index_paths(view, conn, x, id, degrees, alone)
+        if "lookup_join" not in self.options.skipped:
+            self.check_lookup_joins(view, check, id)
         for column, default in view.columns.items():
             if column.startswith("c"):
                 check(
