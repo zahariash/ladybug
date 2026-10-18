@@ -243,7 +243,9 @@ class Checks(Session):
     ) -> None:
         """count() and count(DISTINCT) over primary keys and id(), which the binder may count as
         the internal ID: a whole table, filtered, both ends of an edge, an OPTIONAL MATCH end
-        that is null when unbound, a bound node, a renamed variable and a two-hop end."""
+        that is null when unbound, a bound node, a renamed variable and a two-hop end. Edge
+        counts also run with a single aggregate, which rel-degree and rel-count rewrites answer
+        from storage."""
         persons, knows = view.persons, view.knows
         n = len(persons)
         ages = [p["age"] for p in persons.values() if p["age"] is not None]
@@ -269,6 +271,17 @@ class Checks(Session):
                 {},
                 [(len(edges), len({d for _, d in edges}), len({s for s, _ in edges}))],
             )
+            # One aggregate each, the shape the count-from-storage rewrites take.
+            sources, targets = len({s for s, _ in edges}), len({d for _, d in edges})
+            for query, expected in [
+                ("MATCH (a:Person)-[:Knows]->(:Person) RETURN count(DISTINCT a.id)", sources),
+                ("MATCH (a:Person)-[:Knows]->(:Person) RETURN count(DISTINCT id(a))", sources),
+                ("MATCH (b:Person)<-[:Knows]-(:Person) RETURN count(DISTINCT b.id)", targets),
+                ("MATCH (a:Person)-[:Knows]->(b:Person) RETURN count(b.id)", len(edges)),
+                ("MATCH ()-[k:Knows]->() RETURN count(k)", len(edges)),
+                ("MATCH ()-[k:Knows]->() RETURN sum(2)", 2 * len(edges) if edges else None),
+            ]:
+                check(query, {}, [(expected,)])
         out = {d for s, d in edges if s == id}
         check(
             "MATCH (a:Person) OPTIONAL MATCH (a)-[:Knows]->(b:Person) "

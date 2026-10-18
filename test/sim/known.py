@@ -55,8 +55,9 @@ KNOWN_BUGS = [
     ),
     Known(
         "snapshot_rel_count",
-        "a relationship count(*) in a read-only transaction counts relationships another "
-        "connection COPYs in after it began (not filed)",
+        "#1306: relationship counts in a read-only transaction (count(*), and count(DISTINCT "
+        "a.key) answered from rel degrees) include relationships another connection COPYs in "
+        "after it began",
     ),
     Known(
         "snapshot_update",
