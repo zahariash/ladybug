@@ -84,6 +84,11 @@ void TaskScheduler::scheduleTaskAndWaitOrError(const std::shared_ptr<Task>& task
         }
         return;
     }
+    // A caller that holds a slot (a worker, or a caller running a task inline) is blocked until
+    // this task finishes, so it works on the task too: when such callers hold every slot, no one
+    // else can. A launched thread already stands in for the caller.
+    const bool runOnThisThread =
+        !launchNewWorkerThread && busySlotOwner == this && task->registerThread();
     std::thread newWorkerThread;
     if (launchNewWorkerThread) {
         // Note that newWorkerThread is not executing yet. However, we still call
@@ -101,6 +106,9 @@ void TaskScheduler::scheduleTaskAndWaitOrError(const std::shared_ptr<Task>& task
     }
     auto scheduledTask = pushTaskIntoQueue(task);
     cv.notify_all();
+    if (runOnThisThread) {
+        runTask(task.get());
+    }
     std::unique_lock<std::mutex> taskLck{task->taskMtx, std::defer_lock};
     while (true) {
         taskLck.lock();

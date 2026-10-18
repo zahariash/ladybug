@@ -9,6 +9,7 @@
 #include "main/client_context.h"
 #include "main/connection.h"
 #include "main/database.h"
+#include "test_helper/hang_watchdog.h"
 
 using namespace lbug;
 
@@ -21,17 +22,20 @@ void updatePeak(std::atomic<uint64_t>& peak, uint64_t now) {
 
 class CountingTask final : public common::Task {
 public:
-    CountingTask(std::atomic<uint64_t>& active, std::atomic<uint64_t>& peak)
-        : Task{1}, active{active}, peak{peak} {}
+    CountingTask(std::atomic<uint64_t>& active, std::atomic<uint64_t>& peak,
+        uint64_t maxNumThreads = 1)
+        : Task{maxNumThreads}, active{active}, peak{peak} {}
 
     void run() override {
         threadID = std::this_thread::get_id();
+        ++numRuns;
         updatePeak(peak, ++active);
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
         --active;
     }
 
     std::thread::id threadID;
+    std::atomic<uint64_t> numRuns{0};
 
 private:
     std::atomic<uint64_t>& active;
@@ -56,12 +60,15 @@ private:
 
 class NestingTask final : public common::Task {
 public:
-    NestingTask(main::ClientContext* context, std::shared_ptr<CountingTask> child)
-        : Task{1}, context{context}, child{std::move(child)} {}
+    NestingTask(main::ClientContext* context, std::shared_ptr<CountingTask> child,
+        bool launchNewWorkerThread = false)
+        : Task{1}, context{context}, child{std::move(child)},
+          launchNewWorkerThread{launchNewWorkerThread} {}
 
     void run() override {
         threadID = std::this_thread::get_id();
-        common::TaskScheduler::Get(*context)->scheduleTaskAndWaitOrError(child, context);
+        common::TaskScheduler::Get(*context)->scheduleTaskAndWaitOrError(child, context,
+            launchNewWorkerThread);
     }
 
     std::thread::id threadID;
@@ -69,6 +76,7 @@ public:
 private:
     main::ClientContext* context;
     std::shared_ptr<CountingTask> child;
+    bool launchNewWorkerThread;
 };
 
 void schedule(main::Connection& conn, const std::shared_ptr<common::Task>& task) {
@@ -157,3 +165,49 @@ TEST(TaskSchedulerTest, NestedOneThreadTaskReusesCallerSlot) {
     EXPECT_EQ(outer->threadID, std::this_thread::get_id());
     EXPECT_EQ(child->threadID, std::this_thread::get_id());
 }
+
+// The only slot is held by the outer task, so no worker can join the nested task: the caller
+// has to run it.
+TEST(TaskSchedulerTest, NestedTaskRunsOnCallerWhenNoSlotIsFree) {
+    lbug::testing::HangWatchdog watchdog{std::chrono::seconds(60)};
+    main::Database db(":memory:", main::SystemConfig(-1u, 1));
+    main::Connection conn(&db);
+    std::atomic<uint64_t> active{0}, peak{0};
+    auto child = std::make_shared<CountingTask>(active, peak, 2 /* maxNumThreads */);
+    auto outer = std::make_shared<NestingTask>(conn.getClientContext(), child);
+    schedule(conn, outer);
+    EXPECT_EQ(child->threadID, outer->threadID);
+}
+
+#ifndef __SINGLE_THREADED__
+// With a timeout the outer task runs on the only worker while the caller watches the clock. The
+// nested task is not inlined up front, so the worker has to join it after queuing it.
+TEST(TaskSchedulerTest, NestedTaskWithTimeoutRunsOnWorker) {
+    lbug::testing::HangWatchdog watchdog{std::chrono::seconds(60)};
+    main::Database db(":memory:", main::SystemConfig(-1u, 1));
+    main::Connection conn(&db);
+    conn.setQueryTimeOut(60000);
+    conn.getClientContext()->startTimer();
+    std::atomic<uint64_t> active{0}, peak{0};
+    auto child = std::make_shared<CountingTask>(active, peak);
+    auto outer = std::make_shared<NestingTask>(conn.getClientContext(), child);
+    schedule(conn, outer);
+    EXPECT_NE(outer->threadID, std::this_thread::get_id());
+    EXPECT_EQ(child->threadID, outer->threadID);
+}
+
+// A launched thread stands in for the blocked caller, so the caller must not work on the task
+// as well: that would put two threads on one slot.
+TEST(TaskSchedulerTest, LaunchedThreadStandsInForCaller) {
+    lbug::testing::HangWatchdog watchdog{std::chrono::seconds(60)};
+    main::Database db(":memory:", main::SystemConfig(-1u, 1));
+    main::Connection conn(&db);
+    std::atomic<uint64_t> active{0}, peak{0};
+    auto child = std::make_shared<CountingTask>(active, peak, 2 /* maxNumThreads */);
+    auto outer = std::make_shared<NestingTask>(conn.getClientContext(), child,
+        true /* launchNewWorkerThread */);
+    schedule(conn, outer);
+    EXPECT_EQ(child->numRuns.load(), 1u);
+    EXPECT_NE(child->threadID, outer->threadID);
+}
+#endif
