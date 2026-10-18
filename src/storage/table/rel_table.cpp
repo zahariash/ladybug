@@ -897,8 +897,19 @@ row_idx_t RelTable::getDegreeForOffset(const Transaction* transaction, RelDataDi
     auto& csrNodeGroup = nodeGroup->cast<CSRNodeGroup>();
     row_idx_t count = 0;
     if (auto* persistentGroup = csrNodeGroup.getPersistentChunkedGroup()) {
-        count +=
-            persistentGroup->cast<ChunkedCSRNodeGroup>().getCSRHeader().getCSRLength(offsetInGroup);
+        // COPY and checkpoint flush a persistent group before publishing it, so its CSR length
+        // chunk is on disk: read the length through the column.
+        auto& csrHeader = persistentGroup->cast<ChunkedCSRNodeGroup>().getCSRHeader();
+        if (offsetInGroup < csrHeader.length->getNumValues()) {
+            auto* csrLengthColumn = relTableData->getCSRLengthColumn();
+            ChunkState chunkState;
+            csrHeader.length->initializeScanState(chunkState, csrLengthColumn);
+            const auto [segmentState, offsetInSegment] = chunkState.findSegment(offsetInGroup);
+            uint64_t length = 0;
+            csrLengthColumn->scanSegment(*segmentState, offsetInSegment, 1 /*length*/,
+                reinterpret_cast<uint8_t*>(&length));
+            count += length;
+        }
     }
     if (const auto* csrIndex = csrNodeGroup.getCSRIndex()) {
         count += csrIndex->getNumRows(offsetInGroup);
