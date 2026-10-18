@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <fstream>
 #include <functional>
 #include <map>
 #include <stdexcept>
@@ -859,6 +860,40 @@ TEST_F(StatsOptimizerTest, FilterPushDownOrdersMostSelectivePredicateFirst2) {
     auto* deepestFilter = getDeepestFilter(plan->getLastOperator().get());
     ASSERT_NE(nullptr, deepestFilter);
     ASSERT_NE(std::string::npos, deepestFilter->getPredicate()->toString().find("rare"));
+}
+
+// A COPY into an empty node group and a checkpoint both leave the relationships in the node group's
+// persistent group, whose CSR lengths are on disk.
+TEST_F(StatsOptimizerTest, RelDegreeOffsetCountReadsPersistentRels) {
+    auto csvPath = TestHelper::getTempDBPathStr("RelDegreeOffsetCountReadsPersistentRels") + ".csv";
+    {
+        std::ofstream csv(csvPath);
+        for (auto i = 1; i < 128; ++i) {
+            csv << i % 40 << "," << i * 7 % 40 << "\n";
+        }
+    }
+    for (const auto& statement : std::vector<std::string>{
+             "CREATE NODE TABLE N(id INT64, PRIMARY KEY(id));", "CREATE REL TABLE C(FROM N TO N);",
+             "CREATE REL TABLE K(FROM N TO N);", "UNWIND range(0, 39) AS i CREATE (:N {id: i});",
+             "ALTER TABLE N SET SORTED BY (id ASC) CSR;", std::format("COPY C FROM '{}';", csvPath),
+             "UNWIND range(1, 127) AS i MATCH (a:N {id: i % 40}), (b:N {id: (i * 7) % 40}) "
+             "CREATE (a)-[:K]->(b);"}) {
+        auto result = conn->query(statement);
+        ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+    }
+    auto countEdges = [&](const std::string& rel) {
+        const auto query = "MATCH (a:N)-[:" + rel + "]->(b:N) WHERE a.id = 1 RETURN count(*);";
+        EXPECT_TRUE(OptimizerTest::hasOperatorType(getRoot(query)->getLastOperator().get(),
+            planner::LogicalOperatorType::REL_DEGREE_TABLE));
+        auto result = conn->query(query);
+        EXPECT_TRUE(result->isSuccess()) << result->getErrorMessage();
+        return result->getNext()->getValue(0)->getValue<int64_t>();
+    };
+    ASSERT_EQ(countEdges("C"), 4);
+    ASSERT_EQ(countEdges("K"), 4);
+    ASSERT_TRUE(conn->query("CHECKPOINT;")->isSuccess());
+    ASSERT_EQ(countEdges("C"), 4);
+    ASSERT_EQ(countEdges("K"), 4);
 }
 
 TEST_F(StatsOptimizerTest, HashJoinCostIncludesEstimatedOutputCardinality) {

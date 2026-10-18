@@ -751,6 +751,35 @@ row_idx_t RelTable::getNumTotalRows(const Transaction* transaction) {
     return numLocalRows + nextRelOffset;
 }
 
+// COPY and checkpoint flush a persistent group before publishing it, so its CSR header chunks are
+// on disk: read them through their columns.
+static uint64_t readCSRHeaderValue(ColumnChunk& chunk, Column& column, offset_t offset) {
+    ChunkState chunkState;
+    chunk.initializeScanState(chunkState, &column);
+    const auto [segmentState, offsetInSegment] = chunkState.findSegment(offset);
+    uint64_t value = 0;
+    column.scanSegment(*segmentState, offsetInSegment, 1 /*length*/,
+        reinterpret_cast<uint8_t*>(&value));
+    return value;
+}
+
+// One node's committed rels.
+static row_idx_t getCommittedDegree(const RelTableData& relTableData, const CSRNodeGroup& nodeGroup,
+    offset_t offsetInGroup) {
+    row_idx_t count = 0;
+    if (auto* persistentGroup = nodeGroup.getPersistentChunkedGroup()) {
+        auto& csrHeader = persistentGroup->cast<ChunkedCSRNodeGroup>().getCSRHeader();
+        if (offsetInGroup < csrHeader.length->getNumValues()) {
+            count += readCSRHeaderValue(*csrHeader.length, *relTableData.getCSRLengthColumn(),
+                offsetInGroup);
+        }
+    }
+    if (const auto* csrIndex = nodeGroup.getCSRIndex()) {
+        count += csrIndex->getNumRows(offsetInGroup);
+    }
+    return count;
+}
+
 // Calls func(offset, degree) for every bound node with at least one rel, in ascending offset
 // order. A degree adds up the node's checkpointed CSR length, its committed in-memory rels and,
 // in a write transaction, its uncommitted rels.
@@ -887,21 +916,12 @@ row_idx_t RelTable::getDegreeForOffset(const Transaction* transaction, RelDataDi
     const auto nodeGroupIdx = StorageUtils::getNodeGroupIdx(nodeOffset);
     const auto offsetInGroup = nodeOffset - StorageUtils::getStartOffsetOfNodeGroup(nodeGroupIdx);
     auto* relTableData = getDirectedTableData(direction);
-    if (nodeGroupIdx >= relTableData->getNumNodeGroups()) {
-        return 0;
-    }
-    auto* nodeGroup = relTableData->getNodeGroup(nodeGroupIdx);
-    if (!nodeGroup) {
-        return 0;
-    }
-    auto& csrNodeGroup = nodeGroup->cast<CSRNodeGroup>();
     row_idx_t count = 0;
-    if (auto* persistentGroup = csrNodeGroup.getPersistentChunkedGroup()) {
-        count +=
-            persistentGroup->cast<ChunkedCSRNodeGroup>().getCSRHeader().getCSRLength(offsetInGroup);
-    }
-    if (const auto* csrIndex = csrNodeGroup.getCSRIndex()) {
-        count += csrIndex->getNumRows(offsetInGroup);
+    if (nodeGroupIdx < relTableData->getNumNodeGroups()) {
+        if (auto* nodeGroup = relTableData->getNodeGroup(nodeGroupIdx)) {
+            count +=
+                getCommittedDegree(*relTableData, nodeGroup->cast<CSRNodeGroup>(), offsetInGroup);
+        }
     }
     if (transaction->isWriteTransaction()) {
         if (auto* localTable = transaction->getLocalStorage()->getLocalTable(*this)) {

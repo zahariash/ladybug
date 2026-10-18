@@ -69,6 +69,15 @@ protected:
         EXPECT_EQ(entries, expected);
 
         EXPECT_EQ(table.getNumActiveBoundNodes(transaction, direction), expected.size());
+        for (const auto& [offset, degree] : expected) {
+            EXPECT_EQ(table.getDegreeForOffset(transaction, direction, offset), degree) << offset;
+        }
+        for (offset_t offset = 0; offset < 64; ++offset) {
+            if (!std::binary_search(expected.begin(), expected.end(), std::make_pair(offset, 0ul),
+                    [](const auto& a, const auto& b) { return a.first < b.first; })) {
+                EXPECT_EQ(table.getDegreeForOffset(transaction, direction, offset), 0u) << offset;
+            }
+        }
 
         row_idx_t totalDegree = 0;
         row_idx_t maxDegree = 0;
