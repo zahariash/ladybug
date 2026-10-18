@@ -57,7 +57,7 @@ KNOWN_BUGS = [
         "snapshot_rel_count",
         "#1306: relationship counts in a read-only transaction (count(*), and count(DISTINCT "
         "a.key) answered from rel degrees) include relationships another connection COPYs in "
-        "after it began",
+        "after it began (fix: branch fix/1306-degree-count-visibility, 9243dfb06; not merged)",
     ),
     Known(
         "snapshot_update",
@@ -105,7 +105,8 @@ KNOWN_BUGS = [
         "csr_local_offset_count",
         "one node's relationship count on a CSR-declared table (REL_DEGREE_TABLE OFFSET_COUNT) "
         "misses the transaction's own relationships while the rel table has no node group "
-        "there: getDegreeForOffset returns before reading local storage (not filed)",
+        "there: getDegreeForOffset returns before reading local storage (fixed on branch "
+        "fix/1306-degree-count-visibility, 9243dfb06, with #1306; not merged)",
     ),
     Known(
         "rollback_prepared",
