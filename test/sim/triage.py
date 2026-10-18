@@ -47,7 +47,7 @@ def shape(query: str) -> str:
 def operation(op: dict) -> str:
     """The class of a step: its first keyword, and for ALTER the change it makes."""
     query = op.get("query")
-    if op["op"] not in ("execute", "prepared", "prepare") or not query:
+    if op["op"] not in ("execute", "columns", "prepared", "prepare") or not query:
         return op["op"]
     words = query.split()
     if words[0].upper() == "ALTER" and len(words) > 3:
@@ -134,7 +134,7 @@ def cypher(trace: list, failing: int, failure: str, config: dict) -> str:
         if params:
             values = ", ".join(f"${k} = {literal(v)}" for k, v in params.items())
             statement = f"{statement}  // {values}"
-        if kind == "execute":
+        if kind in ("execute", "columns"):
             text = f"{where}{terminated(statement)}"
         elif kind == "prepared":
             text = f"{where}// prepared, then executed twice:\n{terminated(statement)}"
@@ -224,7 +224,7 @@ def run_stage(path, index):
         conn(0).execute(query)
     for n, op in enumerate(stage["steps"]):
         try:
-            if op["op"] == "execute":
+            if op["op"] in ("execute", "columns"):
                 conn(op["conn"]).execute(op["query"], op["params"]).get_all()
             elif op["op"] == "prepared":
                 statement = conn(op["conn"]).prepare(op["query"], op["params"])

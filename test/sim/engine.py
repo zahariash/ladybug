@@ -101,7 +101,8 @@ def hold(conn, held: list) -> int:
 
 def serve(conns: list, db, connect, named: dict, held: list, message: tuple):
     """Handles one request: ("race", writes, queries, readers); ("prepared", connection,
-    query, params), which prepares the query and executes it twice; ("prepare", name,
+    query, params), which prepares the query and executes it twice; ("columns", connection,
+    query, params), the result's column names and rows; ("prepare", name,
     connection, query, params), which keeps the statement for ("run", name, params);
     ("hold", connection) and ("release",), which fill the buffer pool with unconsumed
     results and free them; or (connection, query, params)."""
@@ -119,6 +120,10 @@ def serve(conns: list, db, connect, named: dict, held: list, message: tuple):
         if not statement.is_success():
             raise RuntimeError(statement.get_error_message())
         return [conns[conn].execute(statement, params).get_all() for _ in range(2)]
+    if message[0] == "columns":
+        _, conn, query, params = message
+        result = conns[conn].execute(query, params)
+        return [result.get_column_names(), result.get_all()]
     if message[0] == "prepare":
         _, name, conn, query, params = message
         statement = conns[conn].prepare(query, params)
@@ -296,6 +301,11 @@ class Engine:
         """The rows of two executions of one freshly prepared statement: the first plans the
         query, the second reuses the cached plan."""
         self.send(("prepared", conn, query, params), query)
+        return self.reply()
+
+    def columns(self, query: str, params: dict, conn: int = 0) -> list:
+        """The column names and the rows of one execution."""
+        self.send(("columns", conn, query, params), query)
         return self.reply()
 
     def prepare(self, name: str, query: str, params: dict, conn: int = 0) -> None:

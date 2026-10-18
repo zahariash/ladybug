@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from engine import Engine, EngineError
 from hypothesis.stateful import precondition
 from model import Model, canonical
-from strategies import CSR_NODES
+from strategies import CSR_ROWS
 from triage import probe_of, signature
 
 # Every name rules are gated on, so --sim-skip can reject names that match nothing. Rules add
@@ -26,12 +26,13 @@ RULE_NAMES: set[str] = set()
 EXTENSIONS = ("fts", "vector")
 
 DUPLICATE_KEY = "duplicated primary key"
-# C holds ids 0..CSR_NODES-1 at the offsets of their ids, which SORTED BY CSR declares. Every
-# open runs these: the declaration does not survive a reopen, and the MERGE writes nothing
-# once the rows exist, so C's change epoch, which the CSR rewrites check, stays.
+# C holds ids 0..CSR_ROWS-1 at the offsets of their ids, which SORTED BY CSR declares. Every
+# open runs these: the declaration does not survive a reopen, and the insert runs only while
+# the last row is missing, so C's change epoch, which the CSR rewrites check, stays.
 CSR_SETUP = [
     "CREATE NODE TABLE IF NOT EXISTS C(id INT64 PRIMARY KEY)",
-    f"UNWIND range(0, {CSR_NODES - 1}) AS i MERGE (:C {{id: i}})",
+    f"OPTIONAL MATCH (c:C {{id: {CSR_ROWS - 1}}}) WITH c WHERE c IS NULL "
+    f"UNWIND range(0, {CSR_ROWS - 1}) AS i CREATE (:C {{id: i}})",
     "CREATE REL TABLE IF NOT EXISTS CK(FROM C TO C)",
     "ALTER TABLE C SET SORTED BY (id ASC) CSR",
 ]
@@ -306,6 +307,11 @@ class Session:
 
     def rows(self, query: str, params: dict | None = None, conn: int = 0) -> list[tuple]:
         return [canonical(row) for row in self.run(query, params, conn)]
+
+    def columns(self, query: str, conn: int = 0) -> tuple[list[str], list[tuple]]:
+        op = dict(op="columns", conn=conn, query=query, params={})
+        names, rows = self.traced(op, lambda: self.engine.columns(query, {}, conn))
+        return names, [canonical(row) for row in rows]
 
     def prepare_named(self, name: str, query: str, params: dict) -> None:
         op = dict(op="prepare", name=name, query=query, params=params)

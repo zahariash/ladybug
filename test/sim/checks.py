@@ -9,7 +9,7 @@ import hypothesis.strategies as st
 from hypothesis.stateful import invariant, precondition, rule
 from model import Model
 from session import Session, diff, gated
-from strategies import CSR_NODES, clusters, small_ids
+from strategies import clusters, csr_id, small_ids
 
 USER_TABLES = {"Person", "Knows"}
 
@@ -23,6 +23,7 @@ gated(
     "count_keys",
     "rollback_prepared",
     "csr_local_offset_count",
+    "repeated_aggregate",
 )
 
 
@@ -288,6 +289,34 @@ class Checks(Session):
                 ("MATCH ()-[k:Knows]->() RETURN sum(2)", 2 * len(edges) if edges else None),
             ]:
                 check(query, {}, [(expected,)])
+        query = (
+            "MATCH (a:Person)-[:Knows]->(b:Person) "
+            "RETURN count(b.id), count(DISTINCT b.id), count(id(b))"
+        )
+        names, rows = self.columns(query, conn)
+        # An unaliased aggregate is named by its text, also when the key is counted as the ID.
+        assert names == ["COUNT(b.id)", "COUNT(DISTINCT b.id)", "COUNT(b._ID)"], (query, names)
+        assert rows == [(len(edges), len({d for _, d in edges}), len(edges))], (query, rows)
+        query = "MATCH (p:Person) WITH p, count(p.id) AS c RETURN c, count(p.id)"
+        names, _ = self.columns(query, conn)
+        assert names == ["c", "COUNT(p.id)"], (query, names)
+        if "repeated_aggregate" not in self.options.skipped:
+            in_degrees = Counter(d for _, d in edges)
+            fan_out = {s: len({d for t, d in edges if t == s}) for s, _ in edges}
+            for query, expected in [
+                (query, [(1, n)] if n else []),
+                (
+                    "MATCH (a:Person)-[:Knows]->(b:Person) WITH b, count(b.id) AS c "
+                    "RETURN c, count(b.id)",
+                    list(Counter(in_degrees.values()).items()),
+                ),
+                (
+                    "MATCH (a:Person)-[:Knows]->(b:Person) WITH a, count(DISTINCT b.id) AS c "
+                    "RETURN c, count(DISTINCT a.id)",
+                    list(Counter(fan_out.values()).items()),
+                ),
+            ]:
+                check(query, {}, expected)
         out = {d for s, d in edges if s == id}
         check(
             "MATCH (a:Person) OPTIONAL MATCH (a)-[:Knows]->(b:Person) "
@@ -496,7 +525,7 @@ class Checks(Session):
         if "count_keys" not in self.options.skipped:
             self.check_key_counts(view, check, conn, x, id, degrees)
         if self.has_csr():
-            self.check_csr_counts(view, check, conn, id % CSR_NODES, alone)
+            self.check_csr_counts(view, check, conn, csr_id(id), alone)
         for column, default in view.columns.items():
             if column.startswith("c"):
                 check(

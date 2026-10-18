@@ -68,6 +68,8 @@ class Replayer:
             self.engine.execute(op["query"], op["params"], op["conn"])
         elif kind == "prepared":
             self.engine.execute_prepared(op["query"], op["params"], op["conn"])
+        elif kind == "columns":
+            self.engine.columns(op["query"], op["params"], op["conn"])
         elif kind == "prepare":
             self.engine.prepare(op["name"], op["query"], op["params"])
         elif kind == "run":

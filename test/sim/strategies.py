@@ -25,9 +25,17 @@ table_ids = st.integers(0, 2)
 EXTRA_COLUMNS = ["c0", "c1", "c2"]
 extra_columns = st.sampled_from(EXTRA_COLUMNS)
 clusters = st.integers(1, 3)
-# Rows of C, the node table declared CSR: ids 0..CSR_NODES-1, at the offsets of their ids.
-CSR_NODES = 40
-csr_ids = st.integers(0, CSR_NODES - 1)
+# C, the node table declared CSR, holds ids 0..CSR_ROWS-1 at the offsets of their ids. Its edges
+# join the first 40 and the last 40, so that they lie in two node groups (2^17 rows each, the
+# default build).
+CSR_SECOND_GROUP = 2**17
+CSR_ROWS = CSR_SECOND_GROUP + 40
+csr_ids = st.one_of(st.integers(0, 39), st.integers(CSR_SECOND_GROUP, CSR_ROWS - 1))
+
+
+def csr_id(i: int) -> int:
+    """A C id for a small id: in the first node group for even ones, the second for odd ones."""
+    return i % 40 if i % 2 == 0 else CSR_SECOND_GROUP + i % 40
 
 ints = st.one_of(
     st.none(),
