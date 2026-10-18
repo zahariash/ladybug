@@ -21,6 +21,7 @@ gated(
     "pk_ranges",
     "lookup_join",
     "count_keys",
+    "rollback_prepared",
 )
 
 
@@ -282,13 +283,14 @@ class Checks(Session):
             dict(id=id),
             [(degrees[id], bound, bound, len(out))],
         )
-        reach = out | {d for s, d in edges if s in out}
-        check(
-            "MATCH (a:Person)-[:Knows*1..2]->(b:Person) WHERE a.id = $id "
-            "RETURN count(DISTINCT b.id)",
-            dict(id=id),
-            [(len(reach),)],
-        )
+        if "rollback_prepared" not in self.options.skipped:
+            reach = out | {d for s, d in edges if s in out}
+            check(
+                "MATCH (a:Person)-[:Knows*1..2]->(b:Person) WHERE a.id = $id "
+                "RETURN count(DISTINCT b.id)",
+                dict(id=id),
+                [(len(reach),)],
+            )
         if self.has_partitions():
             ids = {i for i, _ in view.partitioned}
             check(

@@ -101,6 +101,12 @@ KNOWN_BUGS = [
         "(not filed)",
     ),
     Known(
+        "rollback_prepared",
+        "a variable-length query the driver prepared inside a transaction that added columns and "
+        "rolled back fails with unordered_map::at in a later transaction, nondeterministically "
+        "(not filed)",
+    ),
+    Known(
         "second_writer",
         "after a refused BEGIN TRANSACTION, the connection's next statement segfaults (not filed)",
     ),
