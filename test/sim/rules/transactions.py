@@ -124,6 +124,8 @@ class TransactionRules(Session):
             if not (kind in DDL_OPS and "txn_ddl" in skipped)
             and not (kind == "duplicate" and "txn_error" in skipped)
             and not (kind == "drop_column" and "txn_column_gap" in skipped)
+            and not (kind in ("create_macro", "drop_macro") and "macros" in skipped)
+            and not (kind == "drop_macro" and "drop_macro" in skipped)
         ] + (["ck", "unck"] if "csr" not in skipped else [])
 
     def runs(self, model: Model, kind: str, a) -> bool:
