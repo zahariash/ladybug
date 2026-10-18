@@ -319,6 +319,11 @@ std::shared_ptr<LogicalOperator> FilterPushDownOptimizer::visitScanNodeTableRepl
             scan.setExtraInfo(std::make_unique<SecondaryIndexScanInfo>(
                 secondaryIndexComparison->second, secondaryIndexComparison->first));
             scan.computeFlatSchema();
+            // The equality filter that held card/ndv is gone. Projection pushdown copies
+            // this cardinality onto the operators SIP reads.
+            if (cardinalityEstimator != nullptr) {
+                scan.setCardinality(cardinalityEstimator->estimateScanNode(*op));
+            }
         }
     }
     return finishPushDown(op);

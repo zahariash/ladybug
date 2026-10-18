@@ -4,6 +4,7 @@
 #include "binder/expression/property_expression.h"
 #include "binder/expression/scalar_function_expression.h"
 #include "catalog/catalog.h"
+#include "catalog/catalog_entry/index_catalog_entry.h"
 #include "catalog/catalog_entry/node_table_catalog_entry.h"
 #include "catalog/catalog_entry/rel_group_catalog_entry.h"
 #include "catalog/catalog_entry/table_catalog_entry.h"
@@ -163,6 +164,52 @@ cardinality_t CardinalityEstimator::getNodeIDDom(const std::string& nodeIDName) 
     return nodeIDName2dom.at(nodeIDName);
 }
 
+// NDV of the single column a secondary ART equality scan looks up. Empty when the
+// index is missing, composite, or the column has no HLL, so the caller keeps the
+// same 1% fallback estimateFilter uses when it cannot see a distinct count.
+static std::optional<cardinality_t> secondaryIndexNumDistinct(main::ClientContext* context,
+    const LogicalScanNodeTable& scan,
+    const std::unordered_map<common::table_id_t, PlannerTableStats>& tableStats) {
+    if (scan.getExtraInfo() == nullptr || scan.getTableIDs().size() != 1) {
+        return {};
+    }
+    const auto tableID = scan.getTableIDs()[0];
+    const auto statsIt = tableStats.find(tableID);
+    if (statsIt == tableStats.end() || !statsIt->second.storageStats.has_value()) {
+        return {};
+    }
+    const auto& info = scan.getExtraInfo()->constCast<SecondaryIndexScanInfo>();
+    auto transaction = Transaction::Get(*context);
+    const auto dbIt = scan.getTableDBMap().find(tableID);
+    const auto dbName = dbIt == scan.getTableDBMap().end() ? std::string{} : dbIt->second;
+    auto [cat, storageManager] = main::DatabaseManager::resolveTableStorage(*context, tableID, dbName);
+    UNUSED(storageManager);
+    auto* entry = cat->getTableCatalogEntry(transaction, tableID);
+    const catalog::IndexCatalogEntry* indexEntry = nullptr;
+    for (auto* candidate : cat->getIndexEntries(transaction, tableID)) {
+        if (candidate->getIndexName() == info.indexName) {
+            indexEntry = candidate;
+            break;
+        }
+    }
+    if (indexEntry == nullptr) {
+        return {};
+    }
+    const auto propertyIDs = indexEntry->getPropertyIDs();
+    if (propertyIDs.size() != 1) {
+        return {};
+    }
+    const auto columnID = entry->getColumnID(propertyIDs[0]);
+    if (columnID == INVALID_COLUMN_ID || columnID == ROW_IDX_COLUMN_ID) {
+        return {};
+    }
+    const auto ndv = statsIt->second.storageStats->getNumDistinctValues(columnID);
+    if (ndv == 0) {
+        return {};
+    }
+    return ndv;
+}
+
 uint64_t CardinalityEstimator::estimateScanNode(const LogicalOperator& op) const {
     const auto& scan = op.constCast<const LogicalScanNodeTable&>();
     switch (scan.getScanType()) {
@@ -172,8 +219,14 @@ uint64_t CardinalityEstimator::estimateScanNode(const LogicalOperator& op) const
                    atLeastOne(getNodeIDDom(scan.getNodeID()->getUniqueName())) :
                    1;
     }
-    case LogicalScanNodeTableType::SECONDARY_INDEX_SCAN:
-        return atLeastOne(getNodeIDDom(scan.getNodeID()->getUniqueName()));
+    case LogicalScanNodeTableType::SECONDARY_INDEX_SCAN: {
+        const auto dom = getNodeIDDom(scan.getNodeID()->getUniqueName());
+        if (const auto ndv = secondaryIndexNumDistinct(context, scan, tableStats)) {
+            return atLeastOne(dom / ndv.value());
+        }
+        return atLeastOne(static_cast<cardinality_t>(
+            static_cast<double>(dom) * PlannerKnobs::EQUALITY_PREDICATE_SELECTIVITY));
+    }
     default:
         return atLeastOne(getNodeIDDom(scan.getNodeID()->getUniqueName()));
     }
