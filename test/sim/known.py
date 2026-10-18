@@ -102,6 +102,12 @@ KNOWN_BUGS = [
         "(not filed)",
     ),
     Known(
+        "csr_local_offset_count",
+        "one node's relationship count on a CSR-declared table (REL_DEGREE_TABLE OFFSET_COUNT) "
+        "misses the transaction's own relationships while the rel table has no node group "
+        "there: getDegreeForOffset returns before reading local storage (not filed)",
+    ),
+    Known(
         "rollback_prepared",
         "a variable-length query the driver prepared inside a transaction that added columns and "
         "rolled back fails with unordered_map::at in a later transaction, nondeterministically "

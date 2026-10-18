@@ -1,4 +1,4 @@
-"""Rules that write data: persons, Knows edges, bulk COPY, the partitioned table."""
+"""Rules that write data: persons, Knows edges, bulk COPY, the partitioned table, CK edges."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from session import DUPLICATE_KEY, Session, enabled
 from strategies import (
     VECTOR_CAPACITY,
     clusters,
+    csr_ids,
     csv_names,
     doubles,
     ints,
@@ -194,3 +195,28 @@ class DataRules(Session):
     def delete_partitioned(self, id):
         self.ok("MATCH (n:L {id: $id}) DELETE n", dict(id=id))
         self.model.partitioned = {(i, c) for i, c in self.model.partitioned if i != id}
+
+    @enabled("csr")
+    @rule(src=csr_ids, dst=csr_ids)
+    def insert_ck(self, src, dst):
+        self.ok(
+            "MATCH (a:C {id: $a}), (b:C {id: $b}) CREATE (a)-[:CK]->(b)", dict(a=src, b=dst)
+        )
+        self.model.ck[(src, dst)] += 1
+
+    @enabled("csr")
+    @rule(src=csr_ids, dst=csr_ids)
+    def delete_ck(self, src, dst):
+        self.ok("MATCH (a:C {id: $a})-[k:CK]->(b:C {id: $b}) DELETE k", dict(a=src, b=dst))
+        self.model.ck.pop((src, dst), None)
+
+    @enabled("csr")
+    @precondition(lambda self: self.checkpoint_keeps_snapshots())
+    @rule(edges=st.lists(st.tuples(csr_ids, csr_ids), min_size=1, max_size=300))
+    def copy_ck(self, edges):
+        """A COPY into an empty CK, or into node groups that already hold edges."""
+        fd, csv = tempfile.mkstemp(suffix=".csv", dir=self.files)
+        with os.fdopen(fd, "w") as f:
+            f.writelines(f"{s},{d}\n" for s, d in edges)
+        self.ok(f'COPY CK FROM "{csv}"')
+        self.model.ck.update(edges)

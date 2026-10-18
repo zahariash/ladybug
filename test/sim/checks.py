@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, defaultdict
 from contextlib import contextmanager
 
 import hypothesis.strategies as st
 from hypothesis.stateful import invariant, precondition, rule
 from model import Model
 from session import Session, diff, gated
-from strategies import clusters, small_ids
+from strategies import CSR_NODES, clusters, small_ids
 
 USER_TABLES = {"Person", "Knows"}
 
@@ -22,6 +22,7 @@ gated(
     "lookup_join",
     "count_keys",
     "rollback_prepared",
+    "csr_local_offset_count",
 )
 
 
@@ -46,6 +47,9 @@ class Checks(Session):
             expected = Counter(self.model.partitioned)
             actual = Counter(self.rows("MATCH (n:L) RETURN n.id, n.cluster"))
             assert actual == expected, diff(actual, expected)
+        if self.has_csr():
+            actual = Counter(self.rows("MATCH (a:C)-[:CK]->(b:C) RETURN a.id, b.id"))
+            assert actual == self.model.ck, diff(actual, self.model.ck)
         for i, values in self.model.tables.items():
             # SERIAL ids must be unique; values are compared as a multiset.
             rows = self.rows(f"MATCH (t:T{i}) RETURN t.id, t.v")
@@ -69,6 +73,8 @@ class Checks(Session):
         expected = USER_TABLES | {f"T{i}" for i in self.model.tables}
         if self.has_partitions():
             expected.add("L")
+        if self.has_csr():
+            expected |= {"C", "CK"}
         if self.options.loaded:
             expected.add("Doc")
         assert tables == expected, tables
@@ -316,6 +322,60 @@ class Checks(Session):
                 [(len(values), len(values))],
             )
 
+    def check_csr_counts(self, view: Model, check, conn: int, a: int, alone: bool) -> None:
+        """Counts over CK, whose node table C is declared CSR, so that the optimizer answers them
+        from rel degrees (one node's, top k, nodes with an edge), by bounded traversals (nodes
+        reachable from one node, walks ending at each node) and from rel counts. Each also runs
+        over the key, which the binder may count as the internal ID. The id is in the query:
+        the offset rewrite takes a literal key."""
+        edges = list(view.ck.elements())
+        targets = defaultdict(list)
+        for s, d in edges:
+            targets[s].append(d)
+        out = targets.get(a, [])
+        reach = set(out) | {d for m in out for d in targets.get(m, [])}
+        walks = Counter(d for _, d in edges) + Counter(
+            d for _, m in edges for d in targets.get(m, [])
+        )
+        txn = self.txns.get(conn)
+        writing = alone or (txn is not None and txn.kind == "write")
+        local_gap = writing and "csr_local_offset_count" in self.options.skipped
+        if not (txn and txn.kind == "read" and "snapshot_rel_count" in self.options.skipped):
+            for counted in ("*", "b.id"):
+                if not local_gap:
+                    check(
+                        f"MATCH (a:C)-[:CK]->(b:C) WHERE a.id = {a} RETURN count({counted})",
+                        {},
+                        [(len(out),)],
+                    )
+                self.check_top_degrees(counted, Counter(s for s, _ in edges), conn)
+            check(
+                "MATCH (a:C)-[:CK]->(:C) RETURN count(DISTINCT a.id)", {}, [(len(targets),)]
+            )
+            check("MATCH ()-[k:CK]->() RETURN count(*)", {}, [(len(edges),)])
+        for counted in ("b", "b.id"):
+            check(
+                f"MATCH (a:C)-[:CK*1..2]->(b:C) WHERE a.id = {a} RETURN count(DISTINCT {counted})",
+                {},
+                [(len(reach),)],
+            )
+            check(
+                f"MATCH (a:C)-[:CK*1..2]->(b:C) RETURN b.id, count({counted})",
+                {},
+                list(walks.items()),
+            )
+
+    def check_top_degrees(self, counted: str, degrees: Counter, conn: int) -> None:
+        """The three nodes with the most CK edges; ties may come back in any order."""
+        query = (
+            f"MATCH (a:C)-[:CK]->(b:C) RETURN a.id, count({counted}) AS d ORDER BY d DESC LIMIT 3"
+        )
+        rows = self.rows(query, None, conn)
+        expected = sorted(degrees.values(), reverse=True)[:3]
+        assert [d for _, d in rows] == expected, (query, rows, expected)
+        assert all(degrees[i] == d for i, d in rows), (query, rows, dict(degrees))
+        assert len({i for i, _ in rows}) == len(rows), (query, rows)
+
     def check_view(
         self,
         view: Model,
@@ -426,6 +486,8 @@ class Checks(Session):
             self.check_lookup_joins(view, check, id)
         if "count_keys" not in self.options.skipped:
             self.check_key_counts(view, check, conn, x, id, degrees)
+        if self.has_csr():
+            self.check_csr_counts(view, check, conn, id % CSR_NODES, alone)
         for column, default in view.columns.items():
             if column.startswith("c"):
                 check(

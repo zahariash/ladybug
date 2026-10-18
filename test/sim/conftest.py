@@ -30,6 +30,7 @@ FOCUS = {
         "atomic_statement",
         "knows",
         "partitions",
+        "csr",
         "macros",
         "tables",
         "columns",

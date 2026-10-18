@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from engine import Engine, EngineError
 from hypothesis.stateful import precondition
 from model import Model, canonical
+from strategies import CSR_NODES
 from triage import probe_of, signature
 
 # Every name rules are gated on, so --sim-skip can reject names that match nothing. Rules add
@@ -25,6 +26,15 @@ RULE_NAMES: set[str] = set()
 EXTENSIONS = ("fts", "vector")
 
 DUPLICATE_KEY = "duplicated primary key"
+# C holds ids 0..CSR_NODES-1 at the offsets of their ids, which SORTED BY CSR declares. Every
+# open runs these: the declaration does not survive a reopen, and the MERGE writes nothing
+# once the rows exist, so C's change epoch, which the CSR rewrites check, stays.
+CSR_SETUP = [
+    "CREATE NODE TABLE IF NOT EXISTS C(id INT64 PRIMARY KEY)",
+    f"UNWIND range(0, {CSR_NODES - 1}) AS i MERGE (:C {{id: i}})",
+    "CREATE REL TABLE IF NOT EXISTS CK(FROM C TO C)",
+    "ALTER TABLE C SET SORTED BY (id ASC) CSR",
+]
 
 
 @dataclass(frozen=True)
@@ -150,11 +160,19 @@ class Session:
         partition bug cannot end workloads that never touch it."""
         return "partitions" not in self.options.skipped
 
+    def has_csr(self) -> bool:
+        """Whether C and CK exist: only while the csr rules run."""
+        return "csr" not in self.options.skipped
+
+    def loads(self) -> list[str]:
+        """The statements each open runs before the rules: extension loads and CSR_SETUP."""
+        return list(self.options.extensions) + (CSR_SETUP if self.has_csr() else [])
+
     # Engine lifecycle
 
     def start_trace(self) -> None:
         self.trace = []
-        op = dict(op="open", config=self.config, loads=list(self.options.extensions))
+        op = dict(op="open", config=self.config, loads=self.loads())
         self.traced(op, self.open_engine)
         op["build"] = self.engine.build
 
@@ -222,7 +240,7 @@ class Session:
             # of a syscall is the same call in every run.
             config = {**config, "max_num_threads": 1}
         self.engine = Engine(
-            self.path, config, list(self.options.extensions), inject, self.options.debug
+            self.path, config, self.loads(), inject, self.options.debug
         )
 
     def reopen_engine(self) -> None:

@@ -13,7 +13,7 @@ from engine import EngineError
 from hypothesis.stateful import precondition, rule
 from model import Model
 from session import DUPLICATE_KEY, Session, enabled, gated
-from strategies import clusters, extra_columns, ints, macro_ids, small_ids, table_ids
+from strategies import clusters, csr_ids, extra_columns, ints, macro_ids, small_ids, table_ids
 
 ENDS = ["commit", "rollback", "crash"]
 gated("txn_ddl", "txn_error", *(f"txn_{end}" for end in ENDS))
@@ -24,6 +24,8 @@ op = st.one_of(
     st.tuples(st.just("set_age"), small_ids, ints),
     st.tuples(st.just("delete"), small_ids, st.none()),
     st.tuples(st.just("knows"), small_ids, small_ids),
+    st.tuples(st.just("ck"), csr_ids, csr_ids),
+    st.tuples(st.just("unck"), csr_ids, csr_ids),
     st.tuples(st.just("create_table"), table_ids, st.none()),
     st.tuples(st.just("insert_t"), table_ids, st.integers(-1000, 1000)),
     st.tuples(st.just("create_macro"), macro_ids, st.integers(-5, 5)),
@@ -50,6 +52,10 @@ def statement(model: Model, kind: str, a, b) -> tuple[str, dict, str | None] | N
     if kind == "knows":
         query = "MATCH (x:Person {id: $a}), (y:Person {id: $b}) CREATE (x)-[:Knows {since: 0}]->(y)"
         return query, dict(a=a, b=b), None
+    if kind == "ck":
+        return "MATCH (x:C {id: $a}), (y:C {id: $b}) CREATE (x)-[:CK]->(y)", dict(a=a, b=b), None
+    if kind == "unck":
+        return "MATCH (x:C {id: $a})-[k:CK]->(y:C {id: $b}) DELETE k", dict(a=a, b=b), None
     if kind == "create_table":
         if a in model.tables:
             return None
@@ -87,6 +93,10 @@ def apply(model: Model, kind: str, a, b) -> None:
         model.forget(a)
     elif kind == "knows" and a in model.persons and b in model.persons:
         model.knows[(a, b, 0)] += 1
+    elif kind == "ck":
+        model.ck[(a, b)] += 1
+    elif kind == "unck":
+        model.ck.pop((a, b), None)
     elif kind == "create_table":
         model.tables[a] = []
     elif kind == "insert_t":
@@ -114,7 +124,7 @@ class TransactionRules(Session):
             if not (kind in DDL_OPS and "txn_ddl" in skipped)
             and not (kind == "duplicate" and "txn_error" in skipped)
             and not (kind == "drop_column" and "txn_column_gap" in skipped)
-        ]
+        ] + (["ck", "unck"] if "csr" not in skipped else [])
 
     def runs(self, model: Model, kind: str, a) -> bool:
         """Whether an op runs: its kind is allowed, and it hits no bug in known.py: re-adding a

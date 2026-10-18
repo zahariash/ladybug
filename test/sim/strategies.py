@@ -25,6 +25,9 @@ table_ids = st.integers(0, 2)
 EXTRA_COLUMNS = ["c0", "c1", "c2"]
 extra_columns = st.sampled_from(EXTRA_COLUMNS)
 clusters = st.integers(1, 3)
+# Rows of C, the node table declared CSR: ids 0..CSR_NODES-1, at the offsets of their ids.
+CSR_NODES = 40
+csr_ids = st.integers(0, CSR_NODES - 1)
 
 ints = st.one_of(
     st.none(),

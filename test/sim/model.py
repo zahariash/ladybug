@@ -45,6 +45,7 @@ class Model:
     tables: dict = field(default_factory=dict)  # i -> values of T{i}.v, in insertion order
     # (id, cluster) rows of L; each cluster is its own partition, keys are unique per partition
     partitioned: set = field(default_factory=set)
+    ck: Counter = field(default_factory=Counter)  # (src, dst) -> count of CK edges
     pk_index: str | None = "_PK"  # the name of Person's primary-key index, if any
     age_index: str | None = None  # the name of the ART index on Person.age, if any
     dropped_columns: set = field(default_factory=set)  # Person columns dropped at some point
@@ -125,6 +126,7 @@ class Model:
             macros=dict(self.macros),
             tables={i: list(values) for i, values in self.tables.items()},
             partitioned=set(self.partitioned),
+            ck=Counter(self.ck),
             dropped_columns=set(self.dropped_columns),
             wrote=False,
         )
