@@ -12,6 +12,7 @@
 
 #include "api_test/api_test.h"
 #include "common/exception/io.h"
+#include "test_helper/hang_watchdog.h"
 
 using namespace lbug::common;
 using namespace lbug::main;
@@ -592,6 +593,69 @@ TEST_F(ApiTest, MissingParam) {
         std::make_pair(std::string("val1"), 1.1));
     ASSERT_TRUE(result->isSuccess());
     ASSERT_STREQ("2.200000\n", result->getNext()->toString().c_str());
+}
+
+TEST_F(ApiTest, ImportDatabaseWithOneThread) {
+    // IMPORT DATABASE runs its statements as nested queries inside its own task.
+    HangWatchdog watchdog{std::chrono::seconds(60)};
+    auto systemConfig = SystemConfig();
+    systemConfig.maxNumThreads = 1;
+    auto tempDir = TestHelper::getTempDir(getTestGroupAndName());
+    auto exportDir = tempDir + "/export";
+    auto database = std::make_unique<Database>(tempDir + "/one_thread", systemConfig);
+    auto oneThread = std::make_unique<Connection>(database.get());
+    ASSERT_TRUE(oneThread->query("CREATE NODE TABLE P(id INT64 PRIMARY KEY)")->isSuccess());
+    ASSERT_TRUE(oneThread->query("UNWIND range(1, 3) AS i CREATE (:P {id: i})")->isSuccess());
+    auto result = oneThread->query("EXPORT DATABASE '" + exportDir + "'");
+    ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+    auto imported = std::make_unique<Database>(tempDir + "/imported", systemConfig);
+    auto importConn = std::make_unique<Connection>(imported.get());
+    result = importConn->query("IMPORT DATABASE '" + exportDir + "'");
+    ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+    result = importConn->query("MATCH (p:P) RETURN count(*)");
+    ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+    ASSERT_EQ(result->getNext()->getValue(0)->getValue<int64_t>(), 3);
+}
+
+TEST_F(ApiTest, ImportDatabaseWithOneThreadTimesOut) {
+    // With a timeout the import runs on the pool's only worker, which must run the nested
+    // statement itself while the caller watches the clock.
+    HangWatchdog watchdog{std::chrono::seconds(60)};
+    auto systemConfig = SystemConfig();
+    systemConfig.maxNumThreads = 1;
+    auto tempDir = TestHelper::getTempDir(getTestGroupAndName());
+    auto importDir = tempDir + "/import";
+    std::filesystem::create_directories(importDir);
+    std::ofstream{importDir + "/schema.cypher"}
+        << "UNWIND range(1, 100000) AS x UNWIND range(1, 100000) AS y RETURN count(x + y);";
+    auto database = std::make_unique<Database>(tempDir + "/one_thread", systemConfig);
+    auto oneThread = std::make_unique<Connection>(database.get());
+    oneThread->setQueryTimeOut(1000);
+    auto result = oneThread->query("IMPORT DATABASE '" + importDir + "'");
+    ASSERT_FALSE(result->isSuccess());
+    ASSERT_EQ(result->getErrorMessage(), "Runtime exception: Import database failed: Interrupted.");
+}
+
+TEST_F(ApiTest, ProjectGraphWithOneThread) {
+    // PROJECT_GRAPH reads the relationships with a nested query inside its own task.
+    HangWatchdog watchdog{std::chrono::seconds(60)};
+    auto systemConfig = SystemConfig();
+    systemConfig.maxNumThreads = 1;
+    auto database = std::make_unique<Database>(
+        TestHelper::getTempDir(getTestGroupAndName()) + "/one_thread", systemConfig);
+    auto oneThread = std::make_unique<Connection>(database.get());
+    ASSERT_TRUE(oneThread->query("CREATE NODE TABLE P(id INT64 PRIMARY KEY)")->isSuccess());
+    ASSERT_TRUE(oneThread->query("CREATE REL TABLE K(FROM P TO P)")->isSuccess());
+    ASSERT_TRUE(oneThread->query("UNWIND range(0, 9) AS i CREATE (:P {id: i})")->isSuccess());
+    ASSERT_TRUE(oneThread
+                    ->query("MATCH (a:P), (b:P) WHERE b.id = (a.id + 1) % 10 "
+                            "CREATE (a)-[:K]->(b)")
+                    ->isSuccess());
+    auto result = oneThread->query("CALL PROJECT_GRAPH('g', ['P'], ['K'])");
+    ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+    result = oneThread->query("CALL PROJECTED_GRAPH_INFO('g') RETURN *");
+    ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+    ASSERT_TRUE(result->hasNext());
 }
 
 TEST_F(ApiTest, CloseDatabaseBeforeQueryResultAndConnection) {

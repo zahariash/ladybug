@@ -1,1 +1,1 @@
-add_lbug_test(processor_test intersect_kernels_test.cpp)
+add_lbug_test(processor_test intersect_kernels_test.cpp task_scheduler_test.cpp)
