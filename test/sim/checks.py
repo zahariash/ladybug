@@ -194,8 +194,10 @@ class Checks(Session):
         if not enabled:
             for conn in conns:
                 self.ok("CALL enable_plan_optimizer=false", conn=conn)
+            self.unoptimized = set(conns)
         yield
         if not enabled:
+            self.unoptimized = set()
             for conn in conns:
                 self.ok("CALL enable_plan_optimizer=true", conn=conn)
 
@@ -382,6 +384,9 @@ class Checks(Session):
                 "MATCH (a:C)-[:CK]->(:C) RETURN count(DISTINCT a.id)", {}, [(len(targets),)]
             )
             check("MATCH ()-[k:CK]->() RETURN count(*)", {}, [(len(edges),)])
+        # Unoptimized, the walks start at every row of C: seconds per query.
+        if conn in getattr(self, "unoptimized", ()):
+            return
         for counted in ("b", "b.id"):
             check(
                 f"MATCH (a:C)-[:CK*1..2]->(b:C) WHERE a.id = {a} RETURN count(DISTINCT {counted})",
