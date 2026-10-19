@@ -29,9 +29,10 @@ KNOWN_BUGS = [
     ),
     Known(
         "txn_index_lookups",
-        "a transaction's uncommitted rows are missing from secondary ART index lookups (not filed)",
+        "#1318: a transaction's uncommitted rows are missing from secondary ART index lookups, and "
+        "its updates and deletes reach the index at once and survive ROLLBACK",
     ),
-    Known("pk_index", "DROP INDEX on the primary-key index ignores the transaction (not filed)"),
+    Known("pk_index", "#1317: DROP INDEX on the primary-key index ignores the transaction"),
     Known("crash_create", "a kill mid-write can leave a WAL that fails its checksum on reopen"),
     Known(
         "rel_columns",
@@ -115,13 +116,12 @@ KNOWN_BUGS = [
     ),
     Known(
         "rollback_prepared",
-        "a variable-length query the driver prepared inside a transaction that added columns and "
-        "rolled back fails with unordered_map::at in a later transaction, nondeterministically "
-        "(not filed)",
+        "#1220 (comment): a variable-length query the driver prepared inside a transaction that "
+        "added columns and rolled back segfaults or fails with unordered_map::at afterwards",
     ),
     Known(
         "second_writer",
-        "after a refused BEGIN TRANSACTION, the connection's next statement segfaults (not filed)",
+        "#1316: after a refused BEGIN TRANSACTION, the connection's next statement segfaults",
     ),
 ]
 
