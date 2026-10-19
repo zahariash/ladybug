@@ -62,6 +62,48 @@ std::shared_ptr<LogicalOperator> CountRelTableOptimizer::visitOperator(
     return result;
 }
 
+static void visitPlanOperators(const LogicalOperator& op,
+    const std::function<void(const LogicalOperator&)>& visit) {
+    visit(op);
+    for (auto i = 0u; i < op.getNumChildren(); ++i) {
+        visitPlanOperators(*op.getChild(i), visit);
+    }
+}
+
+bool CountRelTableOptimizer::needsReadOnlyTransaction(const LogicalPlan& plan) {
+    bool result = false;
+    if (!plan.isEmpty()) {
+        visitPlanOperators(plan.getLastOperatorRef(), [&](const LogicalOperator& op) {
+            result |= op.getOperatorType() == LogicalOperatorType::COUNT_EXTEND_CHAIN ||
+                      op.getOperatorType() == LogicalOperatorType::COUNT_ANTI_EDGE_CHAIN;
+        });
+    }
+    return result;
+}
+
+std::vector<std::pair<table_id_t, uint64_t>> CountRelTableOptimizer::getCsrTableEpochs(
+    const LogicalPlan& plan) {
+    std::vector<std::pair<table_id_t, uint64_t>> result;
+    if (plan.isEmpty()) {
+        return result;
+    }
+    visitPlanOperators(plan.getLastOperatorRef(), [&](const LogicalOperator& op) {
+        std::shared_ptr<NodeExpression> boundNode;
+        if (op.getOperatorType() == LogicalOperatorType::REACHABLE_COUNT) {
+            boundNode = op.constCast<LogicalReachableCount>().getBoundNode();
+        } else if (op.getOperatorType() == LogicalOperatorType::REL_DEGREE_TABLE &&
+                   op.constCast<LogicalRelDegreeTable>().getMode() !=
+                       RelDegreeTableMode::ACTIVE_BOUND_COUNT) {
+            boundNode = op.constCast<LogicalRelDegreeTable>().getBoundNode();
+        } else {
+            return;
+        }
+        auto* entry = boundNode->getEntry(0)->constPtrCast<NodeTableCatalogEntry>();
+        result.emplace_back(entry->getTableID(), entry->getCsrChangeEpoch());
+    });
+    return result;
+}
+
 static LogicalOperator* skipProjections(LogicalOperator* op);
 static bool containsOp(const LogicalOperator* root, const LogicalOperator* target);
 static bool isNativeRelGroupEntry(const RelGroupCatalogEntry* entry);
