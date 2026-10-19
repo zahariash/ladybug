@@ -1458,3 +1458,40 @@ TEST_F(ApiTest, PreparedCsrCountsAfterNodeInsert) {
             << queries[i].first;
     }
 }
+
+TEST_F(ApiTest, ChainCountKeepsReaderSnapshot) {
+    ASSERT_TRUE(conn->query("CREATE NODE TABLE S939(id INT64 PRIMARY KEY)")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE REL TABLE T939(FROM S939 TO S939)")->isSuccess());
+    ASSERT_TRUE(conn->query("UNWIND range(0, 39) AS i CREATE (:S939 {id: i})")->isSuccess());
+    ASSERT_TRUE(conn->query("MATCH (a:S939), (b:S939) WHERE b.id = (a.id * 7 + 1) % 40 OR "
+                            "b.id = (a.id + 3) % 40 CREATE (a)-[:T939]->(b)")
+                    ->isSuccess());
+    const std::string pattern = "MATCH (a:S939)-[:T939]->(b:S939)-[:T939]->(c:S939) ";
+    ASSERT_NE(conn->query("EXPLAIN " + pattern + "RETURN count(*)")
+                  ->toString()
+                  .find("COUNT_EXTEND_CHAIN"),
+        std::string::npos);
+    // The chain count against the same pattern counted without the rewrite.
+    const auto counts = [&](Connection& connection) {
+        auto chain = connection.query(pattern + "RETURN count(*)");
+        auto rows = connection.query(pattern + "RETURN sum(1)");
+        EXPECT_TRUE(chain->isSuccess()) << chain->getErrorMessage();
+        EXPECT_TRUE(rows->isSuccess()) << rows->getErrorMessage();
+        return std::make_pair(TestHelper::convertResultToString(*chain),
+            TestHelper::convertResultToString(*rows));
+    };
+    auto reader = std::make_unique<Connection>(database.get());
+    ASSERT_TRUE(reader->query("BEGIN TRANSACTION READ ONLY")->isSuccess());
+    const auto before = counts(*reader);
+    ASSERT_EQ(before.first, before.second);
+    ASSERT_TRUE(conn->query("MATCH (a:S939) WHERE a.id % 5 = 0 DETACH DELETE a")->isSuccess());
+    ASSERT_TRUE(conn->query("UNWIND range(40, 99) AS i CREATE (:S939 {id: i})")->isSuccess());
+    ASSERT_TRUE(conn->query("MATCH (a:S939), (b:S939) WHERE a.id >= 40 AND b.id = a.id - 39 "
+                            "CREATE (a)-[:T939]->(b)")
+                    ->isSuccess());
+    ASSERT_EQ(counts(*reader), before);
+    ASSERT_TRUE(reader->query("COMMIT")->isSuccess());
+    const auto after = counts(*conn);
+    ASSERT_EQ(after.first, after.second);
+    ASSERT_NE(after.first, before.first);
+}
