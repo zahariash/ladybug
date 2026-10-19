@@ -49,6 +49,17 @@ void ExpressionEvaluator::evaluate(common::sel_t) {
 
 bool ExpressionEvaluator::select(common::SelectionVector& selVector,
     bool shouldSetSelVectorToFiltered) {
+    if (shouldSetSelVectorToFiltered && isResultFlat()) {
+        // A predicate over flat inputs is one value for all of selVector, and selectInternal
+        // does not spread it over selVector's positions.
+        evaluate();
+        auto pos = resultVector->state->getSelVector()[0];
+        if (resultVector->isNull(pos) || !resultVector->getValue<bool>(pos)) {
+            selVector.setSelSize(0);
+            return false;
+        }
+        return true;
+    }
     bool ret = selectInternal(selVector);
     if (shouldSetSelVectorToFiltered && selVector.isUnfiltered()) {
         selVector.setToFiltered();
