@@ -134,9 +134,11 @@ public:
     bool isFull() const { return numRows.load() == capacity; }
     const std::vector<common::LogicalType>& getDataTypes() const { return dataTypes; }
     NodeGroupDataFormat getFormat() const { return format; }
+    // Appends columns columnIDs of chunkedGroup, which has the same columns as this group.
     common::row_idx_t append(const transaction::Transaction* transaction,
         const std::vector<common::column_id_t>& columnIDs, ChunkedNodeGroup& chunkedGroup,
         common::row_idx_t startRowIdx, common::row_idx_t numRowsToAppend);
+    // Appends column i of chunkedGroup to column columnIDs[i].
     common::row_idx_t append(const transaction::Transaction* transaction,
         const std::vector<common::column_id_t>& columnIDs, InMemChunkedNodeGroup& chunkedGroup,
         common::row_idx_t startRowIdx, common::row_idx_t numRowsToAppend);
@@ -148,7 +150,9 @@ public:
         const std::vector<common::column_id_t>& columnIDs,
         std::span<const ColumnChunk*> chunkedGroup, common::row_idx_t startRowIdx,
         common::row_idx_t numRowsToAppend);
+    // Appends vector i to column columnIDs[i], or to column i when columnIDs is empty.
     void append(const transaction::Transaction* transaction,
+        std::span<const common::column_id_t> columnIDs,
         const std::vector<common::ValueVector*>& vectors, common::row_idx_t startRowIdx,
         common::row_idx_t numRowsToAppend);
 

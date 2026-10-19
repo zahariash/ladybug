@@ -25,10 +25,17 @@ std::vector<LogicalType> LocalNodeTable::getNodeTableColumnTypes(
     return types;
 }
 
-LocalNodeTable::LocalNodeTable(const catalog::TableCatalogEntry* tableEntry, Table& table,
-    MemoryManager& mm)
+static std::vector<LogicalType> getStorageColumnTypes(const NodeTable& table) {
+    std::vector<LogicalType> types;
+    for (auto i = 0u; i < table.getNumColumns(); i++) {
+        types.push_back(table.getColumn(i).getDataType().copy());
+    }
+    return types;
+}
+
+LocalNodeTable::LocalNodeTable(Table& table, MemoryManager& mm)
     : LocalTable{table}, overflowFileHandle(nullptr),
-      nodeGroups{mm, getNodeTableColumnTypes(*tableEntry), false /*enableCompression*/} {
+      nodeGroups{mm, getStorageColumnTypes(table.cast<NodeTable>()), false /*enableCompression*/} {
     initLocalHashIndex(mm);
     startOffset = table.getNumTotalRows(nullptr /* transaction */);
 }
@@ -82,7 +89,7 @@ bool LocalNodeTable::insert(Transaction* transaction, TableInsertState& insertSt
     const auto nodeIDPos =
         nodeInsertState.nodeIDVector.state->getSelVector().getSelectedPositions()[0];
     nodeInsertState.nodeIDVector.setValue(nodeIDPos, internalID_t{nodeOffset, table.getTableID()});
-    nodeGroups.append(&DUMMY_TRANSACTION, insertState.propertyVectors);
+    nodeGroups.append(&DUMMY_TRANSACTION, insertState.columnIDs, insertState.propertyVectors);
     return true;
 }
 

@@ -32,8 +32,7 @@ struct DirectedCSRIndex {
 
 class LocalRelTable final : public LocalTable {
 public:
-    LocalRelTable(const catalog::TableCatalogEntry* tableEntry, const Table& table,
-        MemoryManager& mm);
+    LocalRelTable(const Table& table, MemoryManager& mm);
     DELETE_COPY_AND_MOVE(LocalRelTable);
 
     bool insert(transaction::Transaction* transaction, TableInsertState& state) override;
@@ -85,12 +84,15 @@ private:
 
 private:
     // We don't duplicate local rel tuples. Tuples are stored same as node tuples.
-    // Chunks stored in local rel table are organized as follows:
-    // [srcNodeID, dstNodeID, relID, property1, property2, ...]
+    // Chunk 0 of the local rel table holds the srcNodeIDs, and chunk c + 1 holds column c of
+    // the rel table (see rewriteLocalColumnID): dstNodeID, relID, then the property columns,
+    // including those dropped since the last checkpoint.
     // All local rel tuples are stored in a single node group, and they are indexed by src/dst
     // NodeID.
     std::vector<DirectedCSRIndex> directedIndices;
     std::unique_ptr<NodeGroup> localNodeGroup;
+    // Local column of each vector in an insert; reused across inserts.
+    std::vector<common::column_id_t> insertColumnIDs;
 };
 
 } // namespace storage

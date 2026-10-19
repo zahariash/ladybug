@@ -139,7 +139,7 @@ public:
 
     // Return the max node offset during insertions.
     common::offset_t validateUniquenessConstraint(const transaction::Transaction* transaction,
-        const std::vector<common::ValueVector*>& propertyVectors) const;
+        common::ValueVector& pkVector) const;
 
     void initInsertState(main::ClientContext* context, TableInsertState& insertState) override;
     void insert(transaction::Transaction* transaction, TableInsertState& insertState) override;

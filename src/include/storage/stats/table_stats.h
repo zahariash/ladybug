@@ -17,12 +17,14 @@ public:
 
     void incrementCardinality(common::cardinality_t increment) { cardinality += increment; }
 
+    // Merges column i of other into column i. A CHECKPOINT that drops columns does not drop
+    // their stats, so other can have fewer columns than this.
     void merge(const TableStats& other) {
-        std::vector<common::column_id_t> columnIDs;
-        for (auto i = 0u; i < columnStats.size(); i++) {
-            columnIDs.push_back(i);
+        cardinality += other.cardinality;
+        DASSERT(other.columnStats.size() <= columnStats.size());
+        for (auto i = 0u; i < other.columnStats.size(); ++i) {
+            columnStats[i].merge(other.columnStats[i]);
         }
-        merge(columnIDs, other);
     }
 
     void merge(const std::vector<common::column_id_t>& columnIDs, const TableStats& other) {
@@ -56,7 +58,8 @@ public:
 
     void update(const std::vector<common::ValueVector*>& vectors,
         size_t numColumns = std::numeric_limits<size_t>::max());
-    void update(const std::vector<common::column_id_t>& columnIDs,
+    // Vector i updates column columnIDs[i], or column i when columnIDs is empty.
+    void update(std::span<const common::column_id_t> columnIDs,
         const std::vector<common::ValueVector*>& vectors,
         size_t numColumns = std::numeric_limits<size_t>::max());
 

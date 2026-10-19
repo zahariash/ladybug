@@ -289,7 +289,7 @@ private:
     static void prepareCommitForNodeGroup(const transaction::Transaction* transaction,
         const std::vector<common::column_id_t>& columnIDs, const NodeGroup& localNodeGroup,
         CSRNodeGroup& csrNodeGroup, common::offset_t boundOffsetInGroup,
-        const row_idx_vec_t& rowIndices, common::column_id_t skippedColumn);
+        const row_idx_vec_t& rowIndices, common::RelDataDirection direction);
 
     void updateRelOffsets(const LocalRelTable& localRelTable);
 

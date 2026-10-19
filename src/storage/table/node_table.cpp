@@ -423,17 +423,15 @@ template bool NodeTable::lookupMultiple<false>(Transaction* transaction,
     TableScanState& scanState) const;
 
 offset_t NodeTable::validateUniquenessConstraint(const Transaction* transaction,
-    const std::vector<ValueVector*>& propertyVectors) const {
-    const auto pkVector = propertyVectors[pkColumnID];
-    DASSERT(pkVector->state->getSelVector().getSelSize() == 1);
-    const auto pkVectorPos = pkVector->state->getSelVector()[0];
-    if (offset_t offset = INVALID_OFFSET;
-        lookupPK(transaction, propertyVectors[pkColumnID], pkVectorPos, offset)) {
+    ValueVector& pkVector) const {
+    DASSERT(pkVector.state->getSelVector().getSelSize() == 1);
+    const auto pkVectorPos = pkVector.state->getSelVector()[0];
+    if (offset_t offset = INVALID_OFFSET; lookupPK(transaction, &pkVector, pkVectorPos, offset)) {
         return offset;
     }
     if (const auto localTable = transaction->getLocalStorage()->getLocalTable(*this)) {
         return localTable->cast<LocalNodeTable>().validateUniquenessConstraint(transaction,
-            *pkVector);
+            pkVector);
     }
     return INVALID_OFFSET;
 }
@@ -492,7 +490,7 @@ void NodeTable::insert(Transaction* transaction, TableInsertState& insertState) 
         auto index = indexes[i].getIndex();
         std::vector<ValueVector*> indexedPropertyVectors;
         for (const auto columnID : index->getIndexInfo().columnIDs) {
-            indexedPropertyVectors.push_back(insertState.propertyVectors[columnID]);
+            indexedPropertyVectors.push_back(insertState.getPropertyVector(columnID));
         }
         index->insert(transaction, nodeInsertState.nodeIDVector, indexedPropertyVectors,
             *nodeInsertState.indexInsertStates[i]);

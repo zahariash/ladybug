@@ -185,7 +185,10 @@ public:
     common::transaction_t getInsertCommitTS(common::row_idx_t rowInChunk) const;
     common::transaction_t getDeleteCommitTS(common::row_idx_t rowInChunk) const;
 
+    // Appends vector i to column columnIDs[i], or to column i when columnIDs is empty. Columns
+    // without a vector (dropped since the last checkpoint) are left short.
     uint64_t append(const transaction::Transaction* transaction,
+        std::span<const common::column_id_t> columnIDs,
         const std::vector<common::ValueVector*>& columnVectors, common::row_idx_t startRowInVectors,
         uint64_t numValuesToAppend);
     common::offset_t append(const transaction::Transaction* transaction,

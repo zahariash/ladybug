@@ -24,19 +24,13 @@ catalog::Catalog* getMainCatalog(main::ClientContext& clientContext) {
     return clientContext.getDatabase()->getCatalog();
 }
 
-std::unique_ptr<LocalTable> makeLocalTable(catalog::Catalog* ownerCatalog,
-    transaction::Transaction* transaction, const LocalTableKey& key, Table& table,
-    MemoryManager& mm) {
+std::unique_ptr<LocalTable> makeLocalTable(Table& table, MemoryManager& mm) {
     switch (table.getTableType()) {
     case TableType::NODE: {
-        auto tableEntry = ownerCatalog->getTableCatalogEntry(transaction, key.tableID);
-        return std::make_unique<LocalNodeTable>(tableEntry, table, mm);
+        return std::make_unique<LocalNodeTable>(table, mm);
     } break;
     case TableType::REL: {
-        // We have to fetch the rel group entry from the catalog to based on the relGroupID.
-        auto tableEntry =
-            ownerCatalog->getTableCatalogEntry(transaction, table.cast<RelTable>().getRelGroupID());
-        return std::make_unique<LocalRelTable>(tableEntry, table, mm);
+        return std::make_unique<LocalRelTable>(table, mm);
     } break;
     default:
         UNREACHABLE_CODE;
@@ -45,24 +39,9 @@ std::unique_ptr<LocalTable> makeLocalTable(catalog::Catalog* ownerCatalog,
 } // namespace
 
 LocalTable* LocalStorage::getOrCreateLocalTable(Table& table) {
-    const auto tableID = table.getTableID();
-    const auto key = LocalTableKey{table.getOwnerCatalogName(), tableID};
-    auto transaction = transaction::Transaction::Get(clientContext);
-    auto& mm = *MemoryManager::Get(clientContext);
+    const auto key = LocalTableKey{table.getOwnerCatalogName(), table.getTableID()};
     if (!tables.contains(key)) {
-        // The owner catalog must stay alive while the local table reads its entry, so a
-        // graph owner is resolved under the registry's shared lock (withGraphCatalog) —
-        // a concurrent DROP GRAPH can destroy the catalog the moment a plain
-        // getGraphCatalog lookup releases it.
-        if (key.ownerCatalogName.empty()) {
-            tables[key] =
-                makeLocalTable(getMainCatalog(clientContext), transaction, key, table, mm);
-        } else {
-            main::DatabaseManager::Get(clientContext)
-                ->withGraphCatalog(key.ownerCatalogName, [&](catalog::Catalog* ownerCatalog) {
-                    tables[key] = makeLocalTable(ownerCatalog, transaction, key, table, mm);
-                });
-        }
+        tables[key] = makeLocalTable(table, *MemoryManager::Get(clientContext));
     }
     return tables.at(key).get();
 }

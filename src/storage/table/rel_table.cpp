@@ -660,9 +660,6 @@ void RelTable::commit(main::ClientContext* context, TableCatalogEntry* tableEntr
     auto transaction = transaction::Transaction::Get(*context);
     for (auto& relData : directedRelData) {
         const auto direction = relData->getDirection();
-        const auto columnToSkip = (direction == RelDataDirection::FWD) ?
-                                      LOCAL_BOUND_NODE_ID_COLUMN_ID :
-                                      LOCAL_NBR_NODE_ID_COLUMN_ID;
         for (auto& [boundNodeOffset, rowIndices] : localRelTable.getCSRIndex(direction)) {
             auto [nodeGroupIdx, boundOffsetInGroup] =
                 StorageUtils::getQuotientRemainder(boundNodeOffset, StorageConfig::NODE_GROUP_SIZE);
@@ -671,7 +668,7 @@ void RelTable::commit(main::ClientContext* context, TableCatalogEntry* tableEntr
             pushInsertInfo(transaction, direction, nodeGroup, rowIndices.size(),
                 CSRNodeGroupScanSource::COMMITTED_IN_MEMORY);
             prepareCommitForNodeGroup(transaction, columnIDsToCommit, localNodeGroup, nodeGroup,
-                boundOffsetInGroup, rowIndices, columnToSkip);
+                boundOffsetInGroup, rowIndices, direction);
         }
     }
 
@@ -711,17 +708,15 @@ offset_t RelTable::getCommittedOffset(offset_t uncommittedOffset, offset_t maxCo
 void RelTable::prepareCommitForNodeGroup(const Transaction* transaction,
     const std::vector<column_id_t>& columnIDs, const NodeGroup& localNodeGroup,
     CSRNodeGroup& csrNodeGroup, offset_t boundOffsetInGroup, const row_idx_vec_t& rowIndices,
-    column_id_t skippedColumn) {
+    RelDataDirection direction) {
     for (const auto row : rowIndices) {
         auto [chunkedGroupIdx, rowInChunkedGroup] =
             StorageUtils::getQuotientRemainder(row, StorageConfig::CHUNKED_NODE_GROUP_CAPACITY);
         std::vector<const ColumnChunk*> chunks;
         const auto chunkedGroup = localNodeGroup.getChunkedNodeGroup(chunkedGroupIdx);
-        for (auto i = 0u; i < chunkedGroup->getNumColumns(); i++) {
-            if (i == skippedColumn) {
-                continue;
-            }
-            chunks.push_back(&chunkedGroup->getColumnChunk(i));
+        for (const auto columnID : columnIDs) {
+            chunks.push_back(&chunkedGroup->getColumnChunk(
+                LocalRelTable::rewriteLocalColumnID(direction, columnID)));
         }
         csrNodeGroup.append(transaction, columnIDs, boundOffsetInGroup, chunks, rowInChunkedGroup,
             1 /*numRows*/);

@@ -1,4 +1,8 @@
+#include <algorithm>
+
+#include "catalog/catalog.h"
 #include "catalog/catalog_entry/catalog_entry_type.h"
+#include "catalog/catalog_entry/table_catalog_entry.h"
 #include "common/exception/runtime.h"
 #include "storage/local_storage/local_rel_table.h"
 #include "storage/partition_storage_registry.h"
@@ -12,6 +16,22 @@ using namespace lbug::storage;
 
 namespace lbug {
 namespace storage {
+
+// A record holds one property vector per property the table had when the rows were inserted,
+// which is what the replayed catalog describes at this point of the log. A statement that was not
+// rebound after DDL in its own transaction (#1220) logs the properties it was bound with instead;
+// such a record keeps the positional layout (empty column IDs).
+static std::vector<column_id_t> getRecordedColumnIDs(main::ClientContext& context,
+    table_id_t catalogEntryID, uint64_t numPropertyVectors) {
+    auto columnIDs =
+        catalog::Catalog::Get(context)
+            ->getTableCatalogEntry(transaction::Transaction::Get(context), catalogEntryID)
+            ->getColumnIDs();
+    if (columnIDs.size() != numPropertyVectors) {
+        return {};
+    }
+    return columnIDs;
+}
 
 void WALReplayer::replayTableInsertionRecord(const WALRecord& walRecord) const {
     const auto& insertionRecord = walRecord.constCast<TableInsertionRecord>();
@@ -53,12 +73,20 @@ void WALReplayer::replayNodeTableInsertRecord(const WALRecord& walRecord) const 
     for (auto i = 0u; i < insertionRecord.ownedVectors.size(); i++) {
         propertyVectors[i] = insertionRecord.ownedVectors[i].get();
     }
-    DASSERT(table.getPKColumnID() < insertionRecord.ownedVectors.size());
-    auto& pkVector = *insertionRecord.ownedVectors[table.getPKColumnID()];
+    const auto columnIDs = getRecordedColumnIDs(clientContext, tableID, propertyVectors.size());
+    idx_t pkIdx = table.getPKColumnID();
+    if (!columnIDs.empty()) {
+        pkIdx = std::find(columnIDs.begin(), columnIDs.end(), pkIdx) - columnIDs.begin();
+    }
+    if (pkIdx >= propertyVectors.size()) {
+        throw RuntimeException("Corrupted WAL record: node insertion has no primary key vector.");
+    }
+    auto& pkVector = *propertyVectors[pkIdx];
     const auto nodeIDVector = std::make_unique<ValueVector>(LogicalType::INTERNAL_ID());
     nodeIDVector->setState(anchorState);
     const auto insertState =
         std::make_unique<NodeTableInsertState>(*nodeIDVector, pkVector, propertyVectors);
+    insertState->columnIDs = columnIDs;
     DASSERT(transaction::Transaction::Get(clientContext) &&
             transaction::Transaction::Get(clientContext)->isRecovery());
     table.initInsertState(&clientContext, *insertState);
@@ -110,9 +138,12 @@ void WALReplayer::replayRelTableInsertRecord(const WALRecord& walRecord) const {
         }
         propertyVectors.push_back(insertionRecord.ownedVectors[i].get());
     }
+    const auto columnIDs =
+        getRecordedColumnIDs(clientContext, table.getRelGroupID(), propertyVectors.size());
     const auto insertState = std::make_unique<RelTableInsertState>(
         *insertionRecord.ownedVectors[LOCAL_BOUND_NODE_ID_COLUMN_ID],
         *insertionRecord.ownedVectors[LOCAL_NBR_NODE_ID_COLUMN_ID], propertyVectors);
+    insertState->columnIDs = columnIDs;
     DASSERT(transaction::Transaction::Get(clientContext) &&
             transaction::Transaction::Get(clientContext)->isRecovery());
     for (auto i = 0u; i < numRels; i++) {

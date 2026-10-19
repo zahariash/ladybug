@@ -45,6 +45,7 @@ struct NodeTableInsertInfo {
 
     common::ValueVector* pkVector;
     std::vector<common::ValueVector*> columnDataVectors;
+    // Column ID of each column data vector.
     std::vector<common::column_id_t> columnIDs;
 
     // When writing into a partitioned parent, `table` is the first partition subgraph (used to
@@ -69,8 +70,10 @@ struct NodeTableInsertInfo {
     std::unique_ptr<ListPartitionRouter> listRouter;
 
     NodeTableInsertInfo(storage::NodeTable* table,
-        evaluator::evaluator_vector_t columnDataEvaluators)
-        : table{table}, columnDataEvaluators{std::move(columnDataEvaluators)}, pkVector{nullptr} {}
+        evaluator::evaluator_vector_t columnDataEvaluators,
+        std::vector<common::column_id_t> columnIDs)
+        : table{table}, columnDataEvaluators{std::move(columnDataEvaluators)}, pkVector{nullptr},
+          columnIDs{std::move(columnIDs)} {}
     EXPLICIT_COPY_DEFAULT_MOVE(NodeTableInsertInfo);
 
     void init(const ResultSet& resultSet, main::ClientContext* context);
@@ -152,9 +155,13 @@ struct RelTableInsertInfo {
     evaluator::evaluator_vector_t columnDataEvaluators;
 
     std::vector<common::ValueVector*> columnDataVectors;
+    // Column ID of each column data vector.
+    std::vector<common::column_id_t> columnIDs;
 
-    RelTableInsertInfo(storage::RelTable* table, evaluator::evaluator_vector_t evaluators)
-        : table{table}, columnDataEvaluators{std::move(evaluators)} {}
+    RelTableInsertInfo(storage::RelTable* table, evaluator::evaluator_vector_t evaluators,
+        std::vector<common::column_id_t> columnIDs)
+        : table{table}, columnDataEvaluators{std::move(evaluators)},
+          columnIDs{std::move(columnIDs)} {}
     EXPLICIT_COPY_DEFAULT_MOVE(RelTableInsertInfo);
 
     void init(const ResultSet& resultSet, main::ClientContext* context);
@@ -162,7 +169,8 @@ struct RelTableInsertInfo {
 
 private:
     RelTableInsertInfo(const RelTableInsertInfo& other)
-        : table{other.table}, columnDataEvaluators(copyVector(other.columnDataEvaluators)) {}
+        : table{other.table}, columnDataEvaluators(copyVector(other.columnDataEvaluators)),
+          columnIDs{other.columnIDs} {}
 };
 
 class RelInsertExecutor {

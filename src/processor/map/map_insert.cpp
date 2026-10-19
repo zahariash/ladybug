@@ -87,7 +87,8 @@ NodeInsertExecutor PlanMapper::getNodeInsertExecutor(const LogicalInsertInfo* bo
         auto firstTable = firstClaimed ? nullptr :
                                          storage::PartitionStorageRegistry::resolveNodeTableByID(
                                              clientContext, childTableIDs[0]);
-        auto tableInfo = NodeTableInsertInfo(firstTable, std::move(evaluators));
+        auto tableInfo =
+            NodeTableInsertInfo(firstTable, std::move(evaluators), firstEntry->getColumnIDs());
         tableInfo.partitionKeyColumnID = parent->getPartitionColumnID();
         tableInfo.partitionMethod =
             static_cast<common::PartitionMethod>(*parent->getPartitionMethod());
@@ -113,7 +114,8 @@ NodeInsertExecutor PlanMapper::getNodeInsertExecutor(const LogicalInsertInfo* bo
     // Plain single-table write (including a direct pattern on one partition subgraph).
     auto table =
         storage::PartitionStorageRegistry::resolveNodeTable(clientContext, *node.getEntry(0));
-    auto tableInfo = NodeTableInsertInfo(table, std::move(evaluators));
+    auto tableInfo =
+        NodeTableInsertInfo(table, std::move(evaluators), node.getEntry(0)->getColumnIDs());
     return NodeInsertExecutor(std::move(info), std::move(tableInfo));
 }
 
@@ -139,7 +141,7 @@ RelInsertExecutor PlanMapper::getRelInsertExecutor(const LogicalInsertInfo* boun
     for (auto& expr : boundInfo->columnDataExprs) {
         evaluators.push_back(exprMapper.getEvaluator(expr));
     }
-    auto tableInfo = RelTableInsertInfo(table, std::move(evaluators));
+    auto tableInfo = RelTableInsertInfo(table, std::move(evaluators), relGroupEntry.getColumnIDs());
     return RelInsertExecutor(std::move(info), std::move(tableInfo));
 }
 

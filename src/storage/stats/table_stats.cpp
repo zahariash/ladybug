@@ -20,20 +20,16 @@ TableStats::TableStats(const TableStats& other) : cardinality{other.cardinality}
 }
 
 void TableStats::update(const std::vector<common::ValueVector*>& vectors, size_t numColumns) {
-    std::vector<common::column_id_t> dummyColumnIDs;
-    for (auto i = 0u; i < vectors.size(); ++i) {
-        dummyColumnIDs.push_back(i);
-    }
-    update(dummyColumnIDs, vectors, numColumns);
+    update({}, vectors, numColumns);
 }
 
-void TableStats::update(const std::vector<common::column_id_t>& columnIDs,
+void TableStats::update(std::span<const common::column_id_t> columnIDs,
     const std::vector<common::ValueVector*>& vectors, size_t numColumns) {
-    DASSERT(columnIDs.size() == vectors.size());
+    DASSERT(columnIDs.empty() || columnIDs.size() == vectors.size());
     size_t numColumnsToUpdate = std::min(numColumns, vectors.size());
 
     for (auto i = 0u; i < numColumnsToUpdate; ++i) {
-        auto columnID = columnIDs[i];
+        auto columnID = columnIDs.empty() ? i : columnIDs[i];
         DASSERT(columnID < columnStats.size());
         columnStats[columnID].update(vectors[i]);
     }
