@@ -182,6 +182,8 @@ public:
     bool hasDeletions(const transaction::Transaction* transaction) const;
     virtual void addColumn(TableAddColumnState& addColumnState, PageAllocator* pageAllocator,
         ColumnStats* newColumnStats);
+    // Removes column columnID and every column added after it.
+    virtual void rollbackAddColumn(common::column_id_t columnID, PageAllocator* pageAllocator);
 
     void applyFuncToChunkedGroups(version_record_handler_op_t func, common::row_idx_t startRow,
         common::row_idx_t numRows, common::transaction_t commitTS) const;

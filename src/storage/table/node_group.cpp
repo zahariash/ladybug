@@ -457,6 +457,16 @@ void NodeGroup::addColumn(TableAddColumnState& addColumnState, PageAllocator* pa
     }
 }
 
+void NodeGroup::rollbackAddColumn(column_id_t columnID, PageAllocator* pageAllocator) {
+    const auto lock = chunkedGroups.lock();
+    for (auto& chunkedGroup : chunkedGroups.getAllGroups(lock)) {
+        chunkedGroup->rollbackAddColumn(columnID, pageAllocator);
+    }
+    if (dataTypes.size() > columnID) {
+        dataTypes.resize(columnID);
+    }
+}
+
 void NodeGroup::rollbackInsert(row_idx_t startRow) {
     const auto lock = chunkedGroups.lock();
     const auto numEmptyTrailingGroups = chunkedGroups.getNumEmptyTrailingGroups(lock);

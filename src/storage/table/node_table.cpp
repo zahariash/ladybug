@@ -639,6 +639,11 @@ bool NodeTable::delete_(Transaction* transaction, TableDeleteState& deleteState)
 
 void NodeTable::addColumn(Transaction* transaction, TableAddColumnState& addColumnState,
     PageAllocator& pageAllocator) {
+    // Rolling back the ADD restores the catalog entry, whose next ADD reuses this column ID.
+    const auto columnID = getNumColumns();
+    transaction->pushRollbackCallback([this, columnID, &pageAllocator](Transaction&) {
+        rollbackAddColumn(columnID, pageAllocator);
+    });
     auto& definition = addColumnState.propertyDefinition;
     columns.push_back(ColumnFactory::createColumn(definition.getName(), definition.getType().copy(),
         pageAllocator.getDataFH(), memoryManager, shadowFile, enableCompression));
@@ -651,6 +656,16 @@ void NodeTable::addColumn(Transaction* transaction, TableAddColumnState& addColu
     }
     nodeGroups->addColumn(addColumnState, &pageAllocator);
     setHasChanges();
+}
+
+void NodeTable::rollbackAddColumn(column_id_t columnID, PageAllocator& pageAllocator) {
+    {
+        std::unique_lock schemaLck{schemaMtx};
+        if (columns.size() > columnID) {
+            columns.resize(columnID);
+        }
+    }
+    nodeGroups->rollbackAddColumn(columnID, &pageAllocator);
 }
 
 std::pair<offset_t, offset_t> NodeTable::appendToLastNodeGroup(Transaction* transaction,

@@ -263,6 +263,8 @@ public:
 private:
     void validatePkNotExists(const transaction::Transaction* transaction,
         common::ValueVector* pkVector) const;
+    // Removes column columnID and every column added after it.
+    void rollbackAddColumn(common::column_id_t columnID, PageAllocator& pageAllocator);
 
     visible_func getVisibleFunc(const transaction::Transaction* transaction) const;
     common::DataChunk constructDataChunkForColumns(

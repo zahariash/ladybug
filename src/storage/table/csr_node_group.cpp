@@ -752,6 +752,13 @@ void CSRNodeGroup::addColumn(TableAddColumnState& addColumnState, PageAllocator*
     NodeGroup::addColumn(addColumnState, pageAllocator, newColumnStats);
 }
 
+void CSRNodeGroup::rollbackAddColumn(column_id_t columnID, PageAllocator* pageAllocator) {
+    if (persistentChunkGroup) {
+        persistentChunkGroup->rollbackAddColumn(columnID, pageAllocator);
+    }
+    NodeGroup::rollbackAddColumn(columnID, pageAllocator);
+}
+
 void CSRNodeGroup::serialize(Serializer& serializer) {
     serializer.writeDebuggingInfo("node_group_idx");
     serializer.write<node_group_idx_t>(nodeGroupIdx);

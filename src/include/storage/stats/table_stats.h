@@ -64,6 +64,11 @@ public:
         columnStats.emplace_back(dataType);
         return columnStats.back();
     }
+    // Removes the stats of the last numColumns added columns.
+    void removeLastColumns(common::idx_t numColumns) {
+        DASSERT(numColumns <= columnStats.size());
+        columnStats.erase(columnStats.end() - numColumns, columnStats.end());
+    }
 
     void serialize(common::Serializer& serializer) const;
     TableStats deserialize(common::Deserializer& deserializer);

@@ -592,6 +592,13 @@ void RelTable::detachDeleteForCSRRels(Transaction* transaction, RelTableData* ta
 
 void RelTable::addColumn(Transaction* transaction, TableAddColumnState& addColumnState,
     PageAllocator& pageAllocator) {
+    // Rolling back the ADD restores the catalog entry, whose next ADD reuses this column ID.
+    const auto columnID = getNumColumns();
+    transaction->pushRollbackCallback([this, columnID, &pageAllocator](Transaction&) {
+        for (auto& relData : directedRelData) {
+            relData->rollbackAddColumn(columnID, pageAllocator);
+        }
+    });
     LocalTable* localTable = nullptr;
     if (transaction->getLocalStorage()) {
         localTable = transaction->getLocalStorage()->getLocalTable(*this);

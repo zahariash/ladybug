@@ -167,6 +167,13 @@ void RelTableData::addColumn(TableAddColumnState& addColumnState, PageAllocator&
     nodeGroups->addColumn(addColumnState, &pageAllocator);
 }
 
+void RelTableData::rollbackAddColumn(column_id_t columnID, PageAllocator& pageAllocator) {
+    if (columns.size() > columnID) {
+        columns.resize(columnID);
+    }
+    nodeGroups->rollbackAddColumn(columnID, &pageAllocator);
+}
+
 std::pair<CSRNodeGroupScanSource, row_idx_t> RelTableData::findMatchingRow(Transaction* transaction,
     ValueVector& boundNodeIDVector, const ValueVector& relIDVector) const {
     DASSERT(boundNodeIDVector.state->getSelVector().getSelSize() == 1);

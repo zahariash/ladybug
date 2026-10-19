@@ -182,11 +182,24 @@ void NodeGroupCollection::addColumn(TableAddColumnState& addColumnState,
     PageAllocator* pageAllocator) {
     DASSERT((pageAllocator == nullptr) == (residency == ResidencyState::IN_MEMORY));
     const auto lock = nodeGroups.lock();
+    // Stats and types grow together, so that rollbackAddColumn can undo a partial add.
     auto& newColumnStats = stats.addNewColumn(addColumnState.propertyDefinition.getType());
+    types.push_back(addColumnState.propertyDefinition.getType().copy());
     for (const auto& nodeGroup : nodeGroups.getAllGroups(lock)) {
         nodeGroup->addColumn(addColumnState, pageAllocator, &newColumnStats);
     }
-    types.push_back(addColumnState.propertyDefinition.getType().copy());
+}
+
+void NodeGroupCollection::rollbackAddColumn(column_id_t columnID, PageAllocator* pageAllocator) {
+    const auto lock = nodeGroups.lock();
+    if (types.size() <= columnID) {
+        return;
+    }
+    stats.removeLastColumns(types.size() - columnID);
+    types.resize(columnID);
+    for (const auto& nodeGroup : nodeGroups.getAllGroups(lock)) {
+        nodeGroup->rollbackAddColumn(columnID, pageAllocator);
+    }
 }
 
 uint64_t NodeGroupCollection::getEstimatedMemoryUsage() const {

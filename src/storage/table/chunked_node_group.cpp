@@ -446,6 +446,16 @@ void ChunkedNodeGroup::addColumn(MemoryManager& mm, const TableAddColumnState& a
     }
 }
 
+void ChunkedNodeGroup::rollbackAddColumn(column_id_t columnID, PageAllocator* pageAllocator) {
+    while (chunks.size() > columnID) {
+        if (residencyState == ResidencyState::ON_DISK) {
+            DASSERT(pageAllocator);
+            chunks.back()->reclaimStorage(*pageAllocator);
+        }
+        chunks.pop_back();
+    }
+}
+
 bool ChunkedNodeGroup::isDeleted(const Transaction* transaction, row_idx_t rowInChunk) const {
     if (!versionInfo) {
         return false;

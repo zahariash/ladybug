@@ -75,6 +75,8 @@ public:
     common::column_id_t getNumColumns() const { return types.size(); }
 
     void addColumn(TableAddColumnState& addColumnState, PageAllocator* pageAllocator = nullptr);
+    // Removes column columnID and every column added after it.
+    void rollbackAddColumn(common::column_id_t columnID, PageAllocator* pageAllocator = nullptr);
 
     uint64_t getEstimatedMemoryUsage() const;
 

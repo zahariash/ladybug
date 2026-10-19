@@ -738,3 +738,75 @@ Binder exception: Table studyAt does not exist.
 -STATEMENT call fsm_info() return sum(num_pages) > 0
 ---- 1
 True
+
+-CASE AddNodeColumnAfterRolledBackAdd
+-STATEMENT CREATE NODE TABLE P(id INT64 PRIMARY KEY, a INT64);
+---- ok
+-STATEMENT CREATE (:P {id: 1, a: 1});
+---- ok
+-STATEMENT CHECKPOINT;
+---- ok
+-STATEMENT BEGIN TRANSACTION;
+---- ok
+-STATEMENT ALTER TABLE P ADD d INT64 DEFAULT 7;
+---- ok
+-STATEMENT ALTER TABLE P ADD f STRING DEFAULT 'rolled back';
+---- ok
+-STATEMENT ALTER TABLE P ADD g INT64[] DEFAULT [7, 8];
+---- ok
+-STATEMENT ALTER TABLE P ADD h STRUCT(x INT64, y STRING) DEFAULT {x: 7, y: 'z'};
+---- ok
+-STATEMENT ROLLBACK;
+---- ok
+-STATEMENT CREATE (:P {id: 2, a: 2});
+---- ok
+-STATEMENT ALTER TABLE P ADD e INT64 DEFAULT 5;
+---- ok
+-STATEMENT ALTER TABLE P ADD s STRING DEFAULT 'kept';
+---- ok
+-STATEMENT MATCH (p:P) RETURN p.id, p.e, p.s ORDER BY p.id;
+---- 2
+1|5|kept
+2|5|kept
+-STATEMENT CHECKPOINT;
+---- ok
+-RELOADDB
+-STATEMENT MATCH (p:P) RETURN p.id, p.e, p.s ORDER BY p.id;
+---- 2
+1|5|kept
+2|5|kept
+
+-CASE AddRelPropertyAfterRolledBackAdd
+-STATEMENT CREATE NODE TABLE N(id INT64 PRIMARY KEY);
+---- ok
+-STATEMENT CREATE REL TABLE R(FROM N TO N, a INT64);
+---- ok
+-STATEMENT UNWIND range(1, 3) AS i CREATE (:N {id: i});
+---- ok
+-STATEMENT MATCH (x:N {id: 1}), (y:N {id: 2}) CREATE (x)-[:R {a: 1}]->(y);
+---- ok
+-STATEMENT CHECKPOINT;
+---- ok
+-STATEMENT BEGIN TRANSACTION;
+---- ok
+-STATEMENT ALTER TABLE R ADD d INT64 DEFAULT 7;
+---- ok
+-STATEMENT ALTER TABLE R ADD f STRING DEFAULT 'rolled back';
+---- ok
+-STATEMENT ROLLBACK;
+---- ok
+-STATEMENT MATCH (x:N {id: 2}), (y:N {id: 3}) CREATE (x)-[:R {a: 2}]->(y);
+---- ok
+-STATEMENT ALTER TABLE R ADD e INT64 DEFAULT 5;
+---- ok
+-STATEMENT MATCH (x:N)-[r:R]->(y:N) RETURN x.id, r.e ORDER BY x.id;
+---- 2
+1|5
+2|5
+-STATEMENT CHECKPOINT;
+---- ok
+-RELOADDB
+-STATEMENT MATCH (y:N)<-[r:R]-(x:N) RETURN x.id, r.e ORDER BY x.id;
+---- 2
+1|5
+2|5
