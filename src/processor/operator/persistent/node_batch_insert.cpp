@@ -477,11 +477,14 @@ void NodeBatchInsert::initGlobalStateInternal(ExecutionContext* context) {
     auto nodeTableEntry = catalog->getTableCatalogEntry(transaction, info->tableName)
                               ->ptrCast<NodeTableCatalogEntry>();
     const auto& pkDefinition = nodeTableEntry->getPrimaryKeyDefinition();
-    auto pkColumnID = nodeTableEntry->getColumnID(pkDefinition.getName());
+    idx_t pkColumnIdx = 0;
     // Init info
     info->compressionEnabled = StorageManager::Get(*clientContext)->compressionEnabled();
     auto dataColumnIdx = 0u;
     for (auto& property : nodeTableEntry->getProperties()) {
+        if (property.getName() == pkDefinition.getName()) {
+            pkColumnIdx = dataColumnIdx;
+        }
         info->columnTypes.push_back(property.getType().copy());
         info->insertColumnIDs.push_back(nodeTableEntry->getColumnID(property.getName()));
         info->outputDataColumns.push_back(dataColumnIdx++);
@@ -492,7 +495,7 @@ void NodeBatchInsert::initGlobalStateInternal(ExecutionContext* context) {
     }
     // Init shared state
     auto nodeSharedState = sharedState->ptrCast<NodeBatchInsertSharedState>();
-    nodeSharedState->pkColumnID = pkColumnID;
+    nodeSharedState->pkColumnIdx = pkColumnIdx;
     nodeSharedState->pkType = pkDefinition.getType().copy();
     nodeSharedState->skipDuplicatePK = info->ptrCast<NodeBatchInsertInfo>()->skipDuplicatePK;
 
@@ -916,17 +919,17 @@ void NodeBatchInsert::writeAndResetNodeGroup(transaction::Transaction* transacti
         for (const auto warningDataColumn : info->warningDataColumns) {
             warningChunkData.push_back(&nodeGroup->getColumnChunk(warningDataColumn));
         }
-        indexBuilder->insert(nodeGroup->getColumnChunk(nodeSharedState->pkColumnID),
+        indexBuilder->insert(nodeGroup->getColumnChunk(nodeSharedState->pkColumnIdx),
             warningChunkData, nodeOffset, numRowsWritten, errorHandler);
     } else if (sharedTarget.usePrimaryKeyIndexCommitInsert) {
         auto* index = nodeTable->tryGetPrimaryKeyIndex();
         DASSERT(index != nullptr);
         commitPrimaryKeyIndexInsertions(transaction, *nodeTable, *index,
-            nodeGroup->getColumnChunk(nodeSharedState->pkColumnID), nodeOffset, numRowsWritten,
+            nodeGroup->getColumnChunk(nodeSharedState->pkColumnIdx), nodeOffset, numRowsWritten,
             transaction->getClientContext());
     } else if (sharedTarget.noIndexPKValidator) {
         sharedTarget.noIndexPKValidator->validate(
-            nodeGroup->getColumnChunk(nodeSharedState->pkColumnID), 0, numRowsWritten);
+            nodeGroup->getColumnChunk(nodeSharedState->pkColumnIdx), 0, numRowsWritten);
     }
     if (numRowsWritten == nodeGroup->getNumRows()) {
         nodeGroup->resetToEmpty();

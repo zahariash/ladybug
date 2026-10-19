@@ -1029,3 +1029,49 @@ True
 ---- 2
 1|11|13
 2|21|24
+
+-CASE NodePrimaryKeyAfterDroppedColumn
+-STATEMENT CALL force_checkpoint_on_close=false;
+---- ok
+-STATEMENT CALL auto_checkpoint=false;
+---- ok
+-STATEMENT CREATE NODE TABLE Q(a INT64, id INT64 PRIMARY KEY, b STRING);
+---- ok
+-STATEMENT CREATE (:Q {a: 0, id: 1, b: 'one'});
+---- ok
+-STATEMENT ALTER TABLE Q DROP a;
+---- ok
+-STATEMENT CREATE (:Q {id: 2, b: 'two'});
+---- ok
+-STATEMENT CREATE (q:Q {b: 'none'});
+---- error
+Binder exception: Create node q expects primary key id as input.
+-STATEMENT MATCH (q:Q {id: 2}) RETURN q.b;
+---- 1
+two
+-RELOADDB
+-STATEMENT MATCH (q:Q {id: 2}) RETURN q.b;
+---- 1
+two
+-STATEMENT COPY Q FROM (UNWIND [3, 4] AS i RETURN i AS id, 'x' + CAST(i AS STRING) AS b);
+---- ok
+-STATEMENT MATCH (q:Q {id: 4}) RETURN q.b;
+---- 1
+x4
+-STATEMENT MATCH (q:Q) RETURN q.id, q.b ORDER BY q.id;
+---- 4
+1|one
+2|two
+3|x3
+4|x4
+
+-CASE NodePrimaryKeyAfterOnlyOtherColumnDropped
+-STATEMENT CREATE NODE TABLE Q(a INT64, id INT64 PRIMARY KEY);
+---- ok
+-STATEMENT ALTER TABLE Q DROP a;
+---- ok
+-STATEMENT CREATE (:Q {id: 1});
+---- ok
+-STATEMENT MATCH (q:Q {id: 1}) RETURN q.id;
+---- 1
+1
