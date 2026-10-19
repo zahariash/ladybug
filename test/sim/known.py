@@ -103,11 +103,6 @@ KNOWN_BUGS = [
         "(not filed)",
     ),
     Known(
-        "repeated_aggregate",
-        "#1246: an aggregate repeated after a WITH that keeps its argument's variable returns the "
-        "earlier clause's value (fix: PR #1289)",
-    ),
-    Known(
         "csr_local_offset_count",
         "one node's relationship count on a CSR-declared table (REL_DEGREE_TABLE OFFSET_COUNT) "
         "misses the transaction's own relationships while the rel table has no node group "
