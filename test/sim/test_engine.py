@@ -3,14 +3,20 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 
+import pytest
+
 from engine import (
+    CRASH_TRACE_SOURCE,
     GDB_WRAPPER,
     KEEP_MARKER,
     SCRATCH_PREFIX,
     STRACE_WRAPPER,
+    backtrace_frames,
+    crash_tracer,
     native_stacks,
     read_state,
     scratch_root,
@@ -102,6 +108,39 @@ def test_bulk_edges_have_distinct_sources_and_match_the_query() -> None:
     rows = "UNWIND range(0, 0) AS i RETURN (i * 67 + 1) % 131112, (i * 1) % 131112"
     assert copy == f"COPY CK FROM ({rows})"
     assert params == {}
+
+
+BACKTRACE = """signal 11 address (nil)
+/tmp/lbug-sim-crash-trace-1000-0123456789ab.so(+0x1472)[0x7e2fe2c3a472]
+/lib/x86_64-linux-gnu/libc.so.6(+0x45330)[0x7e2fe2845330]
+/x/_lbug.so(_ZNK4lbug7storage11ColumnChunk4scanEm+0x50)[0x1]
+/x/_lbug.so(+0x123456)[0x2]
+/x/_lbug.so(_ZNK4lbug7storage16ChunkedNodeGroup4scanEmm+0x59e)[0x3]
+/lib/x86_64-linux-gnu/libstdc++.so.6(+0xf5c79)[0x7e2fdecf5c79]
+"""
+
+
+@pytest.mark.skipif(not shutil.which("c++filt"), reason="needs c++filt")
+def test_backtrace_frames_keep_the_engine_frames_innermost_first() -> None:
+    assert backtrace_frames(BACKTRACE).splitlines() == [
+        "Thread that crashed: signal 11 address (nil)",
+        "#0 lbug::storage::ColumnChunk::scan",
+        "#1 lbug::storage::ChunkedNodeGroup::scan",
+    ]
+
+
+def test_the_crash_tracer_writes_the_backtrace_and_keeps_the_signal(tmp_path) -> None:
+    library = crash_tracer()
+    if library is None:
+        pytest.skip("no C compiler")
+    assert os.path.basename(CRASH_TRACE_SOURCE) == "crash_trace.c"
+    crash = f"import ctypes; ctypes.CDLL({library!r}); ctypes.string_at(0)"
+    env = dict(os.environ, SIM_CRASH_TRACE_DIR=str(tmp_path))
+    result = subprocess.run([sys.executable, "-c", crash], env=env, capture_output=True)
+    assert result.returncode == -11
+    (trace,) = tmp_path.iterdir()
+    assert trace.name.startswith("crash-")
+    assert trace.read_text().startswith("signal 11 address")
 
 
 def test_the_strace_wrapper_kills_at_the_requested_call() -> None:

@@ -13,6 +13,8 @@ point that does not depend on timing.
 from __future__ import annotations
 
 import ctypes
+import functools
+import hashlib
 import multiprocessing
 import os
 import re
@@ -139,10 +141,17 @@ def serve(conns: list, db, connect, named: dict, held: list, message: tuple):
     return conns[conn].execute(query, params).get_all()
 
 
-def worker_main(pipe, path: str, config: dict, loads: list[str]) -> None:
-    """Opens the database with `config`, runs `loads` and serves requests until None."""
+def worker_main(
+    pipe, path: str, config: dict, loads: list[str], tracer: tuple[str, str] | None = None
+) -> None:
+    """Opens the database with `config`, runs `loads` and serves requests until None.
+    `tracer` = (library, directory) loads crash_trace.c's library, which writes the backtrace of
+    a crash to the directory."""
     # Lets the parent's gdb attach (ptrace_scope 1 only allows ancestors otherwise).
     ctypes.CDLL(None).prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0)
+    if tracer:
+        os.environ["SIM_CRASH_TRACE_DIR"] = tracer[1]
+        ctypes.CDLL(tracer[0])
     import ladybug as lb
 
     try:
@@ -180,6 +189,52 @@ def native_stacks(gdb_output: str, limit: int = 60) -> str:
         elif frame := re.match(r"(#\d+)\s+(?:0x[0-9a-f]+ in )?(lbug::[^(]+)", line):
             lines.append(f"{frame[1]} {frame[2].strip()}")
     return "\n".join(lines[:limit]) or gdb_output[-2000:]
+
+
+def demangle(names: list[str]) -> list[str]:
+    try:
+        result = subprocess.run(
+            ["c++filt"], input="\n".join(names), capture_output=True, text=True, timeout=30
+        )
+    except (OSError, subprocess.SubprocessError):
+        return names
+    demangled = result.stdout.splitlines()
+    return demangled if len(demangled) == len(names) else names
+
+
+def backtrace_frames(trace: str, limit: int = 40) -> str:
+    """The engine frames of a crash_trace.c backtrace, innermost first and numbered from #0 like
+    native_stacks' frames, under a line naming the signal."""
+    lines = trace.splitlines()
+    mangled = [m[1] for line in lines[1:] if (m := re.search(r"\((_Z[^+)]+)", line))]
+    names = [name.split("(")[0] for name in demangle(mangled) if name.startswith("lbug::")]
+    head = f"Thread that crashed: {lines[0]}" if lines else "Thread that crashed"
+    return "\n".join([head, *(f"#{i} {name}" for i, name in enumerate(names[:limit]))])
+
+
+CRASH_TRACE_SOURCE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "crash_trace.c")
+
+
+@functools.cache
+def crash_tracer() -> str | None:
+    """crash_trace.c built as a shared library, once per version of the source; None without a C
+    compiler. Unlike gdb, it leaves the worker's timing alone, so races still crash under it."""
+    with open(CRASH_TRACE_SOURCE, "rb") as f:
+        digest = hashlib.sha1(f.read()).hexdigest()[:12]
+    path = os.path.join(tempfile.gettempdir(), f"lbug-sim-crash-trace-{os.getuid()}-{digest}.so")
+    if not os.path.exists(path):
+        partial = f"{path}.{os.getpid()}"
+        try:
+            subprocess.run(
+                ["cc", "-shared", "-fPIC", "-O2", "-o", partial, CRASH_TRACE_SOURCE],
+                check=True,
+                capture_output=True,
+                timeout=120,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        os.replace(partial, path)
+    return path
 
 
 def gdb_stacks(pid: int) -> str:
@@ -253,8 +308,14 @@ class Engine:
     ) -> None:
         context = multiprocessing.get_context("spawn")
         self.pipe, child = context.Pipe()
+        # gdb stops the worker on the signal itself, and strace's kills are SIGKILL.
+        self.crash_dir, tracer = None, None
+        if not (inject or debug) and (library := crash_tracer()):
+            self.crash_dir = os.path.join(tempfile.gettempdir(), f"lbug-sim-crashes-{os.getpid()}")
+            os.makedirs(self.crash_dir, exist_ok=True)
+            tracer = (library, self.crash_dir)
         self.process = context.Process(
-            target=worker_main, args=(child, path, config, loads), daemon=True
+            target=worker_main, args=(child, path, config, loads, tracer), daemon=True
         )
         self.pid, self.request, self.build = None, "open", {}
         self.gdb_output = None
@@ -364,9 +425,14 @@ class Engine:
         return gdb_stacks(self.pid)
 
     def stacks_of_crash(self) -> str:
-        """The stacks gdb wrote when the worker stopped; gdb exits once it has written them."""
+        """The stacks gdb wrote when the worker stopped (gdb exits once it has written them), or
+        the crashing thread's backtrace from crash_trace.c."""
         if not self.gdb_output:
-            return ""
+            trace = os.path.join(self.crash_dir or "", f"crash-{self.process.pid}.txt")
+            if not self.crash_dir or not os.path.exists(trace):
+                return ""
+            with open(trace) as f:
+                return "\n" + backtrace_frames(f.read())
         self.process.join(timeout=120)
         with open(self.gdb_output) as f:
             output = f.read()

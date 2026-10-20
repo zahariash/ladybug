@@ -71,10 +71,12 @@ which a run removes at the end; the next run removes those of runs that were kil
 extensions built from `extension/`), the Doc table and the rules of each loaded extension are
 added.
 `SIM_TIMEOUT_SECONDS` (300 by default) bounds how long one statement may take; a hang reports the
-native stack of every engine thread, and `--sim-gdb` starts workers under gdb so that a crash
-reports its native stack too. With `strace` installed, crash points kill the engine at the n-th
-call of a file syscall, which does not depend on timing; `--sim-enable <name>` turns a known-bug
-rule back on, e.g. to verify a fix.
+native stack of every engine thread. A crash reports the engine frames of the thread that crashed:
+with a C compiler installed, workers load `test/sim/crash_trace.c`, which writes the backtrace
+without slowing the worker, so races that gdb's timing hides still crash. `--sim-gdb` starts
+workers under gdb instead, for the stacks of every thread. With `strace` installed, crash points
+kill the engine at the n-th call of a file syscall, which does not depend on timing;
+`--sim-enable <name>` turns a known-bug rule back on, e.g. to verify a fix.
 
 Every workload records its engine interactions in a trace, each step tagged with its rule.
 Traces live in `.hypothesis/traces/` (`--sim-trace-dir`); a failing workload is kept there as
