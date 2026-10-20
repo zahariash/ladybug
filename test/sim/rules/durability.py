@@ -9,10 +9,10 @@ import hypothesis.strategies as st
 from hypothesis.stateful import precondition, rule
 from model import Model
 from session import Session, diff, enabled, gated
-from strategies import BULK_ID_START, small_ids
+from strategies import BULK_ID_START, CSR_ROWS, small_ids
 
 CRASH_OPS = ["copy", "create", "delete", "checkpoint"]
-RACE_OPS = ["insert", "delete", "set_age", "clear_age", "checkpoint"]
+RACE_OPS = ["insert", "delete", "set_age", "clear_age", "knows", "unknows", "checkpoint"]
 # File syscalls a crash point can kill at, with how many calls a statement makes at most; the
 # engine writes from two threads, each counted separately.
 SYSCALLS = {
@@ -23,7 +23,7 @@ SYSCALLS = {
     "rename": 2,
     "unlink": 10,
 }
-gated(*(f"crash_{op}" for op in CRASH_OPS), "race_checkpoint")
+gated(*(f"crash_{op}" for op in CRASH_OPS), "race_checkpoint", "race_edges")
 
 # The committed state a racing reader sees (see engine.read_state and race_state). Races write
 # ages between -100 and 100; other ages are left out of the sum so that it cannot overflow.
@@ -31,6 +31,15 @@ STATE_QUERIES = [
     "MATCH (p:Person) RETURN count(*), sum(p.id), count(p.age), "
     "sum(CASE WHEN p.age >= -100 AND p.age <= 100 THEN p.age ELSE 0 END)",
     "MATCH (:Person)-[k:Knows]->(:Person) RETURN count(*)",
+    # Answered from rel degrees, which read the CSR index that committing edges change.
+    "MATCH (a:Person)-[:Knows]->(:Person) RETURN count(DISTINCT a.id)",
+]
+# What a reader racing race_bulk sees of CK. The filtered count is a scan, planned from CK's
+# degree statistics.
+CK_STATE_QUERIES = [
+    "MATCH ()-[k:CK]->() RETURN count(*)",
+    "MATCH (a:C)-[:CK]->(:C) RETURN count(DISTINCT a.id)",
+    "MATCH (a:C)-[k:CK]->(b:C) WHERE b.id >= 0 RETURN count(*)",
 ]
 
 
@@ -39,7 +48,35 @@ def race_state(model: Model) -> tuple:
     ages = [p["age"] for p in model.persons.values() if p["age"] is not None]
     small = sum(a for a in ages if -100 <= a <= 100)
     persons = (len(model.persons), sum(model.persons) if model.persons else None, len(ages))
-    return (persons + ((small if model.persons else None),),), ((sum(model.knows.values()),),)
+    sources = len({src for src, _, _ in model.knows})
+    return (
+        (persons + ((small if model.persons else None),),),
+        ((sum(model.knows.values()),),),
+        ((sources,),),
+    )
+
+
+def ck_state(model: Model) -> tuple:
+    """What engine.read_state returns for CK_STATE_QUERIES."""
+    edges = sum(model.ck.values())
+    return ((edges,),), ((len({src for src, _ in model.ck}),),), ((edges,),)
+
+
+def bulk_edges(start: int, count: int, step: int) -> list[tuple[int, int]]:
+    """The CK edges bulk_ck_query adds, from up to count distinct sources spread over C."""
+    rows = range(start, start + count)
+    return [((i * 67 + step) % CSR_ROWS, (i * step) % CSR_ROWS) for i in rows]
+
+
+def bulk_ck_writes(kind: str, start: int, count: int, step: int) -> list[tuple[str, dict]]:
+    """One COPY of bulk_edges(start, count, step), or one CREATE per edge: a CREATE that looks up
+    many edges' endpoints from an UNWIND fills the buffer pool on a table as large as C."""
+    if kind == "copy":
+        src, dst = f"(i * 67 + {step}) % {CSR_ROWS}", f"(i * {step}) % {CSR_ROWS}"
+        rows = f"UNWIND range({start}, {start + count - 1}) AS i RETURN {src}, {dst}"
+        return [(f"COPY CK FROM ({rows})", {})]
+    query = "MATCH (a:C {id: $a}), (b:C {id: $b}) CREATE (a)-[:CK]->(b)"
+    return [(query, dict(a=src, b=dst)) for src, dst in bulk_edges(start, count, step)]
 
 
 class DurabilityRules(Session):
@@ -175,7 +212,72 @@ class DurabilityRules(Session):
                 age = value if op == "set_age" else None
                 writes.append(("MATCH (p:Person {id: $id}) SET p.age = $v", dict(id=id, v=age)))
                 model.update(id, "age", age)
+            elif op in ("knows", "unknows"):
+                # Between existing persons, the second one picked by `value`.
+                if id not in model.persons or "race_edges" in self.options.skipped:
+                    continue
+                dst = sorted(model.persons)[value % len(model.persons)]
+                if op == "knows":
+                    query = (
+                        "MATCH (a:Person {id: $a}), (b:Person {id: $b}) "
+                        "CREATE (a)-[:Knows {since: $s}]->(b)"
+                    )
+                    writes.append((query, dict(a=id, b=dst, s=value)))
+                    model.knows[(id, dst, value)] += 1
+                else:
+                    query = "MATCH (a:Person {id: $a})-[k:Knows]->(b:Person {id: $b}) DELETE k"
+                    writes.append((query, dict(a=id, b=dst)))
+                    for key in [k for k in model.knows if k[:2] == (id, dst)]:
+                        del model.knows[key]
             else:
                 writes.append(("CHECKPOINT", {}))
             states.append(race_state(model))
         return writes, states
+
+    @enabled("race_bulk")
+    @precondition(
+        lambda self: (
+            self.has_csr()
+            and "race_edges" not in self.options.skipped
+            and (
+                "race_checkpoint" not in self.options.skipped
+                or self.config["checkpoint_threshold"] == -1
+            )
+        )
+    )
+    @rule(
+        writes=st.lists(
+            st.one_of(
+                st.tuples(st.just("copy"), st.integers(0, 3000), st.integers(1, 3000)),
+                st.tuples(st.just("create"), st.integers(0, 3000), st.integers(1, 100)),
+            ),
+            min_size=1,
+            max_size=4,
+        ),
+        step=st.integers(1, 7),
+        num_readers=st.integers(2, 4),
+    )
+    def race_bulk(self, writes, step, num_readers):
+        """Many CK edges race readers of CK: COPYs of thousands, each giving many nodes their
+        first in-memory edges or adding to earlier ones, and one-edge CREATEs, each a commit.
+        Readers walk the CSR index those commits change; a COPY also forces a checkpoint."""
+        checkpoints = (
+            "race_checkpoint" not in self.options.skipped and self.checkpoint_keeps_snapshots()
+        )
+        if "race_checkpoint" in self.options.skipped and self.checkpoint_keeps_snapshots():
+            self.ok("CHECKPOINT")
+        model = self.model.fork()
+        statements, states = [], [ck_state(model)]
+        for kind, start, count in writes:
+            if kind == "copy" and not checkpoints:
+                kind, count = "create", min(count, 100)
+            for query, params in bulk_ck_writes(kind, start, count, step):
+                statements.append((query, params))
+                if kind == "create":
+                    model.ck[(params["a"], params["b"])] += 1
+                    states.append(ck_state(model))
+            if kind == "copy":
+                model.ck.update(bulk_edges(start, count, step))
+                states.append(ck_state(model))
+        self.check_race(statements, CK_STATE_QUERIES, states, num_readers)
+        self.model = model

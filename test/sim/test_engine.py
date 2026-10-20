@@ -17,7 +17,14 @@ from engine import (
     wrapper_executable,
 )
 from model import Model
-from rules.durability import STATE_QUERIES, race_state
+from rules.durability import (
+    CK_STATE_QUERIES,
+    STATE_QUERIES,
+    bulk_ck_writes,
+    bulk_edges,
+    ck_state,
+    race_state,
+)
 
 GDB_OUTPUT = """\
 [New LWP 12]
@@ -63,13 +70,38 @@ def test_race_state_has_the_shape_read_state_returns() -> None:
         {1: model.new_person(age=5), 2: model.new_person(), 3: model.new_person(age=500)}
     )
     model.knows[(1, 2, 0)] += 2
-    conn = FakeConnection({STATE_QUERIES[0]: [[3, 6, 2, 5]], STATE_QUERIES[1]: [[2]]})
-    assert race_state(model) == read_state(conn, STATE_QUERIES)
+    model.knows[(1, 3, 7)] += 1
+    model.knows[(3, 1, 0)] += 1
+    answers = {STATE_QUERIES[0]: [[3, 6, 2, 5]], STATE_QUERIES[1]: [[4]], STATE_QUERIES[2]: [[2]]}
+    assert race_state(model) == read_state(FakeConnection(answers), STATE_QUERIES)
 
 
 def test_race_state_of_an_empty_model() -> None:
-    conn = FakeConnection({STATE_QUERIES[0]: [[0, None, 0, None]], STATE_QUERIES[1]: [[0]]})
-    assert race_state(Model()) == read_state(conn, STATE_QUERIES)
+    answers = {
+        STATE_QUERIES[0]: [[0, None, 0, None]],
+        STATE_QUERIES[1]: [[0]],
+        STATE_QUERIES[2]: [[0]],
+    }
+    assert race_state(Model()) == read_state(FakeConnection(answers), STATE_QUERIES)
+
+
+def test_ck_state_counts_edges_and_their_sources() -> None:
+    model = Model()
+    model.ck.update([(0, 5), (0, 5), (131072, 1)])
+    answers = {CK_STATE_QUERIES[0]: [[3]], CK_STATE_QUERIES[1]: [[2]], CK_STATE_QUERIES[2]: [[3]]}
+    assert ck_state(model) == read_state(FakeConnection(answers), CK_STATE_QUERIES)
+
+
+def test_bulk_edges_have_distinct_sources_and_match_the_query() -> None:
+    edges = bulk_edges(1950, 100, 3)
+    assert len({src for src, _ in edges}) == 100
+    assert edges[0] == ((1950 * 67 + 3) % 131112, 1950 * 3)
+    creates = bulk_ck_writes("create", 1950, 100, 3)
+    assert [(p["a"], p["b"]) for _, p in creates] == edges
+    [(copy, params)] = bulk_ck_writes("copy", 0, 1, 1)
+    rows = "UNWIND range(0, 0) AS i RETURN (i * 67 + 1) % 131112, (i * 1) % 131112"
+    assert copy == f"COPY CK FROM ({rows})"
+    assert params == {}
 
 
 def test_the_strace_wrapper_kills_at_the_requested_call() -> None:

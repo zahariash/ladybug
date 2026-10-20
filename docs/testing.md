@@ -63,7 +63,9 @@ PYTHONPATH=tools/python_api/build uv run --no-project --with hypothesis --with p
 
 Rules that hit known bugs are listed in `test/sim/known.py` and stay off unless `--sim-known` is
 given; `--sim-skip <name>` turns off more, `--sim-focus extensions` keeps only the extension
-rules, and `--sim-keep` keeps the database directories. They live in `/tmp/lbug-sim-run-<pid>`,
+rules, `--sim-focus races` keeps writes racing readers (node and edge writes, and bulk edge
+writes over a large node table) with checkpoints, reopens and crashes, and `--sim-keep` keeps
+the database directories. They live in `/tmp/lbug-sim-run-<pid>`,
 which a run removes at the end; the next run removes those of runs that were killed. With
 `--sim-extensions "LOAD EXTENSION fts;LOAD EXTENSION vector"` (or `LOAD EXTENSION '<path>'` for
 extensions built from `extension/`), the Doc table and the rules of each loaded extension are

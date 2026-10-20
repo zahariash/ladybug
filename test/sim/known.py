@@ -19,10 +19,6 @@ KNOWN_BUGS = [
     Known("crash_copy", "#1159: SIGKILL during COPY's checkpoint can corrupt the database"),
     Known("crash_checkpoint", "#1159: SIGKILL during CHECKPOINT can corrupt the primary-key index"),
     Known(
-        "race_checkpoint",
-        "#1194: a relationship count(*) segfaults while another connection checkpoints",
-    ),
-    Known(
         "partitions",
         "a crash after a CHECKPOINT taken while a read-only transaction is open leaves a database "
         "with a partitioned table unopenable: the partition shadow file is missing (not filed)",
@@ -31,6 +27,11 @@ KNOWN_BUGS = [
         "txn_index_lookups",
         "#1318: a transaction's uncommitted rows are missing from secondary ART index lookups, and "
         "its updates and deletes reach the index at once and survive ROLLBACK",
+    ),
+    Known(
+        "race_edges",
+        "a query segfaults while another connection commits rels: commits edit the CSR index in "
+        "place under readers (not filed; fix branch fix/csr-index-append-cow, 9b8c1116d)",
     ),
     Known("pk_index", "#1317: DROP INDEX on the primary-key index ignores the transaction"),
     Known("crash_create", "a kill mid-write can leave a WAL that fails its checksum on reopen"),
@@ -53,12 +54,6 @@ KNOWN_BUGS = [
         "snapshot_checkpoint",
         "#1184: a CHECKPOINT on another connection, also the one COPY or CREATE INDEX forces, "
         "breaks open read-only transactions",
-    ),
-    Known(
-        "snapshot_rel_count",
-        "#1306: relationship counts in a read-only transaction (count(*), and count(DISTINCT "
-        "a.key) answered from rel degrees) include relationships another connection COPYs in "
-        "after it began (fix: branch fix/1306-degree-count-visibility, 9243dfb06; not merged)",
     ),
     Known(
         "snapshot_update",
@@ -101,13 +96,6 @@ KNOWN_BUGS = [
         "ADD in the same transaction: the new column gets 0, not its default; after DROP and "
         "CREATE TABLE of the same name, an insert into the new table hits the old table's keys "
         "(not filed)",
-    ),
-    Known(
-        "csr_local_offset_count",
-        "one node's relationship count on a CSR-declared table (REL_DEGREE_TABLE OFFSET_COUNT) "
-        "misses the transaction's own relationships while the rel table has no node group "
-        "there: getDegreeForOffset returns before reading local storage (fixed on branch "
-        "fix/1306-degree-count-visibility, 9243dfb06, with #1306; not merged)",
     ),
     Known(
         "rollback_prepared",

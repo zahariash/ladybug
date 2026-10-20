@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import ast
 import pathlib
+from types import SimpleNamespace
 
 import conftest
 import pytest
 from known import known_rules
 from model import Model
 from rules.data import copy_query, csv_field
+from rules.durability import DurabilityRules
 from rules.prepared import TEMPLATES, expected_rows, params_for
 from rules.transactions import apply, statement
-from session import DUPLICATE_KEY, RULE_NAMES
+from session import DUPLICATE_KEY, RULE_NAMES, Options
 
 
 def test_known_bugs_and_focus_groups_name_registered_rules() -> None:
@@ -38,6 +40,17 @@ def small_model() -> Model:
     model.add_persons({1: model.new_person(age=10), 2: model.new_person(age=-5)})
     model.knows[(1, 2, 0)] += 2
     return model
+
+
+def test_race_edges_join_existing_persons_and_update_the_model() -> None:
+    model = small_model()
+    rules = SimpleNamespace(options=Options(), checkpoint_keeps_snapshots=lambda: True)
+    ops = [("knows", 1, 3), ("knows", 9, 0), ("unknows", 1, 1)]
+    writes, states = DurabilityRules.race_writes(rules, model, ops)
+    assert [params for _, params in writes] == [dict(a=1, b=2, s=3), dict(a=1, b=2)]
+    edges_and_sources = [state[1:] for state in states]
+    assert edges_and_sources == [(((2,),), ((1,),)), (((3,),), ((1,),)), (((0,),), ((0,),))]
+    assert not model.knows
 
 
 def test_transaction_statements_skip_no_ops_and_flag_duplicates() -> None:
