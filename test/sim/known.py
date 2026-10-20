@@ -16,8 +16,6 @@ class Known:
 
 
 KNOWN_BUGS = [
-    Known("crash_copy", "#1159: SIGKILL during COPY's checkpoint can corrupt the database"),
-    Known("crash_checkpoint", "#1159: SIGKILL during CHECKPOINT can corrupt the primary-key index"),
     Known(
         "partitions",
         "a crash after a CHECKPOINT taken while a read-only transaction is open leaves a database "
@@ -36,11 +34,6 @@ KNOWN_BUGS = [
     Known("pk_index", "#1317: DROP INDEX on the primary-key index ignores the transaction"),
     Known("crash_create", "a kill mid-write can leave a WAL that fails its checksum on reopen"),
     Known(
-        "rel_columns",
-        "#1185: after DROP of a property, a crash and a CHECKPOINT, re-adding a property of the "
-        "same name brings back the dropped values",
-    ),
-    Known(
         "rename_table",
         "renaming a table leaves its SERIAL sequence under the old name, so the name can't be "
         "reused (not filed)",
@@ -49,11 +42,6 @@ KNOWN_BUGS = [
     Known(
         "vector_recall",
         "#1023: inserts after CREATE_VECTOR_INDEX pick neighbours by cosine whatever the metric",
-    ),
-    Known(
-        "snapshot_checkpoint",
-        "#1184: a CHECKPOINT on another connection, also the one COPY or CREATE INDEX forces, "
-        "breaks open read-only transactions",
     ),
     Known(
         "snapshot_update",
@@ -68,11 +56,6 @@ KNOWN_BUGS = [
     Known(
         "snapshot_prepared",
         "a prepared statement run inside an older snapshot is not rebound after DDL (not filed)",
-    ),
-    Known(
-        "readd_column",
-        "re-adding a dropped Person column after crashes makes a later CHECKPOINT segfault "
-        "(#1185 family, not filed)",
     ),
     Known(
         "txn_column_gap",
