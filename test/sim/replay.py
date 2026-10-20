@@ -295,6 +295,13 @@ def describe(op: dict) -> str:
     return f"{op['op']:12} {detail[:110]}"
 
 
+def relocate_files(trace: list, trace_dir: str) -> list:
+    """Points the steps' file paths at the copies kept next to the trace: the workload wrote its
+    files to <traces>/current-<pid>, which is gone once the run ends (see keep_failure)."""
+    text = re.sub(r'/[^"\s]*/current-\d+(?=/)', lambda _: trace_dir, json.dumps(trace))
+    return json.loads(text)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("trace")
@@ -313,6 +320,7 @@ def main() -> None:
     args = parser.parse_args()
     with open(args.trace) as f:
         trace = [op for op in json.load(f) if op["op"] != "failure"]
+    trace = relocate_files(trace, os.path.dirname(os.path.abspath(args.trace)))
     if args.probe:
         minimize_wrong_result(trace, args)
         return

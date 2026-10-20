@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from replay import describe, minimize, original_failure
+from replay import describe, minimize, original_failure, relocate_files
 
 OPEN = {"op": "open", "config": {}, "loads": []}
 
@@ -62,3 +62,11 @@ def test_describe_names_crash_points_and_races() -> None:
     assert "pwrite64 #65 in CHECKPOINT" in describe(crash)
     race = {"op": "race", "writes": [1, 2, 3], "queries": [], "readers": 4}
     assert "3 writes, 4 readers" in describe(race)
+
+
+def test_relocate_files_points_copies_at_the_kept_directory() -> None:
+    copy = execute('COPY Person FROM "/runs/traces/current-4242/bulk1000.csv"')
+    kept = "/runs/traces/failed/error-crash-abc"
+    relocated = relocate_files([OPEN, copy, execute("RETURN '/x/current-1'")], kept)
+    assert relocated[1]["query"] == f'COPY Person FROM "{kept}/bulk1000.csv"'
+    assert relocated[2]["query"] == "RETURN '/x/current-1'"
