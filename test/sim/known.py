@@ -27,6 +27,11 @@ KNOWN_BUGS = [
         "its updates and deletes reach the index at once and survive ROLLBACK",
     ),
     Known(
+        "csr_walk_counts",
+        "variable-length counts over CK (REACHABLE_COUNT, GROUPED_REACHABLE_COUNT) miss the edges "
+        "of nodes scanned after a node past the rel table's last node group (not filed)",
+    ),
+    Known(
         "race_edges",
         "a query segfaults while another connection commits rels: commits edit the CSR index in "
         "place under readers (not filed; fix branch fix/csr-index-append-cow, 9b8c1116d)",

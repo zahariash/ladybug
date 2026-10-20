@@ -23,6 +23,7 @@ gated(
     "count_keys",
     "rollback_prepared",
     "csr_local_offset_count",
+    "csr_walk_counts",
     "repeated_aggregate",
 )
 
@@ -385,7 +386,7 @@ class Checks(Session):
             )
             check("MATCH ()-[k:CK]->() RETURN count(*)", {}, [(len(edges),)])
         # Unoptimized, the walks start at every row of C: seconds per query.
-        if conn in getattr(self, "unoptimized", ()):
+        if conn in getattr(self, "unoptimized", ()) or "csr_walk_counts" in self.options.skipped:
             return
         for counted in ("b", "b.id"):
             check(
