@@ -186,6 +186,14 @@ class DurabilityRules(Session):
         if "race_checkpoint" in self.options.skipped and self.checkpoint_keeps_snapshots():
             # Empties the WAL, so that the race's writes cannot trigger an automatic checkpoint.
             self.ok("CHECKPOINT")
+        if "snapshot_update" in self.options.skipped and (
+            self.model.updated_since_checkpoint
+            or self.config["checkpoint_threshold"] != -1
+            or any(op == "checkpoint" for op, _, _ in ops)
+        ):
+            # A checkpoint while the readers hold snapshots moves updates made since the last
+            # checkpoint to other rows (snapshot_update).
+            ops = [o for o in ops if o[0] not in ("set_age", "clear_age")]
         model = self.model.fork()
         writes, states = self.race_writes(model, ops)
         self.check_race(writes, STATE_QUERIES, states, num_readers)
@@ -239,6 +247,11 @@ class DurabilityRules(Session):
         lambda self: (
             self.has_csr()
             and "race_edges" not in self.options.skipped
+            # COPY checkpoints while the readers hold snapshots (snapshot_update).
+            and (
+                "snapshot_update" not in self.options.skipped
+                or not self.model.updated_since_checkpoint
+            )
             and (
                 "race_checkpoint" not in self.options.skipped
                 or self.config["checkpoint_threshold"] == -1
