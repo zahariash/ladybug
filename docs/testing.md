@@ -55,6 +55,13 @@ WAL replay, and a segfault or a hang fails the test. Query results are compared 
 on a freshly prepared statement, on its cached plan, through the driver and on a single-threaded
 connection. Failures shrink to a minimal sequence of steps, except those that depend on timing.
 
+Besides small tables, every workload has C, a node table of two node groups (2^17 rows and a
+second one past a vector end), with two rel tables. The rules draw C ids from bands at size
+boundaries: CSR leaf regions, vectors, segments, the end of each node group. CK joins both
+groups. CK2's sources lie in the first group only, so its rel table lacks the second group, and
+multi-hop checks (`hop_one`, `hop_two`, `hop_varlen`, `hop_mixed`, `hop_optional`,
+`band_degrees`, each a gate of its own) read nodes of both groups in and out of offset order.
+
 ```bash
 make python
 PYTHONPATH=tools/python_api/build uv run --no-project --with hypothesis --with pytest \

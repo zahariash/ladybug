@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
+import random
 from collections import Counter, defaultdict
 from contextlib import contextmanager
 
 import hypothesis.strategies as st
 from hypothesis.stateful import invariant, precondition, rule
-from model import Model
+from model import Model, two_hops, walk_ends
 from session import Session, diff, gated
-from strategies import clusters, csr_id, small_ids
+from strategies import CK2_SEED_SOURCE, CSR_BANDS, clusters, csr_id, csr_src_id, small_ids
 
 USER_TABLES = {"Person", "Knows"}
 
@@ -25,7 +26,18 @@ gated(
     "csr_local_offset_count",
     "csr_walk_counts",
     "repeated_aggregate",
+    "hop_one",
+    "hop_two",
+    "hop_varlen",
+    "hop_mixed",
+    "hop_optional",
+    "band_degrees",
 )
+
+
+def band_sample(seed: int) -> list[int]:
+    """Twelve C ids from both node groups' bands, in an order that is not the offsets'."""
+    return random.Random(seed).sample(CSR_BANDS[0] + CSR_BANDS[-1], 12)
 
 
 class Checks(Session):
@@ -52,6 +64,8 @@ class Checks(Session):
         if self.has_csr():
             actual = Counter(self.rows("MATCH (a:C)-[:CK]->(b:C) RETURN a.id, b.id"))
             assert actual == self.model.ck, diff(actual, self.model.ck)
+            actual = Counter(self.rows("MATCH (a:C)-[k:CK2]->(b:C) RETURN a.id, b.id, k.w"))
+            assert actual == self.model.ck2, diff(actual, self.model.ck2)
         for i, values in self.model.tables.items():
             # SERIAL ids must be unique; values are compared as a multiset.
             rows = self.rows(f"MATCH (t:T{i}) RETURN t.id, t.v")
@@ -76,7 +90,7 @@ class Checks(Session):
         if self.has_partitions():
             expected.add("L")
         if self.has_csr():
-            expected |= {"C", "CK"}
+            expected |= {"C", "CK", "CK2"}
         if self.options.loaded:
             expected.add("Doc")
         assert tables == expected, tables
@@ -400,14 +414,81 @@ class Checks(Session):
                 list(walks.items()),
             )
 
-    def check_csr_degree(self, src: int) -> None:
-        """One node's CK count right after a committed write to its edges, the moment a count
-        from storage and the edges it has to subtract or add are most likely to disagree."""
-        n = sum(k for (s, _), k in self.model.ck.items() if s == src)
+    def check_csr_degree(self, src: int, table: str = "CK") -> None:
+        """One node's CK or CK2 count right after a committed write to its edges, the moment a
+        count from storage and the edges it has to subtract or add are most likely to disagree."""
+        pairs = self.model.ck if table == "CK" else self.model.ck2_pairs()
+        n = sum(k for (s, _), k in pairs.items() if s == src)
         for counted in ("*", "b.id"):
-            self.check(
-                f"MATCH (a:C)-[:CK]->(b:C) WHERE a.id = {src} RETURN count({counted})", {}, [(n,)]
+            query = f"MATCH (a:C)-[:{table}]->(b:C) WHERE a.id = {src} RETURN count({counted})"
+            self.check(query, {}, [(n,)])
+
+    def check_hops(self, view: Model, check, conn: int, id: int, alone: bool) -> None:
+        """Paths over CK2, whose sources all lie in C's first node group so that its rel table
+        lacks the second, and over CK: a scan that reads a node past a rel table's last node
+        group must still read the edges of the nodes it reads next. Each shape has its own gate.
+        In a write transaction a two-hop batch across such a node misses uncommitted edges
+        (txn_missing_group), so the multi-hop shapes run there only with that gate lifted."""
+        skipped = self.options.skipped
+        ck, ck2 = Counter(view.ck), view.ck2_pairs()
+        a, b, ids = csr_src_id(id), csr_id(id + 1), band_sample(id)
+        if "hop_one" not in skipped:
+            query = f"MATCH (a:C)-[:CK2]->(b:C) WHERE a.id = {a} RETURN b.id"
+            check(query, {}, [(d,) for s, d in ck2.elements() if s == a])
+            query = f"MATCH (b:C)<-[:CK2]-(a:C) WHERE b.id = {b} RETURN a.id"
+            check(query, {}, [(s,) for s, d in ck2.elements() if d == b])
+        if "band_degrees" not in skipped:
+            for table, pairs in (("CK", ck), ("CK2", ck2)):
+                for pattern, end in ((f"-[:{table}]->", 0), (f"<-[:{table}]-", 1)):
+                    degrees = Counter(edge[end] for edge in pairs.elements())
+                    query = f"MATCH (a:C){pattern}(:C) WHERE a.id IN {ids} RETURN a.id, count(*)"
+                    check(query, {}, [(i, degrees[i]) for i in ids if degrees[i]])
+        if "hop_optional" not in skipped:
+            degrees = Counter(s for s, _ in ck2.elements())
+            query = (
+                f"MATCH (a:C) WHERE a.id IN {ids} OPTIONAL MATCH (a)-[:CK2]->(b:C) "
+                "RETURN a.id, count(b)"
             )
+            check(query, {}, [(i, degrees[i]) for i in ids])
+        if alone and "txn_missing_group" in skipped:
+            return
+        sources = sorted({a, CK2_SEED_SOURCE})
+        if "hop_two" not in skipped:
+            for src in sources:
+                query = (
+                    f"MATCH (a:C)-[:CK2]->(m:C)-[:CK2]->(b:C) WHERE a.id = {src} RETURN m.id, b.id"
+                )
+                check(query, {}, [(m, d) for _, m, d in two_hops(ck2, [src]).elements()])
+            # An extend over another extend's output, in sources' offset order.
+            for table, pairs in (("CK", ck), ("CK2", ck2)):
+                query = (
+                    f"MATCH (a:C)-[:{table}]->(m:C)-[:{table}]->(b:C) WHERE a.id < 40 "
+                    "RETURN a.id, m.id, b.id"
+                )
+                sources = {s for s, _ in pairs if s < 40}
+                check(query, {}, list(two_hops(pairs, sources).elements()))
+        if "hop_mixed" not in skipped:
+            both, c = ck + ck2, csr_id(id)
+            query = f"MATCH (a:C)-[:CK|:CK2]->(b:C) WHERE a.id = {c} RETURN b.id"
+            check(query, {}, [(d,) for s, d in both.elements() if s == c])
+            query = (
+                f"MATCH (a:C)-[:CK|:CK2]->(m:C)-[:CK|:CK2]->(b:C) WHERE a.id = {c} "
+                "RETURN m.id, b.id"
+            )
+            check(query, {}, [(m, d) for _, m, d in two_hops(both, [c]).elements()])
+        # Unoptimized, the walks start at every row of C: seconds per query.
+        if "hop_varlen" in skipped or conn in getattr(self, "unoptimized", ()):
+            return
+        for src in sources:
+            ends = walk_ends(ck2, src, 1, 3)
+            if sum(ends.values()) > 50_000:
+                continue
+            query = f"MATCH (a:C)-[:CK2*1..3]->(b:C) WHERE a.id = {src} RETURN b.id"
+            check(query, {}, [(d,) for d in ends.elements()])
+            query = f"MATCH (a:C)-[:CK2*1..3]->(b:C) WHERE a.id = {src} RETURN count(DISTINCT b)"
+            check(query, {}, [(len(ends),)])
+        walks = sum(ck2.values()) + sum(two_hops(ck2, {s for s, _ in ck2}).values())
+        check("MATCH (a:C)-[:CK2*1..2]->(b:C) RETURN count(*)", {}, [(walks,)])
 
     def check_top_degrees(self, counted: str, degrees: Counter, conn: int) -> None:
         """The three nodes with the most CK edges; ties may come back in any order."""
@@ -532,6 +613,7 @@ class Checks(Session):
             self.check_key_counts(view, check, conn, x, id, degrees)
         if self.has_csr():
             self.check_csr_counts(view, check, conn, csr_id(id), alone)
+            self.check_hops(view, check, conn, id, alone)
         for column, default in view.columns.items():
             if column.startswith("c"):
                 check(

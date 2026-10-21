@@ -40,6 +40,8 @@ CK_STATE_QUERIES = [
     "MATCH ()-[k:CK]->() RETURN count(*)",
     "MATCH (a:C)-[:CK]->(:C) RETURN count(DISTINCT a.id)",
     "MATCH (a:C)-[k:CK]->(b:C) WHERE b.id >= 0 RETURN count(*)",
+    # CK2 is not written in the race; its sources are all in C's first node group.
+    "MATCH ()-[k:CK2]->() RETURN count(*)",
 ]
 
 
@@ -59,7 +61,8 @@ def race_state(model: Model) -> tuple:
 def ck_state(model: Model) -> tuple:
     """What engine.read_state returns for CK_STATE_QUERIES."""
     edges = sum(model.ck.values())
-    return ((edges,),), ((len({src for src, _ in model.ck}),),), ((edges,),)
+    sources = len({src for src, _ in model.ck})
+    return ((edges,),), ((sources,),), ((edges,),), ((sum(model.ck2.values()),),)
 
 
 def bulk_edges(start: int, count: int, step: int) -> list[tuple[int, int]]:

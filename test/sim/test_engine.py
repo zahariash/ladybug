@@ -31,6 +31,7 @@ from rules.durability import (
     ck_state,
     race_state,
 )
+from strategies import CSR_ROWS
 
 GDB_OUTPUT = """\
 [New LWP 12]
@@ -94,18 +95,20 @@ def test_race_state_of_an_empty_model() -> None:
 def test_ck_state_counts_edges_and_their_sources() -> None:
     model = Model()
     model.ck.update([(0, 5), (0, 5), (131072, 1)])
+    model.ck2[(1, 131072, 0)] += 1
     answers = {CK_STATE_QUERIES[0]: [[3]], CK_STATE_QUERIES[1]: [[2]], CK_STATE_QUERIES[2]: [[3]]}
+    answers[CK_STATE_QUERIES[3]] = [[1]]
     assert ck_state(model) == read_state(FakeConnection(answers), CK_STATE_QUERIES)
 
 
 def test_bulk_edges_have_distinct_sources_and_match_the_query() -> None:
     edges = bulk_edges(1950, 100, 3)
     assert len({src for src, _ in edges}) == 100
-    assert edges[0] == ((1950 * 67 + 3) % 131112, 1950 * 3)
+    assert edges[0] == ((1950 * 67 + 3) % CSR_ROWS, 1950 * 3)
     creates = bulk_ck_writes("create", 1950, 100, 3)
     assert [(p["a"], p["b"]) for _, p in creates] == edges
     [(copy, params)] = bulk_ck_writes("copy", 0, 1, 1)
-    rows = "UNWIND range(0, 0) AS i RETURN (i * 67 + 1) % 131112, (i * 1) % 131112"
+    rows = f"UNWIND range(0, 0) AS i RETURN (i * 67 + 1) % {CSR_ROWS}, (i * 1) % {CSR_ROWS}"
     assert copy == f"COPY CK FROM ({rows})"
     assert params == {}
 

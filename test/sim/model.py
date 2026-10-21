@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field, replace
 from typing import NamedTuple
 
@@ -46,6 +46,7 @@ class Model:
     # (id, cluster) rows of L; each cluster is its own partition, keys are unique per partition
     partitioned: set = field(default_factory=set)
     ck: Counter = field(default_factory=Counter)  # (src, dst) -> count of CK edges
+    ck2: Counter = field(default_factory=Counter)  # (src, dst, w) -> count of CK2 edges
     pk_index: str | None = "_PK"  # the name of Person's primary-key index, if any
     age_index: str | None = None  # the name of the ART index on Person.age, if any
     dropped_columns: set = field(default_factory=set)  # Person columns dropped at some point
@@ -127,6 +128,7 @@ class Model:
             tables={i: list(values) for i, values in self.tables.items()},
             partitioned=set(self.partitioned),
             ck=Counter(self.ck),
+            ck2=Counter(self.ck2),
             dropped_columns=set(self.dropped_columns),
             wrote=False,
         )
@@ -137,6 +139,13 @@ class Model:
             self.persons[id] = {**self.persons[id], field: value}
             self.updated_since_checkpoint = True
 
+    def ck2_pairs(self) -> Counter:
+        """CK2's edges as (src, dst) -> count, whatever their w."""
+        pairs = Counter()
+        for (src, dst, _), n in self.ck2.items():
+            pairs[(src, dst)] += n
+        return pairs
+
     def take_bulk_ids(self, count: int) -> range:
         ids = range(self.next_bulk_id, self.next_bulk_id + count)
         self.next_bulk_id += count
@@ -144,3 +153,28 @@ class Model:
 
     def person_rows(self) -> Counter:
         return Counter(canonical((id, *p.values())) for id, p in self.persons.items())
+
+
+def walk_ends(pairs: Counter, src: int, lo: int, hi: int) -> Counter:
+    """The end node of every walk of lo..hi edges from src over `pairs` ((src, dst) -> count)."""
+    out = defaultdict(list)
+    for (s, d), n in pairs.items():
+        out[s] += [d] * n
+    ends, frontier = Counter(), Counter({src: 1})
+    for depth in range(1, hi + 1):
+        step = Counter()
+        for v, c in frontier.items():
+            for d in out[v]:
+                step[d] += c
+        frontier = step
+        if depth >= lo:
+            ends += frontier
+    return ends
+
+
+def two_hops(pairs: Counter, sources) -> Counter:
+    """(a, m, b) for every walk a->m->b over `pairs` with a in `sources`."""
+    out = defaultdict(list)
+    for (s, d), n in pairs.items():
+        out[s] += [d] * n
+    return Counter((a, m, b) for a in set(sources) for m in out[a] for b in out[m])

@@ -11,9 +11,19 @@ from __future__ import annotations
 import hypothesis.strategies as st
 from engine import EngineError
 from hypothesis.stateful import precondition, rule
-from model import Model
+from model import Model, two_hops
 from session import DUPLICATE_KEY, Session, enabled, gated
-from strategies import clusters, csr_ids, extra_columns, ints, macro_ids, small_ids, table_ids
+from strategies import (
+    CSR_BANDS,
+    clusters,
+    csr_ids,
+    csr_src_ids,
+    extra_columns,
+    ints,
+    macro_ids,
+    small_ids,
+    table_ids,
+)
 
 ENDS = ["commit", "rollback", "crash"]
 gated("txn_ddl", "txn_error", *(f"txn_{end}" for end in ENDS))
@@ -26,6 +36,8 @@ op = st.one_of(
     st.tuples(st.just("knows"), small_ids, small_ids),
     st.tuples(st.just("ck"), csr_ids, csr_ids),
     st.tuples(st.just("unck"), csr_ids, csr_ids),
+    st.tuples(st.just("ck2"), csr_src_ids, csr_ids),
+    st.tuples(st.just("unck2"), csr_src_ids, csr_ids),
     st.tuples(st.just("create_table"), table_ids, st.none()),
     st.tuples(st.just("insert_t"), table_ids, st.integers(-1000, 1000)),
     st.tuples(st.just("create_macro"), macro_ids, st.integers(-5, 5)),
@@ -56,6 +68,11 @@ def statement(model: Model, kind: str, a, b) -> tuple[str, dict, str | None] | N
         return "MATCH (x:C {id: $a}), (y:C {id: $b}) CREATE (x)-[:CK]->(y)", dict(a=a, b=b), None
     if kind == "unck":
         return "MATCH (x:C {id: $a})-[k:CK]->(y:C {id: $b}) DELETE k", dict(a=a, b=b), None
+    if kind == "ck2":
+        query = "MATCH (x:C {id: $a}), (y:C {id: $b}) CREATE (x)-[:CK2 {w: 0}]->(y)"
+        return query, dict(a=a, b=b), None
+    if kind == "unck2":
+        return "MATCH (x:C {id: $a})-[k:CK2]->(y:C {id: $b}) DELETE k", dict(a=a, b=b), None
     if kind == "create_table":
         if a in model.tables:
             return None
@@ -97,6 +114,11 @@ def apply(model: Model, kind: str, a, b) -> None:
         model.ck[(a, b)] += 1
     elif kind == "unck":
         model.ck.pop((a, b), None)
+    elif kind == "ck2":
+        model.ck2[(a, b, 0)] += 1
+    elif kind == "unck2":
+        for key in [k for k in model.ck2 if k[:2] == (a, b)]:
+            del model.ck2[key]
     elif kind == "create_table":
         model.tables[a] = []
     elif kind == "insert_t":
@@ -126,7 +148,7 @@ class TransactionRules(Session):
             and not (kind == "drop_column" and "txn_column_gap" in skipped)
             and not (kind in ("create_macro", "drop_macro") and "macros" in skipped)
             and not (kind == "drop_macro" and "drop_macro" in skipped)
-        ] + (["ck", "unck"] if "csr" not in skipped else [])
+        ] + (["ck", "unck", "ck2", "unck2"] if "csr" not in skipped else [])
 
     def runs(self, model: Model, kind: str, a) -> bool:
         """Whether an op runs: its kind is allowed, and it hits no bug in known.py: re-adding a
@@ -206,6 +228,33 @@ class TransactionRules(Session):
             self.ok("ROLLBACK")
         else:
             self.crash_engine()
+
+    @enabled("txn_missing_group")
+    @precondition(lambda self: self.has_csr())
+    @rule(
+        a=csr_src_ids,
+        m0=csr_src_ids,
+        m1=st.sampled_from(CSR_BANDS[-1]),
+        x=csr_src_ids,
+        y=csr_src_ids,
+    )
+    def two_hop_across_missing_group(self, a, m0, m1, x, y):
+        """A two-hop match in a write transaction whose middle nodes lie on both sides of the node
+        group CK2 lacks: committed a->m0 and a->m1, uncommitted m0->x and m1->y. The transaction
+        must see both walks; the ROLLBACK keeps CK2's sources in C's first node group."""
+        create = "MATCH (s:C {id: $s}), (d:C {id: $d}) CREATE (s)-[:CK2 {w: $w}]->(d)"
+        for m in (m0, m1):
+            self.ok(create, dict(s=a, d=m, w=0))
+            self.model.ck2[(a, m, 0)] += 1
+        pending = self.model.fork()
+        self.ok("BEGIN TRANSACTION")
+        for s, d in ((m0, x), (m1, y)):
+            self.ok(create, dict(s=s, d=d, w=1))
+            pending.ck2[(s, d, 1)] += 1
+        walks = two_hops(pending.ck2_pairs(), [a])
+        query = "MATCH (a:C)-[:CK2]->(m:C)-[:CK2]->(b:C) WHERE a.id = $a RETURN m.id, b.id"
+        self.check(query, dict(a=a), [(m, b) for _, m, b in walks.elements()], alone=True)
+        self.ok("ROLLBACK")
 
     @enabled("atomic_statement")
     @precondition(lambda self: any(id < 41 for id in self.model.persons))

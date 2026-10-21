@@ -25,17 +25,55 @@ table_ids = st.integers(0, 2)
 EXTRA_COLUMNS = ["c0", "c1", "c2"]
 extra_columns = st.sampled_from(EXTRA_COLUMNS)
 clusters = st.integers(1, 3)
-# C, the node table declared CSR, holds ids 0..CSR_ROWS-1 at the offsets of their ids. Its edges
-# join the first 40 and the last 40, so that they lie in two node groups (2^17 rows each, the
-# default build).
+# C, the node table declared CSR, holds ids 0..CSR_ROWS-1 at the offsets of their ids: a full node
+# group (2^17 rows, the default build) and a second one that ends past a vector. Edges join the
+# first 40 ids of each group and ids at the size boundaries in each group (CSR leaf regions of
+# 1024 lists, vectors of 2048 rows, 32768-row INT64 segments, the group's last rows).
 CSR_SECOND_GROUP = 2**17
-CSR_ROWS = CSR_SECOND_GROUP + 40
-csr_ids = st.one_of(st.integers(0, 39), st.integers(CSR_SECOND_GROUP, CSR_ROWS - 1))
+CSR_ROWS = CSR_SECOND_GROUP + VECTOR_CAPACITY + 40
+BOUNDARY_OFFSETS = [1022, 1023, 1024, 1025, 2046, 2047, 2048, 2049, 4095, 4096]
+BOUNDARY_OFFSETS += [32766, 32767, 32768, 32769, 65534, 65535, 65536, 65537]
+
+
+def csr_bands(rows: int = CSR_ROWS) -> list[list[int]]:
+    """The C ids the rules draw, by node group: the first 40 and the boundary ids."""
+    bands = []
+    for start in range(0, rows, CSR_SECOND_GROUP):
+        size = min(CSR_SECOND_GROUP, rows - start)
+        offsets = set(range(40)) | set(BOUNDARY_OFFSETS) | set(range(size - 4, size))
+        bands.append([start + i for i in sorted(offsets) if i < size])
+    return bands
+
+
+CSR_BANDS = csr_bands()
+CSR_BOUNDARY_IDS = [id for band in CSR_BANDS for id in band if id % CSR_SECOND_GROUP >= 40]
+csr_ids = st.one_of(
+    st.integers(0, 39),
+    st.integers(CSR_SECOND_GROUP, CSR_SECOND_GROUP + 39),
+    st.sampled_from(CSR_BOUNDARY_IDS),
+)
+# CK2's sources lie in the first node group only, so that its rel table lacks the second.
+csr_src_ids = st.one_of(
+    st.integers(0, 39), st.sampled_from([id for id in CSR_BOUNDARY_IDS if id < CSR_SECOND_GROUP])
+)
+
+# CK2's edges in every new database: node 1 reaches 17, 18 and a node of the second group, with two
+# more levels below 17 and 18, and 11 reaches 12 and 13. Variable-length matches from 1 and
+# two-hop matches over 1 and 11 then read first-group nodes after the second-group one.
+CK2_SEED = [(1, 17), (1, CSR_SECOND_GROUP + 8), (1, 18), (17, 5), (18, 6), (5, 7), (6, 8)]
+CK2_SEED += [(11, 12), (12, 13)]
+CK2_SEED_SOURCE = 1
 
 
 def csr_id(i: int) -> int:
     """A C id for a small id: in the first node group for even ones, the second for odd ones."""
     return i % 40 if i % 2 == 0 else CSR_SECOND_GROUP + i % 40
+
+
+def csr_src_id(i: int) -> int:
+    """A first-group C id for a small id, a boundary id for every third."""
+    first = [id for id in CSR_BANDS[0] if id >= 40]
+    return first[i % len(first)] if i % 3 == 2 else i % 40
 
 ints = st.one_of(
     st.none(),

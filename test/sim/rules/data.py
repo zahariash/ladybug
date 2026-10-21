@@ -1,4 +1,5 @@
-"""Rules that write data: persons, Knows edges, bulk COPY, the partitioned table, CK edges."""
+"""Rules that write data: persons, Knows edges, bulk COPY, the partitioned table, CK and CK2
+edges."""
 
 from __future__ import annotations
 
@@ -13,6 +14,7 @@ from strategies import (
     VECTOR_CAPACITY,
     clusters,
     csr_ids,
+    csr_src_ids,
     csv_names,
     doubles,
     ints,
@@ -228,3 +230,39 @@ class DataRules(Session):
         self.ok(f'COPY CK FROM "{csv}"')
         self.model.ck.update(edges)
         self.check_csr_degree(edges[0][0])
+
+    @enabled("csr")
+    @rule(src=csr_src_ids, dst=csr_ids, w=st.integers(-3, 3))
+    def insert_ck2(self, src, dst, w):
+        query = "MATCH (a:C {id: $a}), (b:C {id: $b}) CREATE (a)-[:CK2 {w: $w}]->(b)"
+        self.ok(query, dict(a=src, b=dst, w=w))
+        self.model.ck2[(src, dst, w)] += 1
+        self.check_csr_degree(src, "CK2")
+
+    @enabled("csr")
+    @rule(data=st.data())
+    def delete_ck2(self, data):
+        """An existing edge's endpoints about half the time."""
+        pair = st.tuples(csr_src_ids, csr_ids)
+        if self.model.ck2:
+            pair = st.one_of(st.sampled_from(sorted(self.model.ck2_pairs())), pair)
+        src, dst = data.draw(pair)
+        self.ok("MATCH (a:C {id: $a})-[k:CK2]->(b:C {id: $b}) DELETE k", dict(a=src, b=dst))
+        for key in [k for k in self.model.ck2 if k[:2] == (src, dst)]:
+            del self.model.ck2[key]
+        self.check_csr_degree(src, "CK2")
+
+    @enabled("csr")
+    @precondition(lambda self: self.checkpoint_keeps_snapshots())
+    @rule(
+        edges=st.lists(
+            st.tuples(csr_src_ids, csr_ids, st.integers(-3, 3)), min_size=1, max_size=300
+        )
+    )
+    def copy_ck2(self, edges):
+        fd, csv = tempfile.mkstemp(suffix=".csv", dir=self.files)
+        with os.fdopen(fd, "w") as f:
+            f.writelines(f"{s},{d},{w}\n" for s, d, w in edges)
+        self.ok(f'COPY CK2 FROM "{csv}"')
+        self.model.ck2.update(edges)
+        self.check_csr_degree(edges[0][0], "CK2")

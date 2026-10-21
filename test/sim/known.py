@@ -32,6 +32,21 @@ KNOWN_BUGS = [
         "edges of nodes scanned after a node past the rel table's last node group (fix: PR #1342)",
     ),
     Known(
+        "hop_two",
+        "#1341: an extend over another extend's output misses the edges of nodes it reads after "
+        "a node past the rel table's last node group (fix: PR #1342)",
+    ),
+    Known(
+        "hop_varlen",
+        "#1341: variable-length matches miss the edges of nodes they expand after a node past the "
+        "rel table's last node group (fix: PR #1342)",
+    ),
+    Known(
+        "txn_missing_group",
+        "in a write transaction, a two-hop match misses the uncommitted edges of a node batched "
+        "with a node past the rel table's last node group, until COMMIT (not filed)",
+    ),
+    Known(
         "race_edges",
         "#1332: a query segfaults while another connection commits rels: commits edit the CSR "
         "index in place under readers (fix: PR #1333)",

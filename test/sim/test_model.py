@@ -5,8 +5,8 @@ from __future__ import annotations
 import math
 from collections import Counter
 
-from model import Doc, Model, canonical
-from strategies import BULK_ID_START
+from model import Doc, Model, canonical, two_hops, walk_ends
+from strategies import BULK_ID_START, CSR_BANDS, CSR_ROWS, CSR_SECOND_GROUP
 
 
 def model_with(persons: dict, knows: dict | None = None) -> Model:
@@ -113,3 +113,41 @@ def test_dropping_a_middle_column_marks_the_gap_until_a_checkpoint() -> None:
     assert model.middle_dropped
     model.checkpointed()
     assert not model.middle_dropped
+
+
+def enumerated_walk_ends(edges: list, src: int, length: int) -> list:
+    """The end node of every walk of `length` edges from src, by enumerating the walks."""
+    walks = [[src]]
+    for _ in range(length):
+        walks = [walk + [d] for walk in walks for s, d in edges if s == walk[-1]]
+    return [walk[-1] for walk in walks]
+
+
+def test_walk_ends_counts_every_walk() -> None:
+    edges = [(1, 2), (2, 3), (1, 3), (3, 3), (2, 3), (1, 2)]
+    for lo, hi in [(1, 1), (1, 2), (2, 3), (1, 3)]:
+        expected = Counter(e for n in range(lo, hi + 1) for e in enumerated_walk_ends(edges, 1, n))
+        assert walk_ends(Counter(edges), 1, lo, hi) == expected
+
+
+def test_two_hops_counts_each_pair_of_edges() -> None:
+    edges = [(1, 2), (2, 3), (2, 3), (1, 2), (4, 1)]
+    expected = Counter((a, m, b) for a, m in edges for x, b in edges if x == m and a in (1, 4))
+    assert two_hops(Counter(edges), [1, 4]) == expected
+
+
+def test_fork_copies_ck2_and_pairs_ignore_w() -> None:
+    model = Model()
+    model.ck2[(1, 2, 0)] += 1
+    model.ck2[(1, 2, 5)] += 2
+    fork = model.fork()
+    fork.ck2[(3, 4, 0)] += 1
+    assert (3, 4, 0) not in model.ck2
+    assert model.ck2_pairs() == Counter({(1, 2): 3})
+
+
+def test_csr_bands_stay_inside_c() -> None:
+    first, second = CSR_BANDS
+    assert first[:40] == list(range(40)) and CSR_SECOND_GROUP - 1 in first
+    assert second[-1] == CSR_ROWS - 1 and CSR_SECOND_GROUP + 2049 in second
+    assert CSR_SECOND_GROUP + 4095 not in second

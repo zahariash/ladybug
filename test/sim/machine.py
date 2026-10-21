@@ -20,6 +20,7 @@ from rules.sessions import SessionRules
 from rules.transactions import TransactionRules
 from search import SearchChecks
 from session import FAILURES
+from strategies import CK2_SEED
 
 SCHEMA = [
     "CREATE NODE TABLE Person(id INT64 PRIMARY KEY, name STRING, age INT64, score DOUBLE)",
@@ -76,6 +77,11 @@ class LadybugSim(
         if art_pk:
             self.ok("CREATE ART INDEX person_pk FOR (p:Person) ON (p.id)")
             self.model.pk_index = "person_pk"
+        if self.has_csr():
+            create = "MATCH (a:C {id: $a}), (b:C {id: $b}) CREATE (a)-[:CK2 {w: 0}]->(b)"
+            for src, dst in CK2_SEED:
+                self.ok(create, dict(a=src, b=dst))
+                self.model.ck2[(src, dst, 0)] += 1
 
     def teardown(self):
         # Hypothesis calls teardown in a finally block, so a failing step's error is in flight;
