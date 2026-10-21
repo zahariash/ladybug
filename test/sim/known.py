@@ -28,8 +28,8 @@ KNOWN_BUGS = [
     ),
     Known(
         "csr_walk_counts",
-        "variable-length counts over CK (REACHABLE_COUNT, GROUPED_REACHABLE_COUNT) miss the edges "
-        "of nodes scanned after a node past the rel table's last node group (not filed)",
+        "#1341: variable-length counts over CK (REACHABLE_COUNT, GROUPED_REACHABLE_COUNT) miss the "
+        "edges of nodes scanned after a node past the rel table's last node group (fix: PR #1342)",
     ),
     Known(
         "race_edges",
