@@ -23,8 +23,8 @@ KNOWN_BUGS = [
     ),
     Known(
         "art_copy",
-        "rows that COPY loads into a node table never reach an ART index on its columns, also "
-        "after CHECKPOINT and reopen; CREATE does (not filed)",
+        "#1343: rows that COPY loads into a node table never reach an ART index on its columns, "
+        "also after CHECKPOINT and reopen; CREATE does",
     ),
     Known(
         "txn_index_lookups",
