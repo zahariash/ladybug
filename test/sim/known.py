@@ -18,8 +18,8 @@ class Known:
 KNOWN_BUGS = [
     Known(
         "partitions",
-        "a crash after a CHECKPOINT taken while a read-only transaction is open leaves a database "
-        "with a partitioned table unopenable: the partition shadow file is missing (not filed)",
+        "#1304: a crash after a CHECKPOINT taken while a read-only transaction is open leaves a "
+        "database with a partitioned table unopenable: the partition shadow file is missing",
     ),
     Known(
         "txn_index_lookups",
@@ -33,40 +33,40 @@ KNOWN_BUGS = [
     ),
     Known(
         "race_edges",
-        "a query segfaults while another connection commits rels: commits edit the CSR index in "
-        "place under readers (not filed; fix branch fix/csr-index-append-cow, 9b8c1116d)",
+        "#1332: a query segfaults while another connection commits rels: commits edit the CSR "
+        "index in place under readers (fix: PR #1333)",
     ),
     Known("pk_index", "#1317: DROP INDEX on the primary-key index ignores the transaction"),
     Known("crash_create", "a kill mid-write can leave a WAL that fails its checksum on reopen"),
     Known(
         "rename_table",
-        "renaming a table leaves its SERIAL sequence under the old name, so the name can't be "
-        "reused (not filed)",
+        "#1207: renaming a table leaves its SERIAL sequence under the old name, so the name can't "
+        "be reused",
     ),
-    Known("dotproduct", "dotproduct vector indexes return the least similar vectors first"),
+    Known("dotproduct", "#1210: dotproduct vector indexes return the least similar vectors first"),
     Known(
         "vector_recall",
         "#1023: inserts after CREATE_VECTOR_INDEX pick neighbours by cosine whatever the metric",
     ),
     Known(
         "snapshot_update",
-        "a checkpoint while a read-only transaction is open puts updates made since the last "
-        "checkpoint on other rows, durably (not filed)",
+        "#1303: a checkpoint while a read-only transaction is open puts updates made since the "
+        "last checkpoint on other rows, durably",
     ),
     Known(
         "snapshot_insert_delete",
-        "a row inserted and deleted after a read-only transaction began becomes visible to it "
-        "at the next checkpoint (not filed)",
+        "#1305: a row inserted and deleted after a read-only transaction began becomes visible to "
+        "it at the next checkpoint",
     ),
     Known(
         "snapshot_prepared",
-        "a prepared statement run inside an older snapshot is not rebound after DDL (not filed)",
+        "#1220: a prepared statement run inside an older snapshot is not rebound after DDL",
     ),
     Known(
         "txn_column_gap",
-        "after a column is dropped and another added (or a middle one dropped in the transaction), "
-        "a transaction's new rows are misplaced until a checkpoint: wrong values after COMMIT, or "
-        "a segfault reading them (not filed)",
+        "#1221: after a column is dropped and another added (or a middle one dropped in the "
+        "transaction), a transaction's new rows are misplaced until a checkpoint: wrong values "
+        "after COMMIT, or a segfault reading them",
     ),
     Known(
         "pool_commit",
@@ -75,15 +75,15 @@ KNOWN_BUGS = [
     ),
     Known(
         "rollback_add",
-        "a rolled-back ALTER TABLE ADD leaves its column data behind; the next ADD reads it until "
-        "a checkpoint (not filed)",
+        "#1221: a rolled-back ALTER TABLE ADD leaves its column data behind; the next ADD reads it "
+        "until a checkpoint",
     ),
     Known(
         "txn_prepared_ddl",
-        "a statement prepared with parameters in a transaction is not rebound after ALTER TABLE "
-        "ADD in the same transaction: the new column gets 0, not its default; after DROP and "
+        "#1220: a statement prepared with parameters in a transaction is not rebound after ALTER "
+        "TABLE ADD in the same transaction: the new column gets 0, not its default; after DROP and "
         "CREATE TABLE of the same name, an insert into the new table hits the old table's keys "
-        "(not filed)",
+        "(this case not filed)",
     ),
     Known(
         "rollback_prepared",
