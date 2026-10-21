@@ -162,6 +162,11 @@ class Session:
         partition bug cannot end workloads that never touch it."""
         return "partitions" not in self.options.skipped
 
+    def copy_person_safe(self) -> bool:
+        """Whether a COPY into Person keeps index lookups right: rows COPY loads never reach an
+        ART index on a Person column (art_copy)."""
+        return self.model.age_index is None or "art_copy" not in self.options.skipped
+
     def has_csr(self) -> bool:
         """Whether C and CK exist: only while the csr rules run."""
         return "csr" not in self.options.skipped

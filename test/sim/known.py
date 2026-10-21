@@ -22,6 +22,11 @@ KNOWN_BUGS = [
         "database with a partitioned table unopenable: the partition shadow file is missing",
     ),
     Known(
+        "art_copy",
+        "rows that COPY loads into a node table never reach an ART index on its columns, also "
+        "after CHECKPOINT and reopen; CREATE does (not filed)",
+    ),
+    Known(
         "txn_index_lookups",
         "#1318: a transaction's uncommitted rows are missing from secondary ART index lookups, and "
         "its updates and deletes reach the index at once and survive ROLLBACK",

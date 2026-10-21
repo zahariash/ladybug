@@ -23,7 +23,7 @@ SYSCALLS = {
     "rename": 2,
     "unlink": 10,
 }
-gated(*(f"crash_{op}" for op in CRASH_OPS), "race_checkpoint", "race_edges")
+gated(*(f"crash_{op}" for op in CRASH_OPS), "race_checkpoint", "race_edges", "art_copy")
 
 # The committed state a racing reader sees (see engine.read_state and race_state). Races write
 # ages between -100 and 100; other ages are left out of the sum so that it cannot overflow.
@@ -102,7 +102,7 @@ class DurabilityRules(Session):
 
     def crash_ops(self) -> list[str]:
         ops = [op for op in CRASH_OPS if f"crash_{op}" not in self.options.skipped]
-        if self.model.pk_index is None and self.model.persons_ever:
+        if (self.model.pk_index is None and self.model.persons_ever) or not self.copy_person_safe():
             ops = [op for op in ops if op != "copy"]
         return ops
 

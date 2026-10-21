@@ -162,7 +162,7 @@ class DataRules(Session):
         self.model.add_persons({id: self.model.new_person(age=id % 1000) for id in ids})
 
     @enabled("bulk_copy")
-    @precondition(lambda self: self.checkpoint_keeps_snapshots())
+    @precondition(lambda self: self.checkpoint_keeps_snapshots() and self.copy_person_safe())
     @rule(rows=st.lists(st.tuples(csv_names, st.integers(-1000, 1000)), min_size=1, max_size=3000))
     def bulk_copy(self, rows):
         csv, added = self.write_bulk_csv(rows)
