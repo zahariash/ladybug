@@ -63,10 +63,6 @@ KNOWN_BUGS = [
         "duplicated primary key (not filed; ranking asked in #1341)",
     ),
     Known(
-        "recovery_wal_checksum",
-        "a kill mid-write can leave a WAL that fails its checksum on reopen (not filed)",
-    ),
-    Known(
         "recovery_catalog_exists",
         "a kill during CHECKPOINT can leave a WAL whose replay recreates an existing table or "
         "macro: 'already exists in catalog' (not filed)",

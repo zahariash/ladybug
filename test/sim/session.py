@@ -131,7 +131,6 @@ RECOVERY_SKIPS: Counter = Counter()
 # that hits one is discarded instead of failing, so that crash ops keep running.
 RECOVERY_FAILURES = {
     "recovery_duplicate_key": "Found duplicated primary key value",
-    "recovery_wal_checksum": "Checksum verification failed",
     "recovery_catalog_exists": "already exists in catalog",
 }
 

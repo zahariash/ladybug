@@ -51,7 +51,9 @@ of nodes and edges, a partitioned table, DDL (macros, tables,
 `ALTER TABLE`, the primary-key index, and with `--sim-extensions` full-text and vector indexes),
 checkpoints, reopens, crashes between and in the middle of statements, and writes racing
 concurrent readers. The database runs in a worker process, so a crash is a SIGKILL followed by
-WAL replay, and a segfault or a hang fails the test. Query results are compared with the model
+WAL replay, and a segfault or a hang fails the test. Databases open with
+`throw_on_wal_replay_failure` off, the engine's default, so replay drops the WAL tail a kill tore
+and the checks verify what remains. Query results are compared with the model
 on a freshly prepared statement, on its cached plan, through the driver and on a single-threaded
 connection. Failures shrink to a minimal sequence of steps, except those that depend on timing.
 

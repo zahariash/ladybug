@@ -64,6 +64,9 @@ class LadybugSim(
             max_num_threads=threads,
             compression=compression,
             checkpoint_threshold=checkpoint_threshold,
+            # The engine's default: recovery drops a WAL tail a crash tore, which the crash checks
+            # then verify; the Python driver's default refuses to open the database instead.
+            throw_on_wal_replay_failure=False,
         )
         self.c_fill = c_fill
         self.new_database()
