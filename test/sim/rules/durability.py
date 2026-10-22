@@ -7,7 +7,7 @@ import shutil
 
 import hypothesis.strategies as st
 from hypothesis.stateful import precondition, rule
-from model import Model
+from model import CK2_FP, CK_FP, C_FP, KNOWS_FP, PERSON_FP, Model, knows_fp, person_fp
 from session import ONE_THREAD, Session, copy_c, diff, enabled, gated
 from strategies import BULK_ID_START, C_ROWS_CAP, CSR_ROWS, HUBS, small_ids
 
@@ -25,14 +25,14 @@ SYSCALLS = {
 }
 gated(*(f"crash_{op}" for op in CRASH_OPS), "race_checkpoint", "race_edges", "art_copy")
 
-# The committed state a racing reader sees (see engine.read_state and race_state). Races write
-# ages between -100 and 100; other ages are left out of the sum so that it cannot overflow.
+# The committed state a racing reader sees (see engine.read_state and race_state): counts that
+# fast paths answer, and row fingerprints that scans answer.
 STATE_QUERIES = [
-    "MATCH (p:Person) RETURN count(*), sum(p.id), count(p.age), "
-    "sum(CASE WHEN p.age >= -100 AND p.age <= 100 THEN p.age ELSE 0 END)",
+    f"MATCH (p:Person) RETURN count(*), sum(p.id), count(p.age), sum({PERSON_FP})",
     "MATCH (:Person)-[k:Knows]->(:Person) RETURN count(*)",
     # Answered from rel degrees, which read the CSR index that committing edges change.
     "MATCH (a:Person)-[:Knows]->(:Person) RETURN count(DISTINCT a.id)",
+    f"MATCH (a:Person)-[k:Knows]->(b:Person) RETURN count(*), sum({KNOWS_FP})",
 ]
 # What a reader racing race_bulk sees of CK. The filtered count is a scan, planned from CK's
 # degree statistics.
@@ -42,27 +42,31 @@ CK_STATE_QUERIES = [
     "MATCH (a:C)-[k:CK]->(b:C) WHERE b.id >= 0 RETURN count(*)",
     # CK2 is not written in the race; its sources are all in C's first node group.
     "MATCH ()-[k:CK2]->() RETURN count(*)",
+    f"MATCH (a:C)-[:CK]->(b:C) RETURN count(*), sum({CK_FP})",
+    f"MATCH (a:C)-[k:CK2]->(b:C) RETURN count(*), sum({CK2_FP})",
 ]
 
 
 def race_state(model: Model) -> tuple:
     """What engine.read_state returns for STATE_QUERIES."""
-    ages = [p["age"] for p in model.persons.values() if p["age"] is not None]
-    small = sum(a for a in ages if -100 <= a <= 100)
-    persons = (len(model.persons), sum(model.persons) if model.persons else None, len(ages))
+    people = model.persons
+    ages = sum(p["age"] is not None for p in people.values())
+    fingerprint = sum(person_fp(id, p) for id, p in people.items()) if people else None
+    persons = (len(people), sum(people) if people else None, ages, fingerprint)
     sources = len({src for src, _, _ in model.knows})
-    return (
-        (persons + ((small if model.persons else None),),),
-        ((sum(model.knows.values()),),),
-        ((sources,),),
-    )
+    edges = sum(model.knows.values())
+    knows = sum(n * knows_fp(*key) for key, n in model.knows.items()) if edges else None
+    return (persons,), ((edges,),), ((sources,),), ((edges, knows),)
 
 
 def ck_state(model: Model) -> tuple:
     """What engine.read_state returns for CK_STATE_QUERIES."""
-    edges = sum(model.ck.values())
+    edges, edges2 = sum(model.ck.values()), sum(model.ck2.values())
     sources = len({src for src, _ in model.ck})
-    return ((edges,),), ((sources,),), ((edges,),), ((sum(model.ck2.values()),),)
+    fp = sum(n * (s * 200003 + d) for (s, d), n in model.ck.items()) if edges else None
+    fp2 = sum(n * (s * 200003 + d + w * 7) for (s, d, w), n in model.ck2.items())
+    fp2 = fp2 if edges2 else None
+    return ((edges,),), ((sources,),), ((edges,),), ((edges2,),), ((edges, fp),), ((edges2, fp2),)
 
 
 def bulk_edges(start: int, count: int, step: int) -> list[tuple[int, int]]:
@@ -146,13 +150,13 @@ class DurabilityRules(Session):
         """Person's rows, and C's row count and CK's edge count: in the engine, or in `model`."""
         if model is not None:
             persons = model.person_rows()
-            big = (model.big.count(), sum(model.ck.values())) if self.has_csr() else ()
-            return persons, big
+            big = (model.big.count(), model.big.fingerprint(), sum(model.ck.values()))
+            return persons, big if self.has_csr() else ()
         big = ()
         if self.has_csr():
-            [(rows,)] = self.rows("MATCH (c:C) RETURN count(*)")
+            [(rows, fingerprint)] = self.rows(f"MATCH (c:C) RETURN count(*), sum({C_FP})")
             [(edges,)] = self.rows("MATCH ()-[k:CK]->() RETURN count(*)")
-            big = (rows, edges)
+            big = (rows, fingerprint, edges)
         return self.person_rows(), big
 
     def check_crash(self, op: str, after: Model) -> None:

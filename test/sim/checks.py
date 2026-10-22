@@ -8,7 +8,7 @@ from contextlib import contextmanager
 
 import hypothesis.strategies as st
 from hypothesis.stateful import invariant, precondition, rule
-from model import Model, two_hops, walk_ends
+from model import C_FP, Model, two_hops, walk_ends
 from session import Session, diff, gated
 from strategies import (
     CK2_SEED_SOURCE,
@@ -78,8 +78,10 @@ class Checks(Session):
             assert actual == self.model.ck, diff(actual, self.model.ck)
             actual = Counter(self.rows("MATCH (a:C)-[k:CK2]->(b:C) RETURN a.id, b.id, k.w"))
             assert actual == self.model.ck2, diff(actual, self.model.ck2)
-            rows = self.rows("MATCH (c:C) RETURN count(*)")
-            assert rows == [(self.model.big.count(),)], (rows, self.model.big.count())
+            rows = self.rows(f"MATCH (c:C) RETURN count(*), sum({C_FP})")
+            big = self.model.big
+            expected = [(big.count(), big.fingerprint())]
+            assert rows == expected, (rows, expected)
         for i, values in self.model.tables.items():
             # SERIAL ids must be unique; values are compared as a multiset.
             rows = self.rows(f"MATCH (t:T{i}) RETURN t.id, t.v")

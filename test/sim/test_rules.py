@@ -48,7 +48,7 @@ def test_race_edges_join_existing_persons_and_update_the_model() -> None:
     ops = [("knows", 1, 3), ("knows", 9, 0), ("unknows", 1, 1)]
     writes, states = DurabilityRules.race_writes(rules, model, ops)
     assert [params for _, params in writes] == [dict(a=1, b=2, s=3), dict(a=1, b=2)]
-    edges_and_sources = [state[1:] for state in states]
+    edges_and_sources = [state[1:3] for state in states]
     assert edges_and_sources == [(((2,),), ((1,),)), (((3,),), ((1,),)), (((0,),), ((0,),))]
     assert not model.knows
 

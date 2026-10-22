@@ -34,6 +34,40 @@ class Doc(NamedTuple):
         return " ".join(self.words) if self.words else None
 
 
+# Row fingerprints: a reader sums one number per row, mixed from its columns, so that a wrong row
+# changes the sum where counts match. Values are taken modulo FP_MOD first, so that no product
+# leaves INT64; each Cypher expression below computes what its Python twin does.
+FP_MOD = 1_000_000_007
+PERSON_FP = (
+    f"(p.id % {FP_MOD}) * 1009 + coalesce(p.age % {FP_MOD}, {FP_MOD + 1}) * 7919 "
+    "+ coalesce(size(p.name), -1) * 104729 + CASE WHEN p.score IS NULL THEN 1 ELSE 0 END"
+)
+KNOWS_FP = f"(a.id % {FP_MOD}) * 1009 + (b.id % {FP_MOD}) * 7919 + coalesce(k.since % {FP_MOD}, -1)"
+C_FP = f"c.id * 1009 + coalesce(c.v % {FP_MOD}, {FP_MOD + 1})"
+CK_FP = "a.id * 200003 + b.id"
+CK2_FP = "a.id * 200003 + b.id + k.w * 7"
+
+
+def tmod(a: int, m: int = FP_MOD) -> int:
+    """a % m as the engine computes it: with the sign of a."""
+    r = abs(a) % m
+    return -r if a < 0 else r
+
+
+def person_fp(id: int, p: dict) -> int:
+    age = tmod(p["age"]) if p["age"] is not None else FP_MOD + 1
+    name = len(p["name"]) if p["name"] is not None else -1
+    return tmod(id) * 1009 + age * 7919 + name * 104729 + (p["score"] is None)
+
+
+def knows_fp(src: int, dst: int, since) -> int:
+    return tmod(src) * 1009 + tmod(dst) * 7919 + (tmod(since) if since is not None else -1)
+
+
+def c_fp(id: int, v) -> int:
+    return id * 1009 + (tmod(v) if v is not None else FP_MOD + 1)
+
+
 def filler(id: int) -> int:
     """C.v of a row that no update has changed."""
     return id % 1000
@@ -63,6 +97,20 @@ class Big:
 
     def changed(self) -> set:
         return self.deleted | self.updated.keys()
+
+    def fingerprint(self) -> int | None:
+        """The sum of C_FP over C's rows."""
+        if not self.count():
+            return None
+        full, rest = divmod(self.rows, 1000)
+        total = 1009 * self.rows * (self.rows - 1) // 2
+        total += full * (999 * 1000 // 2) + rest * (rest - 1) // 2
+        for id in self.changed():
+            if id < self.rows:
+                total -= c_fp(id, filler(id))
+                if id not in self.deleted:
+                    total += c_fp(id, self.updated[id])
+        return total
 
     def updated_values(self) -> list:
         return [v for id, v in self.updated.items() if id not in self.deleted and v is not None]

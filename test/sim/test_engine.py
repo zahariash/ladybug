@@ -22,7 +22,7 @@ from engine import (
     scratch_root,
     wrapper_executable,
 )
-from model import Model
+from model import Model, knows_fp, person_fp
 from rules.durability import (
     CK_STATE_QUERIES,
     STATE_QUERIES,
@@ -79,7 +79,10 @@ def test_race_state_has_the_shape_read_state_returns() -> None:
     model.knows[(1, 2, 0)] += 2
     model.knows[(1, 3, 7)] += 1
     model.knows[(3, 1, 0)] += 1
-    answers = {STATE_QUERIES[0]: [[3, 6, 2, 5]], STATE_QUERIES[1]: [[4]], STATE_QUERIES[2]: [[2]]}
+    people = sum(person_fp(id, p) for id, p in model.persons.items())
+    knows = 2 * knows_fp(1, 2, 0) + knows_fp(1, 3, 7) + knows_fp(3, 1, 0)
+    answers = {STATE_QUERIES[0]: [[3, 6, 2, people]], STATE_QUERIES[1]: [[4]]}
+    answers |= {STATE_QUERIES[2]: [[2]], STATE_QUERIES[3]: [[4, knows]]}
     assert race_state(model) == read_state(FakeConnection(answers), STATE_QUERIES)
 
 
@@ -88,6 +91,7 @@ def test_race_state_of_an_empty_model() -> None:
         STATE_QUERIES[0]: [[0, None, 0, None]],
         STATE_QUERIES[1]: [[0]],
         STATE_QUERIES[2]: [[0]],
+        STATE_QUERIES[3]: [[0, None]],
     }
     assert race_state(Model()) == read_state(FakeConnection(answers), STATE_QUERIES)
 
@@ -98,6 +102,8 @@ def test_ck_state_counts_edges_and_their_sources() -> None:
     model.ck2[(1, 131072, 0)] += 1
     answers = {CK_STATE_QUERIES[0]: [[3]], CK_STATE_QUERIES[1]: [[2]], CK_STATE_QUERIES[2]: [[3]]}
     answers[CK_STATE_QUERIES[3]] = [[1]]
+    answers[CK_STATE_QUERIES[4]] = [[3, 2 * 5 + 131072 * 200003 + 1]]
+    answers[CK_STATE_QUERIES[5]] = [[1, 200003 + 131072]]
     assert ck_state(model) == read_state(FakeConnection(answers), CK_STATE_QUERIES)
 
 
