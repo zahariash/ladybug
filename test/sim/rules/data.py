@@ -12,6 +12,7 @@ from engine import EngineError
 from session import DUPLICATE_KEY, Session, enabled
 from strategies import (
     VECTOR_CAPACITY,
+    ck_src_ids,
     clusters,
     csr_ids,
     csr_src_ids,
@@ -199,7 +200,7 @@ class DataRules(Session):
         self.model.partitioned = {(i, c) for i, c in self.model.partitioned if i != id}
 
     @enabled("csr")
-    @rule(src=csr_ids, dst=csr_ids)
+    @rule(src=ck_src_ids, dst=csr_ids)
     def insert_ck(self, src, dst):
         self.ok(
             "MATCH (a:C {id: $a}), (b:C {id: $b}) CREATE (a)-[:CK]->(b)", dict(a=src, b=dst)
@@ -222,7 +223,7 @@ class DataRules(Session):
 
     @enabled("csr")
     @precondition(lambda self: self.checkpoint_keeps_snapshots())
-    @rule(edges=st.lists(st.tuples(csr_ids, csr_ids), min_size=1, max_size=300))
+    @rule(edges=st.lists(st.tuples(ck_src_ids, csr_ids), min_size=1, max_size=300))
     def copy_ck(self, edges):
         """A COPY into an empty CK, or into node groups that already hold edges."""
         edges = [(s, d) for s, d in edges if self.model.big.exists(s) and self.model.big.exists(d)]

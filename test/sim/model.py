@@ -73,6 +73,41 @@ def filler(id: int) -> int:
     return id % 1000
 
 
+# C.s of a row that no update has changed: NULL, a string stored inline (8 bytes) or one past
+# the 12 bytes strings keep inline (25 bytes). Ids are offset to 7 digits, so that strings of one
+# length sort as their ids do. TEXT_QUERY computes it in Cypher for the id {i}.
+SHORT, LONG = 8, 25
+
+
+def filler_text(id: int) -> str | None:
+    if id % 11 == 0:
+        return None
+    if id % 7 == 0:
+        return f"long-{1_000_000 + id}-xxxxxxxxxxxx"
+    return f"s{1_000_000 + id}"
+
+
+TEXT_QUERY = (
+    "CASE WHEN {i} % 11 = 0 THEN NULL "
+    "WHEN {i} % 7 = 0 THEN concat('long-', CAST(1000000 + {i} AS STRING), '-xxxxxxxxxxxx') "
+    "ELSE concat('s', CAST(1000000 + {i} AS STRING)) END"
+)
+
+
+def text_query(i: str) -> str:
+    return TEXT_QUERY.format(i=i)
+
+
+def cs_key(i: int) -> str:
+    """CS's key for id i: 13 to 40 bytes."""
+    return f"key-{1_000_000 + i}-x" + "x" * (i % 28)
+
+
+def cs_key_query(i: str) -> str:
+    xs = "x" * 27
+    return f"concat('key-', CAST(1000000 + {i} AS STRING), '-x', substring('{xs}', 1, {i} % 28))"
+
+
 @dataclass
 class Big:
     """C: ids 0..rows-1 at the offsets of their ids, v = filler(id), less deleted ids and with
@@ -82,15 +117,35 @@ class Big:
     rows: int = 0
     deleted: set = field(default_factory=set)
     updated: dict = field(default_factory=dict)  # id -> v, None for NULL
+    texts: dict = field(default_factory=dict)  # id -> s, None for NULL
+    columns: dict = field(default_factory=dict)  # added columns -> their defaults, in table order
 
     def copy(self) -> Big:
-        return Big(self.rows, set(self.deleted), dict(self.updated))
+        return Big(
+            self.rows, set(self.deleted), dict(self.updated), dict(self.texts), dict(self.columns)
+        )
 
     def exists(self, id: int) -> bool:
         return 0 <= id < self.rows and id not in self.deleted
 
     def value(self, id: int):
         return self.updated[id] if id in self.updated else filler(id)
+
+    def text(self, id: int) -> str | None:
+        return self.texts[id] if id in self.texts else filler_text(id)
+
+    def row(self, id: int) -> tuple:
+        """id, v, s and the added columns."""
+        return (id, self.value(id), self.text(id), *self.columns.values())
+
+    def changed_rows(self) -> list[tuple]:
+        """(id, v, s) of the rows whose v or s is not the formula's."""
+        ids = sorted(id for id in self.updated.keys() | self.texts.keys() if self.exists(id))
+        return [
+            (id, self.value(id), self.text(id))
+            for id in ids
+            if (self.value(id), self.text(id)) != (filler(id), filler_text(id))
+        ]
 
     def count(self) -> int:
         return self.rows - len(self.deleted)
@@ -135,6 +190,34 @@ class Big:
         values += [v for v in (low, high) if v is not None]
         return (min(values), max(values)) if values else (None, None)
 
+    def text_count_size(self) -> tuple[int, int]:
+        """count(c.s) and sum(size(c.s))."""
+        nulls = -(-self.rows // 11)
+        longs = -(-self.rows // 7) - -(-self.rows // 77)
+        count, size = self.rows - nulls, (self.rows - nulls - longs) * SHORT + longs * LONG
+        for id in self.deleted | self.texts.keys():
+            if id < self.rows and (text := filler_text(id)) is not None:
+                count, size = count - 1, size - len(text)
+        for id, text in self.texts.items():
+            if id not in self.deleted and text is not None:
+                count, size = count + 1, size + len(text)
+        return count, size
+
+    def text_min_max(self) -> tuple:
+        """min(c.s) and max(c.s): long strings sort before short ones, and each by id, so the
+        formula's extremes are the first and last unchanged id of each kind."""
+        changed = self.deleted | self.texts.keys()
+
+        def first(ids, long):
+            kind = (lambda id: id % 7 == 0) if long else (lambda id: id % 7 != 0)
+            return next((id for id in ids if id % 11 and kind(id) and id not in changed), None)
+
+        orders = (range(self.rows), range(self.rows - 1, -1, -1))
+        ends = [first(order, long) for order in orders for long in (True, False)]
+        values = [filler_text(id) for id in ends if id is not None]
+        values += [t for id, t in self.texts.items() if id not in self.deleted and t is not None]
+        return (min(values), max(values)) if values else (None, None)
+
     def top(self, k: int) -> list[tuple[int, int]]:
         """(id, v) of the k rows with a value, as ORDER BY v DESC, id LIMIT k returns them."""
         changed = self.changed()
@@ -149,6 +232,39 @@ class Big:
             (-v, id) for id, v in self.updated.items() if id not in self.deleted and v is not None
         )
         return [(id, -nv) for nv, id in itertools.islice(heapq.merge(updated, unchanged()), k)]
+
+
+@dataclass
+class Keys:
+    """CS: the key cs_key(id) with n = id for ids 0..rows-1, less deleted ids, and the rows CREATE
+    inserted, by id: ids at CS_FAR, and deleted ids again."""
+
+    rows: int = 0
+    deleted: set = field(default_factory=set)
+    created: dict = field(default_factory=dict)  # id -> n
+
+    def copy(self) -> Keys:
+        return Keys(self.rows, set(self.deleted), dict(self.created))
+
+    def n(self, id: int) -> int | None:
+        """The row's n, or None if there is no row with the key."""
+        if id in self.created:
+            return self.created[id]
+        return id if id < self.rows and id not in self.deleted else None
+
+    def delete(self, id: int) -> None:
+        self.created.pop(id, None)
+        if id < self.rows:
+            self.deleted.add(id)
+
+    def count(self) -> int:
+        return self.rows - len(self.deleted) + len(self.created)
+
+    def total(self) -> int | None:
+        """sum(c.n)."""
+        if not self.count():
+            return None
+        return self.rows * (self.rows - 1) // 2 - sum(self.deleted) + sum(self.created.values())
 
 
 @dataclass
@@ -167,6 +283,7 @@ class Model:
     ck: Counter = field(default_factory=Counter)  # (src, dst) -> count of CK edges
     ck2: Counter = field(default_factory=Counter)  # (src, dst, w) -> count of CK2 edges
     big: Big = field(default_factory=Big)  # C's rows
+    keys: Keys = field(default_factory=Keys)  # CS's rows
     pk_index: str | None = "_PK"  # the name of Person's primary-key index, if any
     age_index: str | None = None  # the name of the ART index on Person.age, if any
     dropped_columns: set = field(default_factory=set)  # Person columns dropped at some point
@@ -250,6 +367,7 @@ class Model:
             ck=Counter(self.ck),
             ck2=Counter(self.ck2),
             big=self.big.copy(),
+            keys=self.keys.copy(),
             dropped_columns=set(self.dropped_columns),
             wrote=False,
         )
@@ -264,6 +382,7 @@ class Model:
         """DETACH DELETE of a C row: it and its CK and CK2 edges go."""
         self.big.deleted.add(id)
         self.big.updated.pop(id, None)
+        self.big.texts.pop(id, None)
         for key in [k for k in self.ck if id in k]:
             del self.ck[key]
         for key in [k for k in self.ck2 if id in k[:2]]:

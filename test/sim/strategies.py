@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import hypothesis.strategies as st
 
 INT64_MIN, INT64_MAX = -(2**63), 2**63 - 1
@@ -25,12 +27,16 @@ table_ids = st.integers(0, 2)
 EXTRA_COLUMNS = ["c0", "c1", "c2"]
 extra_columns = st.sampled_from(EXTRA_COLUMNS)
 clusters = st.integers(1, 3)
-# C, the node table declared CSR, holds ids 0..CSR_ROWS-1 at the offsets of their ids: a full node
-# group (2^17 rows, the default build) and a second one that ends past a vector. Edges join the
-# first 40 ids of each group and ids at the size boundaries in each group (CSR leaf regions of
-# 1024 lists, vectors of 2048 rows, 32768-row INT64 segments, the group's last rows).
-CSR_SECOND_GROUP = 2**17
-CSR_ROWS = CSR_SECOND_GROUP + VECTOR_CAPACITY + 40
+# C, the node table declared CSR, holds ids 0..CSR_ROWS-1 at the offsets of their ids: SIM_C_GROUPS
+# node groups (2 by default, 2^17 rows each in the default build), the last of which ends past a
+# vector. Edges join the first 40 ids of each group and ids at the size boundaries in each group
+# (CSR leaf regions of 1024 lists, vectors of 2048 rows, 32768-row INT64 segments, the group's
+# last rows).
+C_GROUPS = int(os.environ.get("SIM_C_GROUPS", "2"))
+NODE_GROUP = 2**17
+CSR_LAST_GROUP = (C_GROUPS - 1) * NODE_GROUP
+CSR_ROWS = CSR_LAST_GROUP + VECTOR_CAPACITY + 40
+GROUP_STARTS = list(range(0, CSR_ROWS, NODE_GROUP))
 BOUNDARY_OFFSETS = [1022, 1023, 1024, 1025, 2046, 2047, 2048, 2049, 4095, 4096]
 BOUNDARY_OFFSETS += [32766, 32767, 32768, 32769, 65534, 65535, 65536, 65537]
 
@@ -38,55 +44,71 @@ BOUNDARY_OFFSETS += [32766, 32767, 32768, 32769, 65534, 65535, 65536, 65537]
 def csr_bands(rows: int = CSR_ROWS) -> list[list[int]]:
     """The C ids the rules draw, by node group: the first 40 and the boundary ids."""
     bands = []
-    for start in range(0, rows, CSR_SECOND_GROUP):
-        size = min(CSR_SECOND_GROUP, rows - start)
+    for start in range(0, rows, NODE_GROUP):
+        size = min(NODE_GROUP, rows - start)
         offsets = set(range(40)) | set(BOUNDARY_OFFSETS) | set(range(size - 4, size))
         bands.append([start + i for i in sorted(offsets) if i < size])
     return bands
 
 
-CSR_BANDS = csr_bands()
-CSR_BOUNDARY_IDS = [id for band in CSR_BANDS for id in band if id % CSR_SECOND_GROUP >= 40]
-csr_ids = st.one_of(
-    st.integers(0, 39),
-    st.integers(CSR_SECOND_GROUP, CSR_SECOND_GROUP + 39),
-    st.sampled_from(CSR_BOUNDARY_IDS),
-)
-# CK2's sources lie in the first node group only, so that its rel table lacks the second.
-csr_src_ids = st.one_of(
-    st.integers(0, 39), st.sampled_from([id for id in CSR_BOUNDARY_IDS if id < CSR_SECOND_GROUP])
-)
+def band_ids(groups: list[int]) -> st.SearchStrategy:
+    """A C id in the bands of `groups`."""
+    boundary = [id for g in groups for id in CSR_BANDS[g] if id % NODE_GROUP >= 40]
+    firsts = [st.integers(GROUP_STARTS[g], GROUP_STARTS[g] + 39) for g in groups]
+    return st.one_of(*firsts, st.sampled_from(boundary))
 
-# CK2's edges in every new database: node 1 reaches 17, 18 and a node of the second group, with two
-# more levels below 17 and 18, and 11 reaches 12 and 13. Variable-length matches from 1 and
-# two-hop matches over 1 and 11 then read first-group nodes after the second-group one.
-CK2_SEED = [(1, 17), (1, CSR_SECOND_GROUP + 8), (1, 18), (17, 5), (18, 6), (5, 7), (6, 8)]
-CK2_SEED += [(11, 12), (12, 13)]
+
+CSR_BANDS = csr_bands()
+csr_ids = band_ids(list(range(C_GROUPS)))
+# CK's sources lie in the first and the last node group, so that with three groups CK's middle
+# node group exists and is empty; CK2's lie in the first only, so that its rel table lacks the rest.
+ck_src_ids = band_ids([0, C_GROUPS - 1])
+csr_src_ids = band_ids([0])
+
+# CK2's edges in every new database: node 1 reaches 17, 18 and a node of each later group, with
+# two more levels below 17 and 18, and 11 reaches 12 and 13. Variable-length matches from 1 and
+# two-hop matches over 1 and 11 then read first-group nodes after later-group ones.
+CK2_SEED = [(1, 17)] + [(1, start + 8) for start in GROUP_STARTS[1:]] + [(1, 18)]
+CK2_SEED += [(17, 5), (18, 6), (5, 7), (6, 8), (11, 12), (12, 13)]
 CK2_SEED_SOURCE = 1
-# Hubs, one per node group, take CK edges to leaves, ids that no band holds, so that their CSR
-# lists span several vectors without adding two-hop walks. A degree around 1024 also moves the
-# planner's lookup-join cut-off.
-HUBS = [7, CSR_SECOND_GROUP + 7]
+# Hubs, in the first and the last node group, take CK edges to leaves, ids that no band holds, so
+# that their CSR lists span several vectors without adding two-hop walks. A degree around 1024
+# also moves the planner's lookup-join cut-off.
+HUBS = [7, CSR_LAST_GROUP + 7]
 HUB_DEGREES = [1023, 1024, 1025, 2047, 2048, 2049, 4097]
 LEAF_START = 60_000
-# Appends to C stop here, so that C stays near two node groups.
+# Appends to C stop here, so that C stays near its node groups.
 C_ROWS_CAP = CSR_ROWS + 50_000
 # C.v values an update writes: around the formula's range, and ones whose width no longer fits a
 # segment compressed for 0..999.
 c_values = st.one_of(
     st.integers(-5, 1005), st.sampled_from([INT64_MAX, INT64_MIN, -1, 999, 1000]), st.none()
 )
+# C.s values an update writes: empty, inline (up to 12 bytes) and longer strings, and NULL.
+c_texts = st.one_of(
+    st.none(),
+    st.sampled_from(["", "s", "s1000000", "x" * 12, "x" * 13]),
+    st.text("az09-", max_size=40),
+)
 
 
 def csr_id(i: int) -> int:
-    """A C id for a small id: in the first node group for even ones, the second for odd ones."""
-    return i % 40 if i % 2 == 0 else CSR_SECOND_GROUP + i % 40
+    """A C id for a small id, in each node group in turn."""
+    return GROUP_STARTS[i % C_GROUPS] + i % 40
 
 
 def csr_src_id(i: int) -> int:
     """A first-group C id for a small id, a boundary id for every third."""
     first = [id for id in CSR_BANDS[0] if id >= 40]
     return first[i % len(first)] if i % 3 == 2 else i % 40
+
+
+# CS, a node table with a string primary key of 13 to 40 bytes, past the 12 that strings keep
+# inline, holds the keys of ids 0..rows-1 after a COPY of CS_ROWS; CREATE adds ids at CS_FAR.
+CS_ROWS = 20_000
+CS_FAR = 1_000_000
+CS_ROWS_CAP = CS_ROWS + 20_000
+cs_ids = st.one_of(st.integers(0, CS_ROWS - 1), st.integers(CS_FAR, CS_FAR + 40))
 
 ints = st.one_of(
     st.none(),

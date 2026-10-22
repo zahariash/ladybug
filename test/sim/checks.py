@@ -8,7 +8,7 @@ from contextlib import contextmanager
 
 import hypothesis.strategies as st
 from hypothesis.stateful import invariant, precondition, rule
-from model import C_FP, Model, two_hops, walk_ends
+from model import C_FP, Model, cs_key, filler, text_query, two_hops, walk_ends
 from session import Session, diff, gated
 from strategies import (
     CK2_SEED_SOURCE,
@@ -44,12 +44,13 @@ gated(
     "big_aggregates",
     "big_rows",
     "big_order",
+    "big_changes",
 )
 
 
 def band_sample(seed: int) -> list[int]:
-    """Twelve C ids from both node groups' bands, in an order that is not the offsets'."""
-    return random.Random(seed).sample(CSR_BANDS[0] + CSR_BANDS[-1], 12)
+    """Twelve C ids from every node group's bands, in an order that is not the offsets'."""
+    return random.Random(seed).sample([id for band in CSR_BANDS for id in band], 12)
 
 
 class Checks(Session):
@@ -82,6 +83,10 @@ class Checks(Session):
             big = self.model.big
             expected = [(big.count(), big.fingerprint())]
             assert rows == expected, (rows, expected)
+        if self.has_string_keys():
+            rows = self.rows("MATCH (c:CS) RETURN count(*), sum(c.n)")
+            expected = [(self.model.keys.count(), self.model.keys.total())]
+            assert rows == expected, (rows, expected)
         for i, values in self.model.tables.items():
             # SERIAL ids must be unique; values are compared as a multiset.
             rows = self.rows(f"MATCH (t:T{i}) RETURN t.id, t.v")
@@ -107,9 +112,14 @@ class Checks(Session):
             expected.add("L")
         if self.has_csr():
             expected |= {"C", "CK", "CK2"}
+        if self.has_string_keys():
+            expected.add("CS")
         if self.options.loaded:
             expected.add("Doc")
         assert tables == expected, tables
+        if self.has_csr():
+            columns = [name for (name,) in self.rows("CALL table_info('C') RETURN name")]
+            assert columns == ["id", "v", "s", *self.model.big.columns], columns
         self.check_macros()
         indexes = self.rows("CALL show_indexes() RETURN table_name, index_name")
         person = {name for table, name in indexes if table == "Person"}
@@ -441,8 +451,10 @@ class Checks(Session):
 
     def check_big(self, view: Model, check, id: int) -> None:
         """C's rows past its size boundaries: aggregates over every row, rows at shuffled band
-        ids and at the end of the table, the top of an ORDER BY, and a hub's edges."""
+        ids and at the end of the table, the rows no longer as the formula has them, the top of
+        an ORDER BY, columns added to C, and a hub's edges."""
         skipped, big = self.options.skipped, view.big
+        strings = "big_strings" not in skipped
         if "big_aggregates" not in skipped:
             nulls = sum(v is None for i, v in big.updated.items() if i not in big.deleted)
             low, high = big.min_max()
@@ -452,13 +464,36 @@ class Checks(Session):
             else:  # the sum would overflow INT64
                 query = "MATCH (c:C) RETURN count(*), count(c.v), min(c.v), max(c.v)"
                 check(query, {}, [(big.count(), big.count() - nulls, low, high)])
+            if strings:
+                count, size = big.text_count_size()
+                query = "MATCH (c:C) RETURN count(c.s), sum(size(c.s)), min(c.s), max(c.s)"
+                check(query, {}, [(count, size if count else None, *big.text_min_max())])
         ids = list(dict.fromkeys(band_sample(id) + [big.rows - 1, big.rows - VECTOR_CAPACITY - 1]))
         if "big_rows" not in skipped:
-            query = f"MATCH (c:C) WHERE c.id IN {ids} RETURN c.id, c.v"
-            check(query, {}, [(i, big.value(i)) for i in ids if big.exists(i)])
+            names = ["id", "v", "s", *big.columns] if strings else ["id", "v", *big.columns]
+            columns = ", ".join(f"c.{name}" for name in names)
+
+            def row(i):
+                return big.row(i) if strings else big.row(i)[:2] + big.row(i)[3:]
+
+            query = f"MATCH (c:C) WHERE c.id IN {ids} RETURN {columns}"
+            check(query, {}, [row(i) for i in ids if big.exists(i)])
             gone = next((i for i in ids if not big.exists(i)), ids[0])
-            query = f"MATCH (c:C {{id: {gone}}}) RETURN c.id, c.v"
-            check(query, {}, [(gone, big.value(gone))] if big.exists(gone) else [])
+            query = f"MATCH (c:C {{id: {gone}}}) RETURN {columns}"
+            check(query, {}, [row(gone)] if big.exists(gone) else [])
+        if "big_changes" not in skipped:
+            changed = "coalesce(c.v, -1) <> c.id % 1000"
+            if strings:
+                text = text_query("c.id")
+                changed += f" OR coalesce(c.s, '<null>') <> coalesce({text}, '<null>')"
+                check(f"MATCH (c:C) WHERE {changed} RETURN c.id, c.v, c.s", {}, big.changed_rows())
+            else:
+                rows = [(i, v) for i, v, _ in big.changed_rows() if v != filler(i)]
+                check(f"MATCH (c:C) WHERE {changed} RETURN c.id, c.v", {}, rows)
+        if "big_ddl" not in skipped:
+            for column, default in big.columns.items():
+                query = f"MATCH (c:C) WHERE c.{column} = {default} RETURN count(*)"
+                check(query, {}, [(big.count(),)])
         if "big_order" not in skipped:
             k = (1, 5, VECTOR_CAPACITY + 1)[id % 3]
             query = (
@@ -474,6 +509,21 @@ class Checks(Session):
             if "lookup_join" not in skipped:
                 query = f"MATCH (a:C)-[:CK]->(b:C) WHERE a.id = {hub} MATCH (b) RETURN b.id, b.v"
                 check(query, {}, [(d, big.value(d)) for d in leaves])
+
+    def check_keys(self, view: Model, check, id: int) -> None:
+        """CS's string keys through the primary-key index: a sample over the whole table with
+        the keys CREATE added or DELETE removed, one key alone, and the rows' aggregates."""
+        keys = view.keys
+        sample = random.Random(id).sample(range(keys.rows), min(12, keys.rows))
+        ids = list(dict.fromkeys(sample + sorted(keys.created)[:4] + sorted(keys.deleted)[:4]))
+        query = "MATCH (c:CS) WHERE c.id IN $keys RETURN c.id, c.n"
+        expected = [(cs_key(i), keys.n(i)) for i in ids if keys.n(i) is not None]
+        check(query, dict(keys=[cs_key(i) for i in ids]), expected)
+        one = ids[id % len(ids)]
+        n = keys.n(one)
+        query = "MATCH (c:CS {id: $k}) RETURN c.n"
+        check(query, dict(k=cs_key(one)), [(n,)] if n is not None else [])
+        check("MATCH (c:CS) RETURN count(*), sum(c.n)", {}, [(keys.count(), keys.total())])
 
     def check_hops(self, view: Model, check, conn: int, id: int, alone: bool) -> None:
         """Paths over CK2, whose sources all lie in C's first node group so that its rel table
@@ -667,6 +717,8 @@ class Checks(Session):
             self.check_csr_counts(view, check, conn, csr_id(id), alone)
             self.check_hops(view, check, conn, id, alone)
             self.check_big(view, check, id)
+        if self.has_string_keys():
+            self.check_keys(view, check, id)
         for column, default in view.columns.items():
             if column.startswith("c"):
                 check(

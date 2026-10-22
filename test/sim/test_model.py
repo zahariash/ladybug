@@ -6,8 +6,19 @@ import math
 import random
 from collections import Counter
 
-from model import Big, Doc, Model, canonical, filler, two_hops, walk_ends
-from strategies import BULK_ID_START, CSR_BANDS, CSR_ROWS, CSR_SECOND_GROUP
+from model import (
+    Big,
+    Doc,
+    Keys,
+    Model,
+    canonical,
+    cs_key,
+    filler,
+    filler_text,
+    two_hops,
+    walk_ends,
+)
+from strategies import BULK_ID_START, CS_FAR, NODE_GROUP, csr_bands
 
 
 def model_with(persons: dict, knows: dict | None = None) -> Model:
@@ -148,10 +159,13 @@ def test_fork_copies_ck2_and_pairs_ignore_w() -> None:
 
 
 def test_csr_bands_stay_inside_c() -> None:
-    first, second = CSR_BANDS
-    assert first[:40] == list(range(40)) and CSR_SECOND_GROUP - 1 in first
-    assert second[-1] == CSR_ROWS - 1 and CSR_SECOND_GROUP + 2049 in second
-    assert CSR_SECOND_GROUP + 4095 not in second
+    for groups in (2, 3):
+        last = (groups - 1) * NODE_GROUP
+        bands = csr_bands(last + 2088)
+        assert len(bands) == groups
+        assert bands[0][:40] == list(range(40)) and NODE_GROUP - 1 in bands[0]
+        assert bands[-1][-1] == last + 2087 and last + 2049 in bands[-1]
+        assert last + 4095 not in bands[-1]
 
 
 def test_big_aggregates_and_top_match_the_rows() -> None:
@@ -174,12 +188,61 @@ def test_big_aggregates_and_top_match_the_rows() -> None:
             assert big.top(k) == ranked[:k]
 
 
+def test_big_strings_match_the_rows() -> None:
+    rng = random.Random(11)
+    for rows in (0, 1, 77, 1000, 2500, 2503, 133160):
+        big = Big(rows)
+        for id in rng.sample(range(rows), min(rows, 60)):
+            r = rng.random()
+            if r < 0.3:
+                big.deleted.add(id)
+            elif r < 0.7:
+                big.texts[id] = rng.choice([None, "", "a", "zzz", "x" * 13, filler_text(id)])
+            else:
+                big.updated[id] = rng.choice([None, filler(id), 5])
+        table = {id: (big.value(id), big.text(id)) for id in range(rows) if id not in big.deleted}
+        texts = [t for _, t in table.values() if t is not None]
+        assert big.text_count_size() == (len(texts), sum(map(len, texts)))
+        assert big.text_min_max() == ((min(texts), max(texts)) if texts else (None, None))
+        changed = [
+            (id, v, t)
+            for id, (v, t) in sorted(table.items())
+            if (v, t) != (filler(id), filler_text(id))
+        ]
+        assert big.changed_rows() == changed
+
+
+def test_formula_strings_sort_by_kind_then_id() -> None:
+    texts = [filler_text(id) for id in range(3000)]
+    assert texts[0] is None and len(texts[7]) == 25 and len(texts[1]) == 8
+    longs = [t for t in texts if t and t.startswith("long")]
+    assert sorted(longs) == longs and max(longs) < min(t for t in texts if t and t[0] == "s")
+    assert {len(cs_key(i)) for i in range(28)} == set(range(13, 41))
+
+
+def test_keys_match_a_table_of_rows() -> None:
+    rng = random.Random(5)
+    keys, table = Keys(50), {i: i for i in range(50)}
+    for _ in range(300):
+        id = rng.choice([rng.randrange(50), CS_FAR + rng.randrange(5)])
+        if rng.random() < 0.5:
+            keys.delete(id)
+            table.pop(id, None)
+        elif keys.n(id) is None:
+            keys.created[id] = table[id] = rng.randint(-9, 9)
+        assert all(keys.n(i) == table.get(i) for i in list(range(50)) + [CS_FAR + 1])
+        assert keys.count() == len(table)
+        assert keys.total() == (sum(table.values()) if table else None)
+    assert keys.copy() == keys and keys.copy().deleted is not keys.deleted
+
+
 def test_forget_c_drops_the_row_and_its_edges() -> None:
     model = Model(big=Big(100))
     model.big.updated[5] = 1
+    model.big.texts[5] = "x"
     model.ck.update([(5, 6), (6, 5), (7, 8)])
     model.ck2[(5, 9, 0)] += 1
     model.forget_c(5)
-    assert not model.big.exists(5) and 5 not in model.big.updated
+    assert not model.big.exists(5) and 5 not in model.big.updated and 5 not in model.big.texts
     assert model.ck == Counter({(7, 8): 1}) and not model.ck2
     assert model.fork().big.deleted == {5} and filler(1005) == 5

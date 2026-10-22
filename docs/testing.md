@@ -56,16 +56,21 @@ on a freshly prepared statement, on its cached plan, through the driver and on a
 connection. Failures shrink to a minimal sequence of steps, except those that depend on timing.
 
 Besides small tables, every workload has C, a node table of two node groups (2^17 rows and a
-second one past a vector end), with two rel tables. The rules draw C ids from bands at size
-boundaries: CSR leaf regions, vectors, segments, the end of each node group. CK joins both
-groups. CK2's sources lie in the first group only, so its rel table lacks the second group, and
-multi-hop checks (`hop_one`, `hop_two`, `hop_varlen`, `hop_mixed`, `hop_optional`,
-`band_degrees`, each a gate of its own) read nodes of both groups in and out of offset order.
-C has a column `v = id % 1000`, filled by COPY or by CREATE in each new database. Rules append
-rows across vector ends, update and delete rows at the band ids, give hubs CSR lists of 1023 to
-4097 edges and fill one CSR leaf region before a checkpoint; checks compare aggregates over C,
-rows at band ids and the top of an `ORDER BY` with a model that keeps only the changes.
-`--sim-focus heavy` turns off the Person, DDL and macro rules to spend the steps on C.
+second one past a vector end; `SIM_C_GROUPS=3` makes it three), with two rel tables. The rules
+draw C ids from bands at size boundaries: CSR leaf regions, vectors, segments, the end of each
+node group. CK's sources lie in the first and the last group, so that with three groups its middle
+node group exists and is empty. CK2's sources lie in the first group only, so its rel table lacks
+the others, and multi-hop checks (`hop_one`, `hop_two`, `hop_varlen`, `hop_mixed`,
+`hop_optional`, `band_degrees`, each a gate of its own) read nodes of every group in and out of
+offset order. C has a column `v = id % 1000` and a string `s` that is NULL, inline or longer by
+id, filled by COPY or by CREATE in each new database. Rules append rows across vector ends,
+update and delete rows at the band ids, add, drop and rename columns, give hubs CSR lists of 1023
+to 4097 edges and fill one CSR leaf region before a checkpoint; checks compare aggregates over C,
+rows at band ids, the rows that differ from the formulas (one scan that computes them in Cypher)
+and the top of an `ORDER BY` with a model that keeps only the changes. CS holds 20,000 string
+keys of 13 to 40 bytes, which rules extend by COPY and CREATE, delete and look up.
+`--sim-focus heavy` turns off the Person rules, Person's DDL and the macro rules to spend the
+steps on C and CS.
 
 ```bash
 make python

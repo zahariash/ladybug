@@ -21,7 +21,7 @@ from rules.sessions import SessionRules
 from rules.transactions import TransactionRules
 from search import SearchChecks
 from session import FAILURES
-from strategies import CK2_SEED, CSR_ROWS
+from strategies import CK2_SEED, CS_ROWS, CSR_ROWS
 
 SCHEMA = [
     "CREATE NODE TABLE Person(id INT64 PRIMARY KEY, name STRING, age INT64, score DOUBLE)",
@@ -80,6 +80,8 @@ class LadybugSim(
             self.start_trace()
         if self.has_csr():
             self.model.big.rows = CSR_ROWS
+        if self.has_string_keys():
+            self.model.keys.rows = CS_ROWS
         # SIM_ART_PK=1 gives Person an ART primary key instead of the default hash index, so that
         # primary-key ranges are index lookups.
         art_pk = bool(os.environ.get("SIM_ART_PK"))

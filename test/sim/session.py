@@ -16,8 +16,8 @@ from dataclasses import dataclass, field
 
 from engine import Engine, EngineError
 from hypothesis.stateful import precondition
-from model import Model, canonical
-from strategies import CSR_ROWS
+from model import Model, canonical, cs_key_query, text_query
+from strategies import C_GROUPS, CS_ROWS, CSR_ROWS
 from triage import probe_of, signature
 
 # Every name rules are gated on, so --sim-skip can reject names that match nothing. Rules add
@@ -35,20 +35,35 @@ ONE_THREAD = "CALL threads=1"
 
 
 def copy_c(start: int, count: int) -> str:
-    return f"COPY C FROM (UNWIND range({start}, {start + count - 1}) AS i RETURN i, i % 1000)"
+    """Rows of C; columns added later take their defaults."""
+    rows = f"UNWIND range({start}, {start + count - 1}) AS i RETURN i, i % 1000, {text_query('i')}"
+    return f"COPY C(id, v, s) FROM ({rows})"
 
 
 def csr_setup(fill: str | None, threads: int) -> list[str]:
+    create = f"CREATE (:C {{id: i, v: i % 1000, s: {text_query('i')}}})"
     fills = {
         "copy": [ONE_THREAD, copy_c(0, CSR_ROWS), f"CALL threads={threads}"],
-        "create": [f"UNWIND range(0, {CSR_ROWS - 1}) AS i CREATE (:C {{id: i, v: i % 1000}})"],
+        "create": [f"UNWIND range(0, {CSR_ROWS - 1}) AS i {create}"],
     }
     return [
-        "CREATE NODE TABLE IF NOT EXISTS C(id INT64 PRIMARY KEY, v INT64)",
+        "CREATE NODE TABLE IF NOT EXISTS C(id INT64 PRIMARY KEY, v INT64, s STRING)",
         *(fills[fill] if fill else []),
         "CREATE REL TABLE IF NOT EXISTS CK(FROM C TO C)",
         "CREATE REL TABLE IF NOT EXISTS CK2(FROM C TO C, w INT64)",
         C_SORTED,
+    ]
+
+
+def copy_cs(start: int, count: int) -> str:
+    rows = f"UNWIND range({start}, {start + count - 1}) AS i RETURN {cs_key_query('i')}, i"
+    return f"COPY CS FROM ({rows})"
+
+
+def cs_setup(fill: bool) -> list[str]:
+    return [
+        "CREATE NODE TABLE IF NOT EXISTS CS(id STRING PRIMARY KEY, n INT64)",
+        *([copy_cs(0, CS_ROWS)] if fill else []),
     ]
 
 
@@ -195,25 +210,34 @@ class Session:
         """Whether C and CK exist: only while the csr rules run."""
         return "csr" not in self.options.skipped
 
+    def has_string_keys(self) -> bool:
+        """Whether CS exists: only while its rules run."""
+        return self.has_csr() and "string_keys" not in self.options.skipped
+
     def loads(self) -> list[str]:
-        """The statements each open runs before the rules: extension loads and the C tables,
-        filled on the database's first open."""
-        if not self.has_csr():
-            return list(self.options.extensions)
-        fill = getattr(self, "c_fill", None) if self.model.big.rows == 0 else None
-        return list(self.options.extensions) + csr_setup(fill, self.config["max_num_threads"])
+        """The statements each open runs before the rules: extension loads and the C and CS
+        tables, filled on the database's first open."""
+        first = self.model.big.rows == 0
+        return self.table_loads(getattr(self, "c_fill", None) if first else None, first)
 
     def reopen_loads(self) -> list[str]:
         """What loads() returns on every open after a database's first."""
-        threads = self.config["max_num_threads"]
-        return list(self.options.extensions) + (csr_setup(None, threads) if self.has_csr() else [])
+        return self.table_loads(None, False)
+
+    def table_loads(self, c_fill: str | None, cs_fill: bool) -> list[str]:
+        loads = list(self.options.extensions)
+        if self.has_csr():
+            loads += csr_setup(c_fill, self.config["max_num_threads"])
+        if self.has_string_keys():
+            loads += cs_setup(cs_fill)
+        return loads
 
     # Engine lifecycle
 
     def start_trace(self) -> None:
         self.trace = []
         op = dict(op="open", config=self.config, loads=self.loads())
-        op["reopen_loads"] = self.reopen_loads()
+        op["reopen_loads"], op["c_groups"] = self.reopen_loads(), C_GROUPS
         self.traced(op, self.open_engine)
         op["build"] = self.engine.build
 

@@ -15,6 +15,7 @@ from hypothesis import HealthCheck, settings
 from hypothesis.database import DirectoryBasedExampleDatabase
 from known import KNOWN_BUGS, known_rules
 from session import FAILURES, RECOVERY_SKIPS, RULE_NAMES, RULE_RUNS, Options
+from strategies import C_GROUPS
 
 # Next to Hypothesis's own example database, which it already keeps out of git; not in the
 # temporary directory, which wrappers that clean up after a run delete.
@@ -193,12 +194,14 @@ def engine_build() -> str:
 
 @pytest.fixture(scope="session")
 def sim_settings(pytestconfig, sim_options) -> settings:
-    # Failing examples are saved and replayed first next time, but only for the same rules and
-    # the same engine build: a run with another gate lifted, or on another build, must not
-    # start with (and stop on) this run's failures.
+    # Failing examples are saved and replayed first next time, but only for the same rules, the
+    # same size of C and the same engine build: a run with another gate lifted, or on another
+    # build, must not start with (and stop on) this run's failures.
     rules = sorted(sim_options.skipped) + list(sim_options.extensions)
     rules.append(str(pytestconfig.getoption("sim_steps")))
     rules.append(engine_build())
+    if C_GROUPS != 2:
+        rules.append(f"groups={C_GROUPS}")
     key = hashlib.sha1("\n".join(rules).encode()).hexdigest()[:12]
     return settings(
         max_examples=pytestconfig.getoption("sim_examples"),

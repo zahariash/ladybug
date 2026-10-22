@@ -15,6 +15,7 @@ from model import Model, two_hops
 from session import DUPLICATE_KEY, Session, enabled, gated
 from strategies import (
     CSR_BANDS,
+    ck_src_ids,
     clusters,
     csr_ids,
     csr_src_ids,
@@ -34,7 +35,7 @@ op = st.one_of(
     st.tuples(st.just("set_age"), small_ids, ints),
     st.tuples(st.just("delete"), small_ids, st.none()),
     st.tuples(st.just("knows"), small_ids, small_ids),
-    st.tuples(st.just("ck"), csr_ids, csr_ids),
+    st.tuples(st.just("ck"), ck_src_ids, csr_ids),
     st.tuples(st.just("unck"), csr_ids, csr_ids),
     st.tuples(st.just("ck2"), csr_src_ids, csr_ids),
     st.tuples(st.just("unck2"), csr_src_ids, csr_ids),
@@ -236,12 +237,12 @@ class TransactionRules(Session):
     @rule(
         a=csr_src_ids,
         m0=csr_src_ids,
-        m1=st.sampled_from(CSR_BANDS[-1]),
+        m1=st.sampled_from([id for band in CSR_BANDS[1:] for id in band]),
         x=csr_src_ids,
         y=csr_src_ids,
     )
     def two_hop_across_missing_group(self, a, m0, m1, x, y):
-        """A two-hop match in a write transaction whose middle nodes lie on both sides of the node
+        """A two-hop match in a write transaction whose middle nodes lie on both sides of a node
         group CK2 lacks: committed a->m0 and a->m1, uncommitted m0->x and m1->y. The transaction
         must see both walks; the ROLLBACK keeps CK2's sources in C's first node group."""
         if not all(self.model.big.exists(id) for id in (a, m0, m1, x, y)):

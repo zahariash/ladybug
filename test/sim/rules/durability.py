@@ -148,17 +148,20 @@ class DurabilityRules(Session):
         return "CHECKPOINT", after
 
     def crash_state(self, model: Model | None = None) -> tuple:
-        """Person's rows, and C's row count and CK's edge count: in the engine, or in `model`."""
+        """Person's rows, and C's rows (count, fingerprint, strings) and CK's edge count: in the
+        engine, or in `model`."""
         if model is not None:
-            persons = model.person_rows()
-            big = (model.big.count(), model.big.fingerprint(), sum(model.ck.values()))
-            return persons, big if self.has_csr() else ()
-        big = ()
+            persons, big = model.person_rows(), model.big
+            texts = big.text_count_size()[0]
+            state = (big.count(), big.fingerprint(), texts, sum(model.ck.values()))
+            return persons, state if self.has_csr() else ()
+        state = ()
         if self.has_csr():
-            [(rows, fingerprint)] = self.rows(f"MATCH (c:C) RETURN count(*), sum({C_FP})")
+            query = f"MATCH (c:C) RETURN count(*), sum({C_FP}), count(c.s)"
+            [(rows, fingerprint, texts)] = self.rows(query)
             [(edges,)] = self.rows("MATCH ()-[k:CK]->() RETURN count(*)")
-            big = (rows, fingerprint, edges)
-        return self.person_rows(), big
+            state = (rows, fingerprint, texts, edges)
+        return self.person_rows(), state
 
     def check_crash(self, op: str, after: Model) -> None:
         """After a crash, the data is all of the statement or none of it."""

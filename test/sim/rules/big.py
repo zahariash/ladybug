@@ -1,12 +1,25 @@
 """Rules that write C at its size boundaries: appends across vector ends, updates and deletes at
-the boundary ids, hubs whose CSR lists span several vectors, and a dense CSR leaf region."""
+the boundary ids, hubs whose CSR lists span several vectors, a dense CSR leaf region and column
+DDL; and CS, whose string keys live past the inline bytes of a string."""
 
 from __future__ import annotations
 
 import hypothesis.strategies as st
 from hypothesis.stateful import precondition, rule
-from session import C_SORTED, ONE_THREAD, Session, copy_c, enabled
-from strategies import C_ROWS_CAP, HUB_DEGREES, HUBS, LEAF_START, c_values, csr_ids
+from model import cs_key
+from session import C_SORTED, DUPLICATE_KEY, ONE_THREAD, Session, copy_c, copy_cs, enabled
+from strategies import (
+    C_ROWS_CAP,
+    CS_ROWS_CAP,
+    HUB_DEGREES,
+    HUBS,
+    LEAF_START,
+    c_texts,
+    c_values,
+    cs_ids,
+    csr_ids,
+    extra_columns,
+)
 
 APPENDS = [1, 2047, 2048, 2049]
 # Pairs of consecutive band ids in the first node group: a node and the next one.
@@ -16,14 +29,19 @@ CREATE_CK = "MATCH (a:C {id: $a}), (b:C {id: $b}) CREATE (a)-[:CK]->(b)"
 
 class BigRules(Session):
     def c_write_safe(self, kind: str, id: int) -> bool:
-        """snapshot_write_safe for C: an update under an open snapshot hits snapshot_update, and
-        deleting a row the snapshot does not see hits snapshot_insert_delete."""
+        """snapshot_write_safe for C."""
+        return self.big_write_safe(kind, lambda view: view.big.exists(id))
+
+    def big_write_safe(self, kind: str, visible) -> bool:
+        """snapshot_write_safe for C and CS: an update under an open snapshot hits
+        snapshot_update, and deleting a row a snapshot does not see (`visible(view)` is false)
+        hits snapshot_insert_delete."""
         readers = [txn.view for txn in self.txns.values() if txn.kind == "read"]
         if not readers:
             return True
         if kind == "update":
             return "snapshot_update" not in self.options.skipped
-        hidden = any(not view.big.exists(id) for view in readers)
+        hidden = any(not visible(view) for view in readers)
         return not (hidden and "snapshot_insert_delete" in self.options.skipped)
 
     def declare_sorted(self) -> None:
@@ -56,6 +74,18 @@ class BigRules(Session):
         self.ok("MATCH (c:C {id: $id}) SET c.v = $v", dict(id=id, v=v))
         if self.model.big.exists(id):
             self.model.big.updated[id] = v
+            self.model.updated_since_checkpoint = True
+        self.declare_sorted()
+
+    @enabled("big_strings")
+    @precondition(lambda self: self.has_csr())
+    @rule(id=csr_ids, text=c_texts)
+    def update_c_text(self, id, text):
+        if not self.c_write_safe("update", id):
+            return
+        self.ok("MATCH (c:C {id: $id}) SET c.s = $s", dict(id=id, s=text))
+        if self.model.big.exists(id):
+            self.model.big.texts[id] = text
             self.model.updated_since_checkpoint = True
         self.declare_sorted()
 
@@ -100,3 +130,75 @@ class BigRules(Session):
         self.model.checkpointed()
         self.check_csr_degree(src)
         self.check_csr_degree(src + 1)
+
+    @enabled("big_ddl")
+    @precondition(lambda self: self.has_csr())
+    @rule(column=extra_columns, default=st.integers(-5, 5))
+    def add_c_column(self, column, default):
+        """A column of C's every row, also those that COPY appends later without it."""
+        query = f"ALTER TABLE C ADD {column} INT64 DEFAULT {default}"
+        if column in self.model.big.columns:
+            self.fails(query, None, "already has property")
+            return
+        self.ok(query)
+        self.model.big.columns[column] = default
+        self.declare_sorted()
+
+    @enabled("big_ddl")
+    @precondition(lambda self: self.has_csr() and self.model.big.columns)
+    @rule(data=st.data())
+    def drop_c_column(self, data):
+        column = data.draw(st.sampled_from(list(self.model.big.columns)))
+        self.ok(f"ALTER TABLE C DROP {column}")
+        del self.model.big.columns[column]
+        self.declare_sorted()
+
+    @enabled("big_ddl")
+    @precondition(lambda self: self.has_csr() and self.model.big.columns)
+    @rule(data=st.data(), new=extra_columns)
+    def rename_c_column(self, data, new):
+        old = data.draw(st.sampled_from(list(self.model.big.columns)))
+        query = f"ALTER TABLE C RENAME {old} TO {new}"
+        if new in self.model.big.columns:
+            self.fails(query, None, "already has property")
+            return
+        self.ok(query)
+        columns = self.model.big.columns
+        self.model.big.columns = {new if c == old else c: d for c, d in columns.items()}
+        self.declare_sorted()
+
+    @enabled("string_keys")
+    @precondition(lambda self: self.has_string_keys())
+    @rule(id=cs_ids, n=st.integers(-1000, 1000))
+    def insert_cs(self, id, n):
+        """A key that exists must fail, a deleted one must go in again."""
+        params = dict(k=cs_key(id), n=n)
+        query = "CREATE (:CS {id: $k, n: $n})"
+        if self.model.keys.n(id) is not None:
+            self.fails(query, params, DUPLICATE_KEY)
+            return
+        self.ok(query, params)
+        self.model.keys.created[id] = n
+
+    @enabled("string_keys")
+    @precondition(lambda self: self.has_string_keys())
+    @rule(id=cs_ids)
+    def delete_cs(self, id):
+        if not self.big_write_safe("delete", lambda view: view.keys.n(id) is not None):
+            return
+        self.ok("MATCH (c:CS {id: $k}) DELETE c", dict(k=cs_key(id)))
+        self.model.keys.delete(id)
+
+    @enabled("string_keys")
+    @precondition(
+        lambda self: (
+            self.has_string_keys()
+            and self.model.keys.rows < CS_ROWS_CAP
+            and self.checkpoint_keeps_snapshots()
+        )
+    )
+    @rule(k=st.sampled_from([1, 2049, 5000]))
+    def append_cs(self, k):
+        """A COPY into CS's hash index, which grows it past the keys COPY built it from."""
+        self.ok(copy_cs(self.model.keys.rows, k))
+        self.model.keys.rows += k
