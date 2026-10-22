@@ -57,7 +57,20 @@ KNOWN_BUGS = [
         "index in place under readers (fix: PR #1333)",
     ),
     Known("pk_index", "#1317: DROP INDEX on the primary-key index ignores the transaction"),
-    Known("crash_create", "a kill mid-write can leave a WAL that fails its checksum on reopen"),
+    Known(
+        "recovery_duplicate_key",
+        "a kill during COPY (or other writes) can leave a database whose reopen fails with a "
+        "duplicated primary key (not filed; ranking asked in #1341)",
+    ),
+    Known(
+        "recovery_wal_checksum",
+        "a kill mid-write can leave a WAL that fails its checksum on reopen (not filed)",
+    ),
+    Known(
+        "recovery_catalog_exists",
+        "a kill during CHECKPOINT can leave a WAL whose replay recreates an existing table or "
+        "macro: 'already exists in catalog' (not filed)",
+    ),
     Known(
         "rename_table",
         "#1207: renaming a table leaves its SERIAL sequence under the old name, so the name can't "

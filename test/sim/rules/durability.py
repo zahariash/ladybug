@@ -8,7 +8,7 @@ import shutil
 import hypothesis.strategies as st
 from hypothesis.stateful import precondition, rule
 from model import CK2_FP, CK_FP, C_FP, KNOWS_FP, PERSON_FP, Model, knows_fp, person_fp
-from session import ONE_THREAD, Session, copy_c, diff, enabled, gated
+from session import ONE_THREAD, RECOVERY_FAILURES, Session, copy_c, diff, enabled, gated
 from strategies import BULK_ID_START, C_ROWS_CAP, CSR_ROWS, HUBS, small_ids
 
 CRASH_OPS = ["copy", "create", "delete", "checkpoint", "copy_c", "delete_hub"]
@@ -24,6 +24,7 @@ SYSCALLS = {
     "unlink": 10,
 }
 gated(*(f"crash_{op}" for op in CRASH_OPS), "race_checkpoint", "race_edges", "art_copy")
+gated(*RECOVERY_FAILURES)
 
 # The committed state a racing reader sees (see engine.read_state and race_state): counts that
 # fast paths answer, and row fingerprints that scans answer.

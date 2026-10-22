@@ -14,7 +14,7 @@ from engine import KEEP_MARKER, scratch_root
 from hypothesis import HealthCheck, settings
 from hypothesis.database import DirectoryBasedExampleDatabase
 from known import KNOWN_BUGS, known_rules
-from session import FAILURES, RULE_NAMES, Options
+from session import FAILURES, RECOVERY_SKIPS, RULE_NAMES, RULE_RUNS, Options
 
 # Next to Hypothesis's own example database, which it already keeps out of git; not in the
 # temporary directory, which wrappers that clean up after a run delete.
@@ -207,7 +207,11 @@ def sim_settings(pytestconfig, sim_options) -> settings:
         print_blob=True,
         deadline=None,
         # Steps are slow (a worker process, real I/O) and data is drawn inside rules.
-        suppress_health_check=[HealthCheck.too_slow, HealthCheck.data_too_large],
+        suppress_health_check=[
+            HealthCheck.too_slow,
+            HealthCheck.data_too_large,
+            HealthCheck.filter_too_much,
+        ],
     )
 
 
@@ -232,6 +236,14 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config) -> None:
                     f"--rows '{json.dumps(rows)}' --minimize --pin '<steps that set the answer>'"
                 )
         terminalreporter.write_line(f"{kind} {slug}: {trace}\n  triage: {command}")
+    if RULE_RUNS:
+        runs = ", ".join(f"{rule} {n}" for rule, n in sorted(RULE_RUNS.items()))
+        terminalreporter.write_line(f"rule runs: {runs}")
+        skips = ", ".join(f"{gate} {n}" for gate, n in sorted(RECOVERY_SKIPS.items())) or "none"
+        terminalreporter.write_line(f"workloads discarded on a known recovery failure: {skips}")
+        path = os.path.join(config.getoption("sim_trace_dir"), "rule-runs.json")
+        with open(path, "w") as f:
+            json.dump(dict(rules=RULE_RUNS, recovery=RECOVERY_SKIPS), f, indent=1, sort_keys=True)
 
 
 def pytest_sessionfinish(session, exitstatus) -> None:

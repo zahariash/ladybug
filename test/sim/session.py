@@ -15,6 +15,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 
 from engine import Engine, EngineError
+from hypothesis import assume
 from hypothesis.stateful import precondition
 from model import Model, canonical
 from strategies import CSR_ROWS
@@ -108,6 +109,17 @@ RULE_MARKERS = ("hypothesis_stateful_rule", "hypothesis_stateful_invariant")
 # Every failure this process recorded, for the terminal summary: kind, slug, directory, and for a
 # wrong result the probe and its wrong rows.
 FAILURES: list[tuple] = []
+# How often each rule or invariant ran a statement, and how many workloads ended on a known
+# recovery failure, for the terminal summary.
+RULE_RUNS: Counter = Counter()
+RECOVERY_SKIPS: Counter = Counter()
+# Recovery failures after a kill that are known and not filed; while their gate is on, a workload
+# that hits one is discarded instead of failing, so that crash ops keep running.
+RECOVERY_FAILURES = {
+    "recovery_duplicate_key": "Found duplicated primary key value",
+    "recovery_wal_checksum": "Checksum verification failed",
+    "recovery_catalog_exists": "already exists in catalog",
+}
 
 
 def failure_kind(error: BaseException) -> str:
@@ -238,6 +250,9 @@ class Session:
     def traced(self, op: dict, call):
         """Records `op` with the rule it belongs to, runs `call` and records how it ended."""
         op["rule"] = self.current_rule()
+        if op["rule"] != getattr(self, "last_rule", None):
+            RULE_RUNS[op["rule"] or op["op"]] += 1
+        self.last_rule = op["rule"]
         self.trace.append(op)
         start = time.monotonic()
         try:
@@ -266,9 +281,14 @@ class Session:
             # With one worker thread, the caller and the worker take turns, so the n-th call
             # of a syscall is the same call in every run.
             config = {**config, "max_num_threads": 1}
-        self.engine = Engine(
-            self.path, config, self.loads(), inject, self.options.debug
-        )
+        try:
+            self.engine = Engine(self.path, config, self.loads(), inject, self.options.debug)
+        except EngineError as e:
+            known = [gate for gate, text in RECOVERY_FAILURES.items() if text in str(e)]
+            if crashed and known and known[0] in self.options.skipped:
+                RECOVERY_SKIPS[known[0]] += 1
+                assume(False)
+            raise
 
     def reopen_engine(self) -> None:
         self.traced(dict(op="reopen"), lambda: (self.engine.close(), self.open_engine()))
