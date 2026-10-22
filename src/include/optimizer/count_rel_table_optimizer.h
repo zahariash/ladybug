@@ -35,6 +35,14 @@ public:
 
     void rewrite(planner::LogicalPlan* plan);
 
+    // The rewrites check these at plan time, so a cached plan must be checked again before it
+    // runs. The chain counts read only committed node offsets and need a read-only transaction;
+    // the CSR-gated rewrites need their node table unchanged since its CSR declaration, and are
+    // returned with the table's change epoch at the declaration.
+    static bool needsReadOnlyTransaction(const planner::LogicalPlan& plan);
+    static std::vector<std::pair<common::table_id_t, uint64_t>> getCsrTableEpochs(
+        const planner::LogicalPlan& plan);
+
 private:
     std::shared_ptr<planner::LogicalOperator> visitOperator(
         const std::shared_ptr<planner::LogicalOperator>& op);
