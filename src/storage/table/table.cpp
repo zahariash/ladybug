@@ -1,5 +1,7 @@
 #include "storage/table/table.h"
 
+#include <algorithm>
+
 #include "storage/storage_manager.h"
 #include "storage/table/node_table.h"
 #include "storage/table/rel_table.h"
@@ -33,6 +35,14 @@ void TableScanState::setToTable(const transaction::Transaction*, Table* table_,
 TableInsertState::TableInsertState(std::vector<ValueVector*> propertyVectors)
     : propertyVectors{std::move(propertyVectors)}, logToWAL{true} {}
 TableInsertState::~TableInsertState() = default;
+ValueVector* TableInsertState::getPropertyVector(column_id_t columnID) const {
+    if (columnIDs.empty()) {
+        return propertyVectors[columnID];
+    }
+    const auto it = std::find(columnIDs.begin(), columnIDs.end(), columnID);
+    DASSERT(it != columnIDs.end());
+    return propertyVectors[it - columnIDs.begin()];
+}
 TableUpdateState::TableUpdateState(column_id_t columnID, ValueVector& propertyVector)
     : columnID{columnID}, propertyVector{propertyVector}, logToWAL{true} {}
 TableUpdateState::~TableUpdateState() = default;

@@ -11,9 +11,11 @@ namespace storage {
 struct TableScanState;
 class MemoryManager;
 
+// Has the same columns as the node table's storage: one per column ID, including columns dropped
+// since the last checkpoint.
 class LocalNodeTable final : public LocalTable {
 public:
-    LocalNodeTable(const catalog::TableCatalogEntry* tableEntry, Table& table, MemoryManager& mm);
+    LocalNodeTable(Table& table, MemoryManager& mm);
     DELETE_COPY_AND_MOVE(LocalNodeTable);
 
     bool insert(transaction::Transaction* transaction, TableInsertState& insertState) override;

@@ -91,8 +91,9 @@ struct NodeBatchInsertTarget {
 };
 
 struct NodeBatchInsertSharedState final : BatchInsertSharedState {
-    // Primary key info (identical across partition subgraphs of the same parent).
-    common::column_id_t pkColumnID;
+    // Primary key info (identical across partition subgraphs of the same parent). pkColumnIdx
+    // indexes the primary key among the chunked group's columns, which follow the property order.
+    common::idx_t pkColumnIdx;
     common::LogicalType pkType;
     bool skipDuplicatePK;
 
@@ -120,7 +121,7 @@ struct NodeBatchInsertSharedState final : BatchInsertSharedState {
     std::shared_ptr<DuplicatePKSkipResult> duplicatePKSkipResult;
 
     explicit NodeBatchInsertSharedState(std::shared_ptr<FactorizedTable> fTable)
-        : BatchInsertSharedState{std::move(fTable)}, pkColumnID{0}, skipDuplicatePK{false},
+        : BatchInsertSharedState{std::move(fTable)}, pkColumnIdx{0}, skipDuplicatePK{false},
           tableFuncSharedState{nullptr},
           duplicatePKSkipResult{std::make_shared<DuplicatePKSkipResult>()} {}
 

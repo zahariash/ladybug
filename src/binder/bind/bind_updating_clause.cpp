@@ -1,3 +1,5 @@
+#include <algorithm>
+
 #include "binder/binder.h"
 #include "binder/expression/expression_util.h"
 #include "binder/expression/literal_expression.h"
@@ -168,7 +170,13 @@ std::vector<BoundInsertInfo> Binder::bindInsertInfos(QueryGraphCollection& query
 static void validatePrimaryKeyExistence(const NodeTableCatalogEntry* nodeTableEntry,
     const NodeExpression& node, const expression_vector& defaultExprs) {
     auto primaryKeyName = nodeTableEntry->getPrimaryKeyName();
-    auto pkeyDefaultExpr = defaultExprs.at(nodeTableEntry->getPrimaryKeyID());
+    // defaultExprs follow the property order, in which dropped properties leave no gap.
+    const auto properties = nodeTableEntry->getProperties();
+    const auto pkIdx =
+        std::find_if(properties.begin(), properties.end(),
+            [&](const auto& property) { return property.getName() == primaryKeyName; }) -
+        properties.begin();
+    auto pkeyDefaultExpr = defaultExprs.at(pkIdx);
     if (!node.hasPropertyDataExpr(primaryKeyName) &&
         ExpressionUtil::isNullLiteral(*pkeyDefaultExpr)) {
         throw BinderException(std::format("Create node {} expects primary key {} as input.",

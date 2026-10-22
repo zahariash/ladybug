@@ -93,11 +93,17 @@ struct LBUG_API TableScanState {
 
 struct LBUG_API TableInsertState {
     std::vector<common::ValueVector*> propertyVectors;
+    // Column ID of each property vector. Until a CHECKPOINT renumbers them, the column IDs of a
+    // table with dropped columns have gaps and differ from the vector positions. Empty means
+    // vector i is column i.
+    std::span<const common::column_id_t> columnIDs;
     // TODO(Guodong): Remove this when we have a better way to skip WAL logging for FTS.
     bool logToWAL;
 
     explicit TableInsertState(std::vector<common::ValueVector*> propertyVectors);
     virtual ~TableInsertState();
+
+    common::ValueVector* getPropertyVector(common::column_id_t columnID) const;
 
     template<typename T>
     const T& constCast() const {

@@ -19,8 +19,11 @@ public:
         bool enableCompression, ResidencyState residency = ResidencyState::IN_MEMORY,
         const VersionRecordHandler* versionRecordHandler = nullptr);
 
+    // Appends vector i to column columnIDs[i], or to column i when columnIDs is empty.
     void append(const transaction::Transaction* transaction,
+        std::span<const common::column_id_t> columnIDs,
         const std::vector<common::ValueVector*>& vectors);
+    // Appends columns columnIDs of other, which has the same columns as this collection.
     void append(const transaction::Transaction* transaction,
         const std::vector<common::column_id_t>& columnIDs, const NodeGroupCollection& other);
     void append(const transaction::Transaction* transaction,
@@ -75,6 +78,8 @@ public:
     common::column_id_t getNumColumns() const { return types.size(); }
 
     void addColumn(TableAddColumnState& addColumnState, PageAllocator* pageAllocator = nullptr);
+    // Removes column columnID and every column added after it.
+    void rollbackAddColumn(common::column_id_t columnID, PageAllocator* pageAllocator = nullptr);
 
     uint64_t getEstimatedMemoryUsage() const;
 

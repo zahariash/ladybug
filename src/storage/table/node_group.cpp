@@ -29,9 +29,10 @@ row_idx_t NodeGroup::append(const Transaction* transaction,
     const std::vector<column_id_t>& columnIDs, ChunkedNodeGroup& chunkedGroup,
     row_idx_t startRowIdx, row_idx_t numRowsToAppend) {
     DASSERT(numRowsToAppend <= chunkedGroup.getNumRows());
-    std::vector<const ColumnChunk*> chunksToAppend(chunkedGroup.getNumColumns());
-    for (auto i = 0u; i < chunkedGroup.getNumColumns(); i++) {
-        chunksToAppend[i] = &chunkedGroup.getColumnChunk(i);
+    DASSERT(chunkedGroup.getNumColumns() == dataTypes.size());
+    std::vector<const ColumnChunk*> chunksToAppend(columnIDs.size());
+    for (auto i = 0u; i < columnIDs.size(); i++) {
+        chunksToAppend[i] = &chunkedGroup.getColumnChunk(columnIDs[i]);
     }
     return append(transaction, columnIDs, chunksToAppend, startRowIdx, numRowsToAppend);
 }
@@ -113,8 +114,9 @@ row_idx_t NodeGroup::append(const Transaction* transaction,
     return numRowsBeforeAppend;
 }
 
-void NodeGroup::append(const Transaction* transaction, const std::vector<ValueVector*>& vectors,
-    const row_idx_t startRowIdx, const row_idx_t numRowsToAppend) {
+void NodeGroup::append(const Transaction* transaction, std::span<const column_id_t> columnIDs,
+    const std::vector<ValueVector*>& vectors, const row_idx_t startRowIdx,
+    const row_idx_t numRowsToAppend) {
     const auto lock = chunkedGroups.lock();
     const auto numRowsBeforeAppend = getNumRows();
     if (chunkedGroups.isEmpty(lock)) {
@@ -135,7 +137,7 @@ void NodeGroup::append(const Transaction* transaction, const std::vector<ValueVe
         lastChunkedGroup = chunkedGroups.getLastGroup(lock);
         const auto numRowsToAppendInGroup = std::min(numRowsToAppend - numRowsAppended,
             StorageConfig::CHUNKED_NODE_GROUP_CAPACITY - lastChunkedGroup->getNumRows());
-        lastChunkedGroup->append(transaction, vectors, startRowIdx + numRowsAppended,
+        lastChunkedGroup->append(transaction, columnIDs, vectors, startRowIdx + numRowsAppended,
             numRowsToAppendInGroup);
         numRowsAppended += numRowsToAppendInGroup;
     }
@@ -455,6 +457,16 @@ void NodeGroup::addColumn(TableAddColumnState& addColumnState, PageAllocator* pa
     for (auto& chunkedGroup : chunkedGroups.getAllGroups(lock)) {
         chunkedGroup->addColumn(mm, addColumnState, enableCompression, pageAllocator,
             newColumnStats);
+    }
+}
+
+void NodeGroup::rollbackAddColumn(column_id_t columnID, PageAllocator* pageAllocator) {
+    const auto lock = chunkedGroups.lock();
+    for (auto& chunkedGroup : chunkedGroups.getAllGroups(lock)) {
+        chunkedGroup->rollbackAddColumn(columnID, pageAllocator);
+    }
+    if (dataTypes.size() > columnID) {
+        dataTypes.resize(columnID);
     }
 }
 

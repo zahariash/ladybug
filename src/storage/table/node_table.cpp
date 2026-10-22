@@ -423,17 +423,15 @@ template bool NodeTable::lookupMultiple<false>(Transaction* transaction,
     TableScanState& scanState) const;
 
 offset_t NodeTable::validateUniquenessConstraint(const Transaction* transaction,
-    const std::vector<ValueVector*>& propertyVectors) const {
-    const auto pkVector = propertyVectors[pkColumnID];
-    DASSERT(pkVector->state->getSelVector().getSelSize() == 1);
-    const auto pkVectorPos = pkVector->state->getSelVector()[0];
-    if (offset_t offset = INVALID_OFFSET;
-        lookupPK(transaction, propertyVectors[pkColumnID], pkVectorPos, offset)) {
+    ValueVector& pkVector) const {
+    DASSERT(pkVector.state->getSelVector().getSelSize() == 1);
+    const auto pkVectorPos = pkVector.state->getSelVector()[0];
+    if (offset_t offset = INVALID_OFFSET; lookupPK(transaction, &pkVector, pkVectorPos, offset)) {
         return offset;
     }
     if (const auto localTable = transaction->getLocalStorage()->getLocalTable(*this)) {
         return localTable->cast<LocalNodeTable>().validateUniquenessConstraint(transaction,
-            *pkVector);
+            pkVector);
     }
     return INVALID_OFFSET;
 }
@@ -492,7 +490,7 @@ void NodeTable::insert(Transaction* transaction, TableInsertState& insertState) 
         auto index = indexes[i].getIndex();
         std::vector<ValueVector*> indexedPropertyVectors;
         for (const auto columnID : index->getIndexInfo().columnIDs) {
-            indexedPropertyVectors.push_back(insertState.propertyVectors[columnID]);
+            indexedPropertyVectors.push_back(insertState.getPropertyVector(columnID));
         }
         index->insert(transaction, nodeInsertState.nodeIDVector, indexedPropertyVectors,
             *nodeInsertState.indexInsertStates[i]);
@@ -639,6 +637,11 @@ bool NodeTable::delete_(Transaction* transaction, TableDeleteState& deleteState)
 
 void NodeTable::addColumn(Transaction* transaction, TableAddColumnState& addColumnState,
     PageAllocator& pageAllocator) {
+    // Rolling back the ADD restores the catalog entry, whose next ADD reuses this column ID.
+    const auto columnID = getNumColumns();
+    transaction->pushRollbackCallback([this, columnID, &pageAllocator](Transaction&) {
+        rollbackAddColumn(columnID, pageAllocator);
+    });
     auto& definition = addColumnState.propertyDefinition;
     auto column = ColumnFactory::createColumn(definition.getName(), definition.getType().copy(),
         pageAllocator.getDataFH(), memoryManager, shadowFile, enableCompression);
@@ -655,6 +658,16 @@ void NodeTable::addColumn(Transaction* transaction, TableAddColumnState& addColu
     }
     nodeGroups->addColumn(addColumnState, &pageAllocator);
     setHasChanges();
+}
+
+void NodeTable::rollbackAddColumn(column_id_t columnID, PageAllocator& pageAllocator) {
+    {
+        std::unique_lock schemaLck{schemaMtx};
+        if (columns.size() > columnID) {
+            columns.resize(columnID);
+        }
+    }
+    nodeGroups->rollbackAddColumn(columnID, &pageAllocator);
 }
 
 std::pair<offset_t, offset_t> NodeTable::appendToLastNodeGroup(Transaction* transaction,
