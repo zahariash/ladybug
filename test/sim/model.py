@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import heapq
+import itertools
 import math
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field, replace
@@ -32,6 +34,75 @@ class Doc(NamedTuple):
         return " ".join(self.words) if self.words else None
 
 
+def filler(id: int) -> int:
+    """C.v of a row that no update has changed."""
+    return id % 1000
+
+
+@dataclass
+class Big:
+    """C: ids 0..rows-1 at the offsets of their ids, v = filler(id), less deleted ids and with
+    updated values. Kept as changes against the formula, so that copies and aggregates cost the
+    changes, not the rows."""
+
+    rows: int = 0
+    deleted: set = field(default_factory=set)
+    updated: dict = field(default_factory=dict)  # id -> v, None for NULL
+
+    def copy(self) -> Big:
+        return Big(self.rows, set(self.deleted), dict(self.updated))
+
+    def exists(self, id: int) -> bool:
+        return 0 <= id < self.rows and id not in self.deleted
+
+    def value(self, id: int):
+        return self.updated[id] if id in self.updated else filler(id)
+
+    def count(self) -> int:
+        return self.rows - len(self.deleted)
+
+    def changed(self) -> set:
+        return self.deleted | self.updated.keys()
+
+    def updated_values(self) -> list:
+        return [v for id, v in self.updated.items() if id not in self.deleted and v is not None]
+
+    def sum(self) -> int:
+        full, rest = divmod(self.rows, 1000)
+        total = full * (999 * 1000 // 2) + rest * (rest - 1) // 2
+        total -= sum(filler(id) for id in self.changed() if id < self.rows)
+        return total + sum(self.updated_values())
+
+    def _unchanged_filler(self, values) -> int | None:
+        """The first of `values` that some unchanged row still holds."""
+        changed = self.changed()
+        for v in values:
+            if any(id not in changed for id in range(v, self.rows, 1000)):
+                return v
+        return None
+
+    def min_max(self) -> tuple:
+        values = self.updated_values()
+        low, high = self._unchanged_filler(range(1000)), self._unchanged_filler(range(999, -1, -1))
+        values += [v for v in (low, high) if v is not None]
+        return (min(values), max(values)) if values else (None, None)
+
+    def top(self, k: int) -> list[tuple[int, int]]:
+        """(id, v) of the k rows with a value, as ORDER BY v DESC, id LIMIT k returns them."""
+        changed = self.changed()
+
+        def unchanged():
+            for v in range(999, -1, -1):
+                for id in range(v, self.rows, 1000):
+                    if id not in changed:
+                        yield (-v, id)
+
+        updated = sorted(
+            (-v, id) for id, v in self.updated.items() if id not in self.deleted and v is not None
+        )
+        return [(id, -nv) for nv, id in itertools.islice(heapq.merge(updated, unchanged()), k)]
+
+
 @dataclass
 class Model:
     # Person columns after id, in table order, with their defaults.
@@ -47,6 +118,7 @@ class Model:
     partitioned: set = field(default_factory=set)
     ck: Counter = field(default_factory=Counter)  # (src, dst) -> count of CK edges
     ck2: Counter = field(default_factory=Counter)  # (src, dst, w) -> count of CK2 edges
+    big: Big = field(default_factory=Big)  # C's rows
     pk_index: str | None = "_PK"  # the name of Person's primary-key index, if any
     age_index: str | None = None  # the name of the ART index on Person.age, if any
     dropped_columns: set = field(default_factory=set)  # Person columns dropped at some point
@@ -129,6 +201,7 @@ class Model:
             partitioned=set(self.partitioned),
             ck=Counter(self.ck),
             ck2=Counter(self.ck2),
+            big=self.big.copy(),
             dropped_columns=set(self.dropped_columns),
             wrote=False,
         )
@@ -138,6 +211,15 @@ class Model:
         if id in self.persons:
             self.persons[id] = {**self.persons[id], field: value}
             self.updated_since_checkpoint = True
+
+    def forget_c(self, id: int) -> None:
+        """DETACH DELETE of a C row: it and its CK and CK2 edges go."""
+        self.big.deleted.add(id)
+        self.big.updated.pop(id, None)
+        for key in [k for k in self.ck if id in k]:
+            del self.ck[key]
+        for key in [k for k in self.ck2 if id in k[:2]]:
+            del self.ck2[key]
 
     def ck2_pairs(self) -> Counter:
         """CK2's edges as (src, dst) -> count, whatever their w."""

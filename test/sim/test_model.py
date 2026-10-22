@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import math
+import random
 from collections import Counter
 
-from model import Doc, Model, canonical, two_hops, walk_ends
+from model import Big, Doc, Model, canonical, filler, two_hops, walk_ends
 from strategies import BULK_ID_START, CSR_BANDS, CSR_ROWS, CSR_SECOND_GROUP
 
 
@@ -151,3 +152,34 @@ def test_csr_bands_stay_inside_c() -> None:
     assert first[:40] == list(range(40)) and CSR_SECOND_GROUP - 1 in first
     assert second[-1] == CSR_ROWS - 1 and CSR_SECOND_GROUP + 2049 in second
     assert CSR_SECOND_GROUP + 4095 not in second
+
+
+def test_big_aggregates_and_top_match_the_rows() -> None:
+    rng = random.Random(7)
+    for rows in (0, 1, 999, 1000, 2500):
+        big = Big(rows)
+        ids = range(rows)
+        for id in rng.sample(ids, min(rows, 40)):
+            if rng.random() < 0.5:
+                big.deleted.add(id)
+            else:
+                big.updated[id] = rng.choice([None, -1, 0, 999, 1000, rng.randint(-5, 2000)])
+        table = {id: big.value(id) for id in ids if id not in big.deleted}
+        values = [v for v in table.values() if v is not None]
+        assert big.count() == len(table)
+        assert big.sum() == sum(values)
+        assert big.min_max() == ((min(values), max(values)) if values else (None, None))
+        ranked = sorted(((id, v) for id, v in table.items() if v is not None), key=lambda r: (-r[1], r[0]))
+        for k in (1, 5, 2049):
+            assert big.top(k) == ranked[:k]
+
+
+def test_forget_c_drops_the_row_and_its_edges() -> None:
+    model = Model(big=Big(100))
+    model.big.updated[5] = 1
+    model.ck.update([(5, 6), (6, 5), (7, 8)])
+    model.ck2[(5, 9, 0)] += 1
+    model.forget_c(5)
+    assert not model.big.exists(5) and 5 not in model.big.updated
+    assert model.ck == Counter({(7, 8): 1}) and not model.ck2
+    assert model.fork().big.deleted == {5} and filler(1005) == 5

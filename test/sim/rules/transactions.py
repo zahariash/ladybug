@@ -47,6 +47,7 @@ op = st.one_of(
     st.tuples(st.just("drop_table"), table_ids, st.none()),
     st.tuples(st.just("drop_macro"), macro_ids, st.none()),
 )
+PERSON_OPS = {"insert", "set_age", "delete", "knows", "duplicate"}
 DDL_OPS = {"create_table", "create_macro", "add_column", "drop_column", "drop_table", "drop_macro"}
 gated("txn_column_gap", "rollback_add", "txn_prepared_ddl")
 
@@ -110,11 +111,11 @@ def apply(model: Model, kind: str, a, b) -> None:
         model.forget(a)
     elif kind == "knows" and a in model.persons and b in model.persons:
         model.knows[(a, b, 0)] += 1
-    elif kind == "ck":
+    elif kind == "ck" and model.big.exists(a) and model.big.exists(b):
         model.ck[(a, b)] += 1
     elif kind == "unck":
         model.ck.pop((a, b), None)
-    elif kind == "ck2":
+    elif kind == "ck2" and model.big.exists(a) and model.big.exists(b):
         model.ck2[(a, b, 0)] += 1
     elif kind == "unck2":
         for key in [k for k in model.ck2 if k[:2] == (a, b)]:
@@ -148,6 +149,7 @@ class TransactionRules(Session):
             and not (kind == "drop_column" and "txn_column_gap" in skipped)
             and not (kind in ("create_macro", "drop_macro") and "macros" in skipped)
             and not (kind == "drop_macro" and "drop_macro" in skipped)
+            and not (kind in PERSON_OPS and "persons" in skipped)
         ] + (["ck", "unck", "ck2", "unck2"] if "csr" not in skipped else [])
 
     def runs(self, model: Model, kind: str, a) -> bool:
@@ -242,6 +244,8 @@ class TransactionRules(Session):
         """A two-hop match in a write transaction whose middle nodes lie on both sides of the node
         group CK2 lacks: committed a->m0 and a->m1, uncommitted m0->x and m1->y. The transaction
         must see both walks; the ROLLBACK keeps CK2's sources in C's first node group."""
+        if not all(self.model.big.exists(id) for id in (a, m0, m1, x, y)):
+            return
         create = "MATCH (s:C {id: $s}), (d:C {id: $d}) CREATE (s)-[:CK2 {w: $w}]->(d)"
         for m in (m0, m1):
             self.ok(create, dict(s=a, d=m, w=0))

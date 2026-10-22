@@ -26,17 +26,30 @@ RULE_NAMES: set[str] = set()
 EXTENSIONS = ("fts", "vector")
 
 DUPLICATE_KEY = "duplicated primary key"
-# C holds ids 0..CSR_ROWS-1 at the offsets of their ids, which SORTED BY CSR declares. Every
-# open runs these: the declaration does not survive a reopen, and the insert runs only while
-# the last row is missing, so C's change epoch, which the CSR rewrites check, stays.
-CSR_SETUP = [
-    "CREATE NODE TABLE IF NOT EXISTS C(id INT64 PRIMARY KEY)",
-    f"OPTIONAL MATCH (c:C {{id: {CSR_ROWS - 1}}}) WITH c WHERE c IS NULL "
-    f"UNWIND range(0, {CSR_ROWS - 1}) AS i CREATE (:C {{id: i}})",
-    "CREATE REL TABLE IF NOT EXISTS CK(FROM C TO C)",
-    "CREATE REL TABLE IF NOT EXISTS CK2(FROM C TO C, w INT64)",
-    "ALTER TABLE C SET SORTED BY (id ASC) CSR",
-]
+# C holds ids 0..rows-1 at the offsets of their ids, which SORTED BY CSR declares. Every open
+# declares it again, since the declaration does not survive a reopen; only a new database's first
+# open fills C, by COPY (straight into a node group on disk) or by CREATE (in-memory chunks).
+C_SORTED = "ALTER TABLE C SET SORTED BY (id ASC) CSR"
+# A COPY on several threads stores rows out of input order; the declaration is not checked.
+ONE_THREAD = "CALL threads=1"
+
+
+def copy_c(start: int, count: int) -> str:
+    return f"COPY C FROM (UNWIND range({start}, {start + count - 1}) AS i RETURN i, i % 1000)"
+
+
+def csr_setup(fill: str | None, threads: int) -> list[str]:
+    fills = {
+        "copy": [ONE_THREAD, copy_c(0, CSR_ROWS), f"CALL threads={threads}"],
+        "create": [f"UNWIND range(0, {CSR_ROWS - 1}) AS i CREATE (:C {{id: i, v: i % 1000}})"],
+    }
+    return [
+        "CREATE NODE TABLE IF NOT EXISTS C(id INT64 PRIMARY KEY, v INT64)",
+        *(fills[fill] if fill else []),
+        "CREATE REL TABLE IF NOT EXISTS CK(FROM C TO C)",
+        "CREATE REL TABLE IF NOT EXISTS CK2(FROM C TO C, w INT64)",
+        C_SORTED,
+    ]
 
 
 @dataclass(frozen=True)
@@ -172,8 +185,12 @@ class Session:
         return "csr" not in self.options.skipped
 
     def loads(self) -> list[str]:
-        """The statements each open runs before the rules: extension loads and CSR_SETUP."""
-        return list(self.options.extensions) + (CSR_SETUP if self.has_csr() else [])
+        """The statements each open runs before the rules: extension loads and the C tables,
+        filled on the database's first open."""
+        if not self.has_csr():
+            return list(self.options.extensions)
+        fill = getattr(self, "c_fill", None) if self.model.big.rows == 0 else None
+        return list(self.options.extensions) + csr_setup(fill, self.config["max_num_threads"])
 
     # Engine lifecycle
 
@@ -222,11 +239,14 @@ class Session:
         """Records `op` with the rule it belongs to, runs `call` and records how it ended."""
         op["rule"] = self.current_rule()
         self.trace.append(op)
+        start = time.monotonic()
         try:
             result = call()
         except (EngineError, AssertionError) as e:
             op["outcome"] = outcome_of(e)
             raise
+        finally:
+            op["ms"] = round((time.monotonic() - start) * 1000)
         op["outcome"] = "ok"
         return result
 

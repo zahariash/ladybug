@@ -61,6 +61,11 @@ boundaries: CSR leaf regions, vectors, segments, the end of each node group. CK 
 groups. CK2's sources lie in the first group only, so its rel table lacks the second group, and
 multi-hop checks (`hop_one`, `hop_two`, `hop_varlen`, `hop_mixed`, `hop_optional`,
 `band_degrees`, each a gate of its own) read nodes of both groups in and out of offset order.
+C has a column `v = id % 1000`, filled by COPY or by CREATE in each new database. Rules append
+rows across vector ends, update and delete rows at the band ids, give hubs CSR lists of 1023 to
+4097 edges and fill one CSR leaf region before a checkpoint; checks compare aggregates over C,
+rows at band ids and the top of an `ORDER BY` with a model that keeps only the changes.
+`--sim-focus heavy` turns off the Person, DDL and macro rules to spend the steps on C.
 
 ```bash
 make python

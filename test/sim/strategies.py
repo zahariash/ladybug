@@ -63,6 +63,19 @@ csr_src_ids = st.one_of(
 CK2_SEED = [(1, 17), (1, CSR_SECOND_GROUP + 8), (1, 18), (17, 5), (18, 6), (5, 7), (6, 8)]
 CK2_SEED += [(11, 12), (12, 13)]
 CK2_SEED_SOURCE = 1
+# Hubs, one per node group, take CK edges to leaves, ids that no band holds, so that their CSR
+# lists span several vectors without adding two-hop walks. A degree around 1024 also moves the
+# planner's lookup-join cut-off.
+HUBS = [7, CSR_SECOND_GROUP + 7]
+HUB_DEGREES = [1023, 1024, 1025, 2047, 2048, 2049, 4097]
+LEAF_START = 60_000
+# Appends to C stop here, so that C stays near two node groups.
+C_ROWS_CAP = CSR_ROWS + 50_000
+# C.v values an update writes: around the formula's range, and ones whose width no longer fits a
+# segment compressed for 0..999.
+c_values = st.one_of(
+    st.integers(-5, 1005), st.sampled_from([INT64_MAX, INT64_MIN, -1, 999, 1000]), st.none()
+)
 
 
 def csr_id(i: int) -> int:

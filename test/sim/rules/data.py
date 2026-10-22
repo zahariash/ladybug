@@ -204,7 +204,8 @@ class DataRules(Session):
         self.ok(
             "MATCH (a:C {id: $a}), (b:C {id: $b}) CREATE (a)-[:CK]->(b)", dict(a=src, b=dst)
         )
-        self.model.ck[(src, dst)] += 1
+        if self.model.big.exists(src) and self.model.big.exists(dst):
+            self.model.ck[(src, dst)] += 1
         self.check_csr_degree(src)
 
     @enabled("csr")
@@ -224,6 +225,9 @@ class DataRules(Session):
     @rule(edges=st.lists(st.tuples(csr_ids, csr_ids), min_size=1, max_size=300))
     def copy_ck(self, edges):
         """A COPY into an empty CK, or into node groups that already hold edges."""
+        edges = [(s, d) for s, d in edges if self.model.big.exists(s) and self.model.big.exists(d)]
+        if not edges:
+            return
         fd, csv = tempfile.mkstemp(suffix=".csv", dir=self.files)
         with os.fdopen(fd, "w") as f:
             f.writelines(f"{s},{d}\n" for s, d in edges)
@@ -236,7 +240,8 @@ class DataRules(Session):
     def insert_ck2(self, src, dst, w):
         query = "MATCH (a:C {id: $a}), (b:C {id: $b}) CREATE (a)-[:CK2 {w: $w}]->(b)"
         self.ok(query, dict(a=src, b=dst, w=w))
-        self.model.ck2[(src, dst, w)] += 1
+        if self.model.big.exists(src) and self.model.big.exists(dst):
+            self.model.ck2[(src, dst, w)] += 1
         self.check_csr_degree(src, "CK2")
 
     @enabled("csr")
@@ -260,6 +265,10 @@ class DataRules(Session):
         )
     )
     def copy_ck2(self, edges):
+        exists = self.model.big.exists
+        edges = [(s, d, w) for s, d, w in edges if exists(s) and exists(d)]
+        if not edges:
+            return
         fd, csv = tempfile.mkstemp(suffix=".csv", dir=self.files)
         with os.fdopen(fd, "w") as f:
             f.writelines(f"{s},{d},{w}\n" for s, d, w in edges)

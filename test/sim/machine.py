@@ -11,6 +11,7 @@ import hypothesis.strategies as st
 from checks import Checks
 from hypothesis.stateful import RuleBasedStateMachine, initialize
 from model import Model
+from rules.big import BigRules
 from rules.catalog import CatalogRules
 from rules.data import DataRules
 from rules.durability import DurabilityRules
@@ -20,7 +21,7 @@ from rules.sessions import SessionRules
 from rules.transactions import TransactionRules
 from search import SearchChecks
 from session import FAILURES
-from strategies import CK2_SEED
+from strategies import CK2_SEED, CSR_ROWS
 
 SCHEMA = [
     "CREATE NODE TABLE Person(id INT64 PRIMARY KEY, name STRING, age INT64, score DOUBLE)",
@@ -40,6 +41,7 @@ class LadybugSim(
     SessionRules,
     ExtensionRules,
     DurabilityRules,
+    BigRules,
     SearchChecks,
     Checks,
     RuleBasedStateMachine,
@@ -50,8 +52,9 @@ class LadybugSim(
         threads=st.integers(1, 8),
         compression=st.booleans(),
         checkpoint_threshold=st.sampled_from([-1, 0, 4096]),
+        c_fill=st.sampled_from(["copy", "create"]),
     )
-    def open_db(self, threads, compression, checkpoint_threshold):
+    def open_db(self, threads, compression, checkpoint_threshold, c_fill):
         self.dir = tempfile.mkdtemp(prefix="db-", dir=self.options.scratch)
         self.path = os.path.join(self.dir, "db")
         # The files of the current workload live with its trace, so a failure can be replayed.
@@ -65,7 +68,10 @@ class LadybugSim(
             checkpoint_threshold=checkpoint_threshold,
         )
         self.model = Model()
+        self.c_fill = c_fill
         self.start_trace()
+        if self.has_csr():
+            self.model.big.rows = CSR_ROWS
         # SIM_ART_PK=1 gives Person an ART primary key instead of the default hash index, so that
         # primary-key ranges are index lookups.
         art_pk = bool(os.environ.get("SIM_ART_PK"))

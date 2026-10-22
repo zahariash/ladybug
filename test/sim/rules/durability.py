@@ -8,10 +8,10 @@ import shutil
 import hypothesis.strategies as st
 from hypothesis.stateful import precondition, rule
 from model import Model
-from session import Session, diff, enabled, gated
-from strategies import BULK_ID_START, CSR_ROWS, small_ids
+from session import ONE_THREAD, Session, copy_c, diff, enabled, gated
+from strategies import BULK_ID_START, C_ROWS_CAP, CSR_ROWS, HUBS, small_ids
 
-CRASH_OPS = ["copy", "create", "delete", "checkpoint"]
+CRASH_OPS = ["copy", "create", "delete", "checkpoint", "copy_c", "delete_hub"]
 RACE_OPS = ["insert", "delete", "set_age", "clear_age", "knows", "unknows", "checkpoint"]
 # File syscalls a crash point can kill at, with how many calls a statement makes at most; the
 # engine writes from two threads, each counted separately.
@@ -104,6 +104,10 @@ class DurabilityRules(Session):
         ops = [op for op in CRASH_OPS if f"crash_{op}" not in self.options.skipped]
         if (self.model.pk_index is None and self.model.persons_ever) or not self.copy_person_safe():
             ops = [op for op in ops if op != "copy"]
+        if not self.has_csr() or self.model.big.rows >= C_ROWS_CAP:
+            ops = [op for op in ops if op != "copy_c"]
+        if not self.has_csr() or not any(self.model.big.exists(hub) for hub in HUBS):
+            ops = [op for op in ops if op != "delete_hub"]
         return ops
 
     def plan_crash(self, op: str, size: int) -> tuple[str, Model]:
@@ -127,18 +131,41 @@ class DurabilityRules(Session):
             for id in [id for id in after.persons if id >= BULK_ID_START]:
                 after.forget(id)
             return f"MATCH (p:Person) WHERE p.id >= {BULK_ID_START} DETACH DELETE p", after
+        if op == "copy_c":
+            # The crash reopens the engine, which restores the thread count.
+            self.ok(ONE_THREAD)
+            after.big.rows += size
+            return copy_c(self.model.big.rows, size), after
+        if op == "delete_hub":
+            hub = next(hub for hub in HUBS if after.big.exists(hub))
+            after.forget_c(hub)
+            return f"MATCH (c:C {{id: {hub}}}) DETACH DELETE c", after
         return "CHECKPOINT", after
+
+    def crash_state(self, model: Model | None = None) -> tuple:
+        """Person's rows, and C's row count and CK's edge count: in the engine, or in `model`."""
+        if model is not None:
+            persons = model.person_rows()
+            big = (model.big.count(), sum(model.ck.values())) if self.has_csr() else ()
+            return persons, big
+        big = ()
+        if self.has_csr():
+            [(rows,)] = self.rows("MATCH (c:C) RETURN count(*)")
+            [(edges,)] = self.rows("MATCH ()-[k:CK]->() RETURN count(*)")
+            big = (rows, edges)
+        return self.person_rows(), big
 
     def check_crash(self, op: str, after: Model) -> None:
         """After a crash, the data is all of the statement or none of it."""
-        actual = self.person_rows()
-        if actual == after.person_rows():
+        actual = self.crash_state()
+        if actual == self.crash_state(after):
             self.model = after
             return
-        before = self.model.person_rows()
+        before = self.crash_state(self.model)
         assert actual == before, (
             f"after a crash during {op}, the data is neither the state before nor after it: "
-            + diff(actual, before)
+            f"{diff(actual[0], before[0])}; C rows and CK edges {actual[1]}, before {before[1]}, "
+            f"after {self.crash_state(after)[1]}"
         )
         # An interrupted statement may still have reserved rows, as for an interrupted COPY.
         self.model.persons_ever = after.persons_ever
@@ -250,6 +277,8 @@ class DurabilityRules(Session):
         lambda self: (
             self.has_csr()
             and "race_edges" not in self.options.skipped
+            # The writes' endpoints spread over all of C; a deleted one has no key to COPY to.
+            and not self.model.big.deleted
             # COPY checkpoints while the readers hold snapshots (snapshot_update).
             and (
                 "snapshot_update" not in self.options.skipped

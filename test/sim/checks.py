@@ -10,7 +10,16 @@ import hypothesis.strategies as st
 from hypothesis.stateful import invariant, precondition, rule
 from model import Model, two_hops, walk_ends
 from session import Session, diff, gated
-from strategies import CK2_SEED_SOURCE, CSR_BANDS, clusters, csr_id, csr_src_id, small_ids
+from strategies import (
+    CK2_SEED_SOURCE,
+    CSR_BANDS,
+    HUBS,
+    VECTOR_CAPACITY,
+    clusters,
+    csr_id,
+    csr_src_id,
+    small_ids,
+)
 
 USER_TABLES = {"Person", "Knows"}
 
@@ -32,6 +41,9 @@ gated(
     "hop_mixed",
     "hop_optional",
     "band_degrees",
+    "big_aggregates",
+    "big_rows",
+    "big_order",
 )
 
 
@@ -66,6 +78,8 @@ class Checks(Session):
             assert actual == self.model.ck, diff(actual, self.model.ck)
             actual = Counter(self.rows("MATCH (a:C)-[k:CK2]->(b:C) RETURN a.id, b.id, k.w"))
             assert actual == self.model.ck2, diff(actual, self.model.ck2)
+            rows = self.rows("MATCH (c:C) RETURN count(*)")
+            assert rows == [(self.model.big.count(),)], (rows, self.model.big.count())
         for i, values in self.model.tables.items():
             # SERIAL ids must be unique; values are compared as a multiset.
             rows = self.rows(f"MATCH (t:T{i}) RETURN t.id, t.v")
@@ -423,6 +437,42 @@ class Checks(Session):
             query = f"MATCH (a:C)-[:{table}]->(b:C) WHERE a.id = {src} RETURN count({counted})"
             self.check(query, {}, [(n,)])
 
+    def check_big(self, view: Model, check, id: int) -> None:
+        """C's rows past its size boundaries: aggregates over every row, rows at shuffled band
+        ids and at the end of the table, the top of an ORDER BY, and a hub's edges."""
+        skipped, big = self.options.skipped, view.big
+        if "big_aggregates" not in skipped:
+            nulls = sum(v is None for i, v in big.updated.items() if i not in big.deleted)
+            low, high = big.min_max()
+            if all(abs(v) < 2**40 for v in big.updated_values()):
+                query = "MATCH (c:C) RETURN count(*), count(c.v), sum(c.v), min(c.v), max(c.v)"
+                check(query, {}, [(big.count(), big.count() - nulls, big.sum(), low, high)])
+            else:  # the sum would overflow INT64
+                query = "MATCH (c:C) RETURN count(*), count(c.v), min(c.v), max(c.v)"
+                check(query, {}, [(big.count(), big.count() - nulls, low, high)])
+        ids = list(dict.fromkeys(band_sample(id) + [big.rows - 1, big.rows - VECTOR_CAPACITY - 1]))
+        if "big_rows" not in skipped:
+            query = f"MATCH (c:C) WHERE c.id IN {ids} RETURN c.id, c.v"
+            check(query, {}, [(i, big.value(i)) for i in ids if big.exists(i)])
+            gone = next((i for i in ids if not big.exists(i)), ids[0])
+            query = f"MATCH (c:C {{id: {gone}}}) RETURN c.id, c.v"
+            check(query, {}, [(gone, big.value(gone))] if big.exists(gone) else [])
+        if "big_order" not in skipped:
+            k = (1, 5, VECTOR_CAPACITY + 1)[id % 3]
+            query = (
+                "MATCH (c:C) WHERE c.v IS NOT NULL RETURN c.id, c.v "
+                f"ORDER BY c.v DESC, c.id LIMIT {k}"
+            )
+            check(query, {}, big.top(k), ordered=True)
+        if "hub_edges" not in skipped:
+            hub = HUBS[id % len(HUBS)]
+            leaves = [d for (s, d), n in view.ck.items() if s == hub for _ in range(n)]
+            query = f"MATCH (a:C)-[:CK]->(b:C) WHERE a.id = {hub} RETURN b.id"
+            check(query, {}, [(d,) for d in leaves])
+            if "lookup_join" not in skipped:
+                query = f"MATCH (a:C)-[:CK]->(b:C) WHERE a.id = {hub} MATCH (b) RETURN b.id, b.v"
+                check(query, {}, [(d, big.value(d)) for d in leaves])
+
     def check_hops(self, view: Model, check, conn: int, id: int, alone: bool) -> None:
         """Paths over CK2, whose sources all lie in C's first node group so that its rel table
         lacks the second, and over CK: a scan that reads a node past a rel table's last node
@@ -449,7 +499,7 @@ class Checks(Session):
                 f"MATCH (a:C) WHERE a.id IN {ids} OPTIONAL MATCH (a)-[:CK2]->(b:C) "
                 "RETURN a.id, count(b)"
             )
-            check(query, {}, [(i, degrees[i]) for i in ids])
+            check(query, {}, [(i, degrees[i]) for i in ids if view.big.exists(i)])
         if alone and "txn_missing_group" in skipped:
             return
         sources = sorted({a, CK2_SEED_SOURCE})
@@ -614,6 +664,7 @@ class Checks(Session):
         if self.has_csr():
             self.check_csr_counts(view, check, conn, csr_id(id), alone)
             self.check_hops(view, check, conn, id, alone)
+            self.check_big(view, check, id)
         for column, default in view.columns.items():
             if column.startswith("c"):
                 check(

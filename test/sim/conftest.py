@@ -22,6 +22,28 @@ DEFAULT_TRACES = os.path.abspath(os.path.join(".hypothesis", "traces"))
 
 # Rule groups each focus turns off.
 FOCUS = {
+    # C, CK and CK2 past their size boundaries, with sessions, checkpoints, crashes and races.
+    "heavy": {
+        "persons",
+        "knows",
+        "bulk_copy",
+        "bulk_rows",
+        "partitions",
+        "macros",
+        "drop_macro",
+        "tables",
+        "columns",
+        "rename_table",
+        "rel_columns",
+        "prepared_ddl",
+        "pk_index",
+        "secondary_index",
+        "atomic_statement",
+        "in_lists",
+        "count_keys",
+        "pk_ranges",
+        "repeated_aggregate",
+    },
     "extensions": {
         "persons",
         "bulk_copy",
