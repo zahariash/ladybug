@@ -162,6 +162,8 @@ class DurabilityRules(Session):
 
     def check_crash(self, op: str, after: Model) -> None:
         """After a crash, the data is all of the statement or none of it."""
+        if self.started_over:
+            return
         actual = self.crash_state()
         if actual == self.crash_state(after):
             self.model = after
@@ -221,6 +223,11 @@ class DurabilityRules(Session):
         if "race_checkpoint" in self.options.skipped and self.checkpoint_keeps_snapshots():
             # Empties the WAL, so that the race's writes cannot trigger an automatic checkpoint.
             self.ok("CHECKPOINT")
+        if "snapshot_update" in self.options.skipped and self.model.updated_since_checkpoint:
+            # A checkpoint in the race would move these updates to other rows under the readers'
+            # snapshots (snapshot_update); no reader is open yet.
+            self.ok("CHECKPOINT")
+            self.model.checkpointed()
         if "snapshot_update" in self.options.skipped and (
             self.model.updated_since_checkpoint
             or self.config["checkpoint_threshold"] != -1

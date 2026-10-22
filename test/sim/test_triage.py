@@ -117,3 +117,12 @@ def test_probes_come_from_either_assertion_format() -> None:
         [[1, None, 0]],
     )
     assert triage.probe_of(op, "something else") is None
+
+
+def test_after_last_fresh_starts_the_trace_at_the_last_fresh_database() -> None:
+    head = {"op": "open", "config": {"x": 1}, "loads": ["first"], "reopen_loads": ["again"]}
+    fresh = {"op": "fresh", "loads": ["first'"]}
+    step = {"op": "execute", "query": "RETURN 1"}
+    trace = [head, step, fresh, step, dict(fresh, loads=["first''"]), step]
+    assert triage.after_last_fresh(trace) == [dict(head, loads=["first''"]), step]
+    assert triage.after_last_fresh([head, step]) == [head, step]

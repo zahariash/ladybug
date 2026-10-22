@@ -53,17 +53,19 @@ class Replayer:
         self.dir = tempfile.mkdtemp(prefix="replay-", dir=scratch_root())
         self.path = os.path.join(self.dir, "db")
         self.config, self.loads = trace[0]["config"], trace[0]["loads"]
+        self.reopen_loads = trace[0].get("reopen_loads", self.loads)
         self.engine = None
 
-    def open(self, inject=None) -> None:
+    def open(self, inject=None, loads=None) -> None:
         self.engine = None
         config = {**self.config, "max_num_threads": 1} if inject else self.config
-        self.engine = Engine(self.path, config, self.loads, inject, self.debug)
+        loads = self.reopen_loads if loads is None else loads
+        self.engine = Engine(self.path, config, loads, inject, self.debug)
 
     def step(self, op: dict) -> None:
         kind = op["op"]
         if kind == "open":
-            self.open()
+            self.open(loads=self.loads)
         elif kind == "execute":
             self.engine.execute(op["query"], op["params"], op["conn"])
         elif kind == "prepared":
@@ -220,9 +222,9 @@ def reduce_config(trace: list, fails) -> tuple[list, dict]:
         if fails([{**head, "config": config}] + trace[1:]):
             print(f"  not needed: {key}={head['config'][key]}")
             head = {**head, "config": config}
-    if head.get("loads") and fails([{**head, "loads": []}] + trace[1:]):
+    if head.get("loads") and fails([{**head, "loads": [], "reopen_loads": []}] + trace[1:]):
         print("  not needed: the extension loads")
-        head = {**head, "loads": []}
+        head = {**head, "loads": [], "reopen_loads": []}
     return [head] + trace[1:], head["config"]
 
 
@@ -319,7 +321,7 @@ def main() -> None:
     )
     args = parser.parse_args()
     with open(args.trace) as f:
-        trace = [op for op in json.load(f) if op["op"] != "failure"]
+        trace = triage.after_last_fresh([op for op in json.load(f) if op["op"] != "failure"])
     trace = relocate_files(trace, os.path.dirname(os.path.abspath(args.trace)))
     if args.probe:
         minimize_wrong_result(trace, args)

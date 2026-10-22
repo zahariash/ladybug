@@ -55,8 +55,6 @@ class LadybugSim(
         c_fill=st.sampled_from(["copy", "create"]),
     )
     def open_db(self, threads, compression, checkpoint_threshold, c_fill):
-        self.dir = tempfile.mkdtemp(prefix="db-", dir=self.options.scratch)
-        self.path = os.path.join(self.dir, "db")
         # The files of the current workload live with its trace, so a failure can be replayed.
         self.files = os.path.join(self.options.traces or self.dir, f"current-{os.getpid()}")
         shutil.rmtree(self.files, ignore_errors=True)
@@ -67,9 +65,19 @@ class LadybugSim(
             compression=compression,
             checkpoint_threshold=checkpoint_threshold,
         )
-        self.model = Model()
         self.c_fill = c_fill
-        self.start_trace()
+        self.new_database()
+
+    def new_database(self, fresh: bool = False) -> None:
+        """An empty database with the workload's settings and schema. A fresh one, after a known
+        recovery failure, goes on in the same trace."""
+        self.dir = tempfile.mkdtemp(prefix="db-", dir=self.options.scratch)
+        self.path = os.path.join(self.dir, "db")
+        self.model = Model()
+        if fresh:
+            self.traced(dict(op="fresh", loads=self.loads()), self.open_engine)
+        else:
+            self.start_trace()
         if self.has_csr():
             self.model.big.rows = CSR_ROWS
         # SIM_ART_PK=1 gives Person an ART primary key instead of the default hash index, so that

@@ -15,7 +15,6 @@ from collections import Counter
 from dataclasses import dataclass, field
 
 from engine import Engine, EngineError
-from hypothesis import assume
 from hypothesis.stateful import precondition
 from model import Model, canonical
 from strategies import CSR_ROWS
@@ -204,11 +203,17 @@ class Session:
         fill = getattr(self, "c_fill", None) if self.model.big.rows == 0 else None
         return list(self.options.extensions) + csr_setup(fill, self.config["max_num_threads"])
 
+    def reopen_loads(self) -> list[str]:
+        """What loads() returns on every open after a database's first."""
+        threads = self.config["max_num_threads"]
+        return list(self.options.extensions) + (csr_setup(None, threads) if self.has_csr() else [])
+
     # Engine lifecycle
 
     def start_trace(self) -> None:
         self.trace = []
         op = dict(op="open", config=self.config, loads=self.loads())
+        op["reopen_loads"] = self.reopen_loads()
         self.traced(op, self.open_engine)
         op["build"] = self.engine.build
 
@@ -286,18 +291,28 @@ class Session:
         except EngineError as e:
             known = [gate for gate, text in RECOVERY_FAILURES.items() if text in str(e)]
             if crashed and known and known[0] in self.options.skipped:
-                RECOVERY_SKIPS[known[0]] += 1
-                assume(False)
+                self.start_over(known[0])
+                return
             raise
+
+    def start_over(self, gate: str) -> None:
+        """Goes on with a fresh database after a known recovery failure: discarding the workload
+        would make Hypothesis see a timing-dependent outcome as flaky data generation."""
+        RECOVERY_SKIPS[gate] += 1
+        self.started_over = True
+        self.new_database(fresh=True)
 
     def reopen_engine(self) -> None:
         self.traced(dict(op="reopen"), lambda: (self.engine.close(), self.open_engine()))
 
     def crash_engine(self) -> None:
+        self.started_over = False
         self.traced(dict(op="crash"), lambda: (self.engine.kill(), self.open_engine(crashed=True)))
 
     def crash_during_statement(self, query: str, delay: float) -> None:
         """Sends a statement, kills the engine `delay` seconds later and opens it again."""
+
+        self.started_over = False
 
         def call():
             self.engine.start(query)
@@ -310,6 +325,8 @@ class Session:
     def crash_at_syscall_point(self, query: str, syscall: str, n: int) -> None:
         """Reopens the engine under strace, which kills it at the n-th call of `syscall`, runs
         the statement, and opens the engine again normally."""
+
+        self.started_over = False
 
         def call():
             self.engine.close()

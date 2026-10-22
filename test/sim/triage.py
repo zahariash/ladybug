@@ -117,6 +117,15 @@ def terminated(statement: str) -> str:
     return f"{query};  // {comment}" if comment else f"{query};"
 
 
+def after_last_fresh(trace: list) -> list:
+    """The trace from its last fresh database on (see Session.start_over): nothing before it
+    affects what follows."""
+    fresh = [i for i, op in enumerate(trace) if op["op"] == "fresh"]
+    if not fresh:
+        return trace
+    return [{**trace[0], "loads": trace[fresh[-1]]["loads"]}] + trace[fresh[-1] + 1 :]
+
+
 def cypher(trace: list, failing: int, failure: str, config: dict) -> str:
     """The steps up to the failing one as Cypher, with comments for everything that is not a
     statement: connections, crashes, reopens and the step that fails."""
@@ -197,6 +206,7 @@ import time
 nan, inf = float("nan"), float("inf")  # how repr() writes them in the steps below
 CONFIG = {config!r}
 LOADS = {loads!r}
+REOPEN_LOADS = {reopen_loads!r}
 STAGES = {stages!r}
 EXPECTED = {expected!r}
 TIMEOUT = 300
@@ -220,7 +230,7 @@ def run_stage(path, index):
             conns[i] = lb.Connection(db, num_threads=1) if i == 1 else lb.Connection(db)
         return conns[i]
 
-    for query in LOADS:
+    for query in LOADS if index == 0 else REOPEN_LOADS:
         conn(0).execute(query)
     for n, op in enumerate(stage["steps"]):
         try:
@@ -329,6 +339,7 @@ def script(trace: list, failing: int, kind: str, message: str, config: dict, nam
         cypher=listing.replace('"""', "'''"),
         config=config,
         loads=trace[0].get("loads", []),
+        reopen_loads=trace[0].get("reopen_loads", trace[0].get("loads", [])),
         stages=stages(trace, failing),
         expected=expected,
     )
