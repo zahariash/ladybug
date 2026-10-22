@@ -2,7 +2,16 @@
 
 from __future__ import annotations
 
-from replay import describe, minimize, original_failure, relocate_files
+from collections import Counter
+
+from replay import (
+    agreement,
+    describe,
+    minimize,
+    original_failure,
+    relocate_files,
+    same_failure,
+)
 
 OPEN = {"op": "open", "config": {}, "loads": []}
 
@@ -70,3 +79,38 @@ def test_relocate_files_points_copies_at_the_kept_directory() -> None:
     relocated = relocate_files([OPEN, copy, execute("RETURN '/x/current-1'")], kept)
     assert relocated[1]["query"] == f'COPY Person FROM "{kept}/bulk1000.csv"'
     assert relocated[2]["query"] == "RETURN '/x/current-1'"
+
+
+def test_same_failure_compares_frames_then_error_text_then_operation() -> None:
+    crash = "engine process died\nThread that crashed:\n#0 lbug::a\n#1 lbug::b\n#2 lbug::c"
+    target = {
+        "kind": "died",
+        "frames": ["lbug::a", "lbug::b", "lbug::c"],
+        "error": "",
+        "operation": "MATCH",
+    }
+    assert same_failure(target, "died", execute("CHECKPOINT"), crash)
+    assert not same_failure(
+        target, "died", execute("MATCH (n) RETURN n"), crash.replace("::b", "::x")
+    )
+    assert not same_failure(target, "hung", execute("MATCH (n) RETURN n"), crash)
+    error = {
+        "kind": "error",
+        "frames": [],
+        "error": "Runtime exception: key ? missing",
+        "operation": "MATCH",
+    }
+    assert same_failure(error, "error", execute("RETURN 2"), "Runtime exception: key 17 missing")
+    assert not same_failure(error, "error", execute("RETURN 2"), "Runtime exception: other")
+    bare = {"kind": "died", "frames": [], "error": "", "operation": "CHECKPOINT"}
+    assert same_failure(bare, "died", execute("CHECKPOINT"), "engine process died")
+    assert not same_failure(bare, "died", execute("RETURN 1"), "engine process died")
+
+
+def test_agreement_groups_the_ways_by_their_rows() -> None:
+    right, wrong = Counter({"[1]": 1, "[2]": 1}), Counter({"[1]": 1})
+    ways = {"driver": wrong, "fresh plan": wrong, "cached plan": right, "no optimizer": right}
+    assert agreement(ways) == [["cached plan", "no optimizer"], ["driver", "fresh plan"]]
+    assert agreement({"driver": right, "fresh plan": Counter({"[2]": 1, "[1]": 1})}) == [
+        ["driver", "fresh plan"]
+    ]

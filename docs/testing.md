@@ -120,8 +120,10 @@ PYTHONPATH=tools/python_api/build uv run --no-project --with hypothesis \
 `--runs` retries timing-dependent failures. `--minimize` delta-debugs the trace to the fewest
 steps that still fail the same way, replaces steps with simpler ones (a crash with a clean
 reopen, a timed or syscall crash with the statement and a crash, a prepared statement with a
-plain one, another connection with the first), and drops the database settings the failure does
-not need. `--emit` reruns it once under gdb and writes, next to the trace:
+plain one, another connection with the first), drops the database settings the failure does not
+need, and shrinks the statements: the setup statements, table columns, column defaults and
+list-parameter values it does not need go, and range() bounds are halved while it still fails.
+`--emit` reruns it once under gdb and writes, next to the trace:
 
 - `trace.min.cypher`: the statements in order, with the connection, crash and reopen steps
   marked and the failing statement flagged;
@@ -131,6 +133,25 @@ not need. `--emit` reruns it once under gdb and writes, next to the trace:
 - `finding.json`: the kind of failure, its signature (the failing operation, the statement with
   literals abstracted, the innermost engine frames or the error text), the settings it needs,
   the build and the commands run.
+
+`--shrink` then reduces the steps further with
+[shrinkray](https://github.com/DRMacIver/shrinkray), which cuts anywhere in the statements and
+parameters, the database settings and the setup, as long as the steps still fail with the same
+signature (`--fixed <build>`: and do not fail on that build, which keeps the reduction on a bug the
+build fixes). It works in `shrink/` next to the trace and emits the same three files there. Each
+candidate is a replay and shrinkray tries thousands, with most of the gain in the first minutes,
+so it stops after `--shrink-minutes` (10) and keeps the smallest case so far: worth it for a
+finding about to be reported, not for every one. Install shrinkray without its local language
+model, which these runs do not use (`--no-llm`):
+
+```bash
+uv venv /path/to/venv --python 3.13 && uv pip install --python /path/to/venv/bin/python \
+    --no-deps shrinkray && uv pip install --python /path/to/venv/bin/python click chardet trio \
+    textual textual-plotext humanize libcst exceptiongroup binaryornot black tree-sitter \
+    tree-sitter-language-pack
+```
+
+and pass `--shrinkray /path/to/venv/bin/shrinkray` if it is not on `PATH`.
 
 Two findings with the same signature are almost always one bug; the same frames or statement
 shape after different steps usually mean one cause reached two ways. Before reporting, try the
@@ -156,6 +177,15 @@ too, so `--pin` keeps the steps that define it (here the default the rows should
 minimized steps need a check by hand that the rows are still wrong for them. Statements keep their
 parameters in the listing: drivers reuse a parameterized statement's plan, which some failures
 need.
+
+`--differential` (instead of `--rows` and `--pin`) needs no right answer: the probe runs the ways
+a check runs a query (a fresh plan, the cached plan, the driver, the single-threaded connection)
+and with the plan optimizer off, and the oracle is that they split into the same groups as on
+the original replay. It fits failures of one plan or one path, not data that every path reads
+wrong, and it also works with `--shrink`, which then reduces the probe as well. A split that
+depends on thread timing shows in some replays only: with `--runs N` a candidate counts when any
+of N replays shows it, and shrinkray notices the flakiness itself and confirms each candidate by
+repeated runs.
 
 The simulator's own logic (model, search oracles, trace minimization, rule helpers) has unit
 tests next to it that need no database: `pytest test/sim -k "not simulation"`.
