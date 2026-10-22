@@ -9,6 +9,7 @@
 #include "common/types/date_t.h"
 #include "common/types/string_t.h"
 #include "common/types/types.h"
+#include "function/gds/gds.h"
 #include "graph/graph_entry.h"
 #include "graph/on_disk_graph.h"
 #include "main/client_context.h"
@@ -155,6 +156,46 @@ TEST_F(RelScanTest, ScanFwd) {
     compare(0, {1, 2, 3}, {0, 1, 2}, {3, 6, 9});
     compare(1, {0, 2, 3}, {3, 4, 5}, {0, 7, 10});
     compare(2, {0, 1, 3}, {6, 7, 8}, {1, 4, 11});
+}
+
+// A projected graph's rel predicate that reads no rel property keeps every neighbour or none.
+// The last predicate reads one and holds for every rel.
+TEST_F(RelScanTest, ScanWithConstantRelPredicate) {
+    auto transaction = transaction::Transaction::Get(*context);
+    auto tableID = catalog->getTableCatalogEntry(transaction, "person")->getTableID();
+    auto relEntry = catalog->getTableCatalogEntry(transaction, "knows");
+    auto relTableID =
+        relEntry->ptrCast<catalog::RelGroupCatalogEntry>()->getSingleRelEntryInfo().oid;
+    auto unfilteredState = graph->prepareRelScan(*relEntry, relTableID, tableID, {});
+    const std::vector<std::pair<std::string, bool>> predicates = {{"true", true}, {"false", false},
+        {"random() < 2.0", true}, {"random() > 2.0", false},
+        {"CASE WHEN random() < 2.0 THEN true ELSE false END", true},
+        {"CASE WHEN random() > 2.0 THEN true ELSE false END", false}, {"CAST(NULL AS BOOL)", false},
+        {"NULL OR random() < 2.0", true}, {"r.date IS NOT NULL", true}};
+    for (auto i = 0u; i < predicates.size(); i++) {
+        const auto& [predicate, keepsAll] = predicates[i];
+        auto graphName = "constant" + std::to_string(i);
+        auto result = conn->query(
+            "CALL PROJECT_GRAPH('" + graphName + "', ['person'], {'knows': '" + predicate + "'})");
+        ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+        auto projected = std::make_unique<graph::OnDiskGraph>(context,
+            function::GDSFunction::bindGraphEntry(*context, graphName));
+        auto scanState = projected->prepareRelScan(*relEntry, relTableID, tableID, {});
+        for (offset_t node = 0; node < 8; node++) {
+            auto nodeID = nodeID_t{node, tableID};
+            std::vector<nodeID_t> expectedFwd, expectedBwd;
+            if (keepsAll) {
+                expectedFwd = graph->scanFwd(nodeID, *unfilteredState).collectNbrNodes();
+                expectedBwd = graph->scanBwd(nodeID, *unfilteredState).collectNbrNodes();
+            }
+            EXPECT_EQ(projected->scanFwd(nodeID, *scanState).collectNbrNodes(), expectedFwd)
+                << predicate << ", node " << node;
+            if (!fwdStorageOnly) {
+                EXPECT_EQ(projected->scanBwd(nodeID, *scanState).collectNbrNodes(), expectedBwd)
+                    << predicate << ", node " << node;
+            }
+        }
+    }
 }
 
 TEST_F(VertexScanTest, ScanVertexProperties) {
