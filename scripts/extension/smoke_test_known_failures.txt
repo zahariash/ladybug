@@ -1,0 +1,43 @@
+# Extensions that smoke_test.py expects to fail to install or load, one per line:
+#   <line> <platform> <extension>  # reason
+# <line> and <platform> may be "*". A listed extension that loads is reported, not failed.
+# Found on the GitHub runners the smoke test uses; a local run may differ.
+*        *            adbc           # needs the ADBC driver manager library, which is not shipped
+v0.21.0  *            ducklake       # not an official extension in these engines, so INSTALL refuses it
+v0.22.0  *            ducklake       # not an official extension in these engines, so INSTALL refuses it
+v0.17.0  linux_amd64  httpfs         # needs OpenSSL 1.1
+v0.17.0  linux_amd64  llm            # needs OpenSSL 1.1
+v0.17.0  linux_arm64  httpfs         # needs OpenSSL 1.1
+v0.17.0  linux_arm64  llm            # needs OpenSSL 1.1
+v0.20.0  linux_amd64  algo           # libnetworkit is not shipped
+v0.21.0  linux_amd64  algo           # libnetworkit is not shipped
+v0.22.0  linux_amd64  algo           # libnetworkit is not shipped
+v0.20.0  linux_arm64  algo           # libnetworkit is not shipped
+v0.21.0  linux_arm64  algo           # libnetworkit is not shipped
+v0.22.0  linux_arm64  algo           # libnetworkit is not shipped
+v0.20.0  osx_arm64    algo           # libnetworkit is not shipped
+v0.21.0  osx_arm64    algo           # libnetworkit is not shipped
+v0.22.0  osx_arm64    algo           # libnetworkit is not shipped
+v0.20.0  win_amd64    algo           # arrow.dll and networkit_state.dll are not shipped
+v0.21.0  win_amd64    algo           # arrow.dll and networkit_state.dll are not shipped
+v0.22.0  win_amd64    algo           # arrow.dll and networkit_state.dll are not shipped
+v0.20.0  osx_amd64    httpfs         # loads libssl.3.dylib through an rpath that does not reach it
+v0.20.0  osx_arm64    httpfs         # loads libssl.3.dylib through an rpath that does not reach it
+v0.20.0  osx_amd64    llm            # loads libssl.3.dylib through an rpath that does not reach it
+v0.20.0  osx_arm64    llm            # loads libssl.3.dylib through an rpath that does not reach it
+v0.21.0  osx_amd64    llm            # loads libcurl.4.dylib through an rpath that does not reach it
+v0.21.0  osx_arm64    llm            # loads libcurl.4.dylib through an rpath that does not reach it
+v0.22.0  osx_amd64    llm            # loads libcurl.4.dylib through an rpath that does not reach it
+v0.22.0  osx_arm64    llm            # loads libcurl.4.dylib through an rpath that does not reach it
+*        win_amd64    azure          # needs duckdb.dll, which is not shipped for Windows
+*        win_amd64    delta          # needs duckdb.dll, which is not shipped for Windows
+*        win_amd64    duckdb         # needs duckdb.dll, which is not shipped for Windows
+*        win_amd64    iceberg        # needs duckdb.dll, which is not shipped for Windows
+*        win_amd64    postgres       # needs duckdb.dll, which is not shipped for Windows
+*        win_amd64    unity_catalog  # needs duckdb.dll, which is not shipped for Windows
+v0.17.0  win_amd64    sqlite         # needs duckdb.dll, which is not shipped for Windows
+v0.18.0  win_amd64    sqlite         # needs duckdb.dll, which is not shipped for Windows
+v0.18.1  win_amd64    sqlite         # needs duckdb.dll, which is not shipped for Windows
+v0.19.0  win_amd64    sqlite         # needs duckdb.dll, which is not shipped for Windows
+v0.20.0  win_amd64    sqlite         # needs duckdb.dll, which is not shipped for Windows
+v0.21.0  win_amd64    sqlite         # needs duckdb.dll, which is not shipped for Windows
