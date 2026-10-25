@@ -48,8 +48,10 @@ STORAGE_ERRORS = (
 )
 # max_db_size is a power of two of at least two page groups of 1024 pages.
 MIN_DB_SIZE = 8 * 1024 * 1024
-# Blob stops growing here, since the data checks read every row after every step.
+# Blob stops growing here, since the data checks read every row after every step, within a
+# 256 MiB buffer pool.
 BLOB_ROWS_CAP = 5000
+BLOB_BYTES_CAP = 32 * 1024 * 1024
 
 GRAPH_OPS = ("gn_insert", "gn_set", "gn_delete")
 graph_op = st.tuples(st.sampled_from(GRAPH_OPS), small_ids, st.integers(-100, 100))
@@ -160,10 +162,12 @@ class RecoveryRules(Session):
                 lambda m: graph_apply(m, kind, a, b),
             )
         if kind == "blob":
-            if len(self.model.blobs) >= BLOB_ROWS_CAP:
-                return None
-            ids = self.model.take_blob_ids(a)
+            ids = range(self.model.next_blob_id, self.model.next_blob_id + a)
             lengths = blob_lengths(ids, b)
+            rows, size = len(self.model.blobs) + a, sum(self.model.blobs.values())
+            if rows > BLOB_ROWS_CAP or size + sum(lengths.values()) > BLOB_BYTES_CAP:
+                return None
+            self.model.take_blob_ids(a)
             return Write(lambda: self.ok(blob_query(ids, b)), lambda m: m.blobs.update(lengths))
         if kind == "copy":
             unsafe_pk = self.model.pk_index is None and self.model.persons_ever
@@ -344,14 +348,17 @@ class RecoveryRules(Session):
         if end == "close" and cap != "db_size" and not self.files_limit_safe(closes=True):
             end = "crash"
         if end == "lift":
-            if cap == "files":
-                self.limit_files(None)
-            else:
+            # Lifting a size cap takes a reopen, whose close may lose a doubtful COPY; only a
+            # checkpoint in the worker that still has it makes it durable.
+            if cap == "db_size":
                 self.reopen_engine(clean=False)
+            else:
+                self.limit_files(None)
             if self.checkpoint_keeps_snapshots():
                 self.ok("CHECKPOINT")
                 self.model.checkpointed()
-                state.doubt.clear()
+                if cap != "db_size":
+                    state.doubt.clear()
         elif end == "crash":
             self.crash_engine()
         else:
