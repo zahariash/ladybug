@@ -28,7 +28,7 @@ from rules.transactions import apply, op, statement
 from session import ONE_THREAD, Session, diff, enabled, gated
 from strategies import small_ids
 
-gated("limit_files", "limit_db_size")
+gated("limit_files", "limit_db_size", "limit_partitions", "limit_close")
 # What a failed statement's error says about its transaction, besides that it failed.
 FORCED_CHECKPOINT_FAILED = "but the checkpoint it requires failed"
 APPLIED_ON_REOPEN = "applied when the database reopens"
@@ -293,7 +293,7 @@ class RecoveryRules(Session):
             self.kill_at("CHECKPOINT", syscall, n)
         elif end == "reopen":
             self.reopen_engine()
-        elif end == "full_close" and "limit_files" not in self.options.skipped:
+        elif end == "full_close" and self.files_limit_safe(closes=True):
             # Writes past the WAL's size fail, so the checkpoint that closing runs fails too.
             self.limit_files(self.wal_size())
             self.reopen_engine(clean=False)
@@ -325,7 +325,7 @@ class RecoveryRules(Session):
         if cap == "db_size":
             if "limit_db_size" in self.options.skipped or not self.reopen_capped(size):
                 return
-        elif "limit_files" in self.options.skipped:
+        elif not self.files_limit_safe(closes=False):
             return
         elif cap == "wal":
             self.limit_files(self.wal_size() + slack)
@@ -341,6 +341,8 @@ class RecoveryRules(Session):
                 self.limited_write(write, kind == "copy", state)
         if state.poisoned or state.on_reopen is not None:
             end = "crash" if end == "lift" else end
+        if end == "close" and cap != "db_size" and not self.files_limit_safe(closes=True):
+            end = "crash"
         if end == "lift":
             if cap == "files":
                 self.limit_files(None)
@@ -360,6 +362,14 @@ class RecoveryRules(Session):
             for id in state.doubt:
                 recovered[1].forget(id)
         self.check_recovered(*recovered)
+
+    def files_limit_safe(self, closes: bool) -> bool:
+        """Whether a file limit stays clear of the known full-disk crashes: a checkpoint with a
+        partitioned table (limit_partitions) and a close after a refused write (limit_close)."""
+        skipped = self.options.skipped
+        if "limit_files" in skipped or ("limit_partitions" in skipped and self.has_partitions()):
+            return False
+        return not (closes and "limit_close" in skipped)
 
     def wal_size(self) -> int:
         wal = f"{self.path}.wal"

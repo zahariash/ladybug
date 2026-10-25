@@ -145,6 +145,16 @@ KNOWN_BUGS = [
         "one closing the database runs, segfaults",
     ),
     Known(
+        "limit_partitions",
+        "with a partitioned table, a CHECKPOINT that a full disk fails segfaults in "
+        "FileInfo::truncate (not filed)",
+    ),
+    Known(
+        "limit_close",
+        "closing a database after a write that a full disk refused aborts: the WAL flush throws "
+        "out of a path that cannot throw (not filed)",
+    ),
+    Known(
         "pool_commit_crash",
         "#1377: a COMMIT that fails on a full buffer pool after its WAL record is written is "
         "applied after a crash (fix: PR #1380)",
