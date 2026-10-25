@@ -317,6 +317,7 @@ class Model:
         self.added_after_drop |= self.dropped_since_checkpoint
 
     def checkpointed(self) -> None:
+        self.indexed |= self.keyed_tables()
         self.dropped_since_checkpoint = self.added_after_drop = self.middle_dropped = False
         self.rolled_back_add = self.updated_since_checkpoint = False
 
@@ -333,6 +334,18 @@ class Model:
     graph: dict | None = None
     blobs: dict = field(default_factory=dict)  # id -> length of Blob.s
     next_blob_id: int = 0
+    # The tables of keyed_tables() whose primary-key index held keys at a checkpoint known to
+    # have succeeded.
+    indexed: set = field(default_factory=set)
+
+    def keyed_tables(self) -> set[str]:
+        """The tables with a hash-index primary key that hold rows now."""
+        held = {"Person": self.persons, "Blob": self.blobs, "GN": self.graph}
+        return {table for table, rows in held.items() if rows}
+
+    def first_index_pending(self) -> bool:
+        """Whether a table's primary-key index has keys but none at any checkpoint yet."""
+        return bool(self.keyed_tables() - self.indexed)
 
     def new_person(self, **values) -> dict:
         return {column: values.get(column, default) for column, default in self.columns.items()}
@@ -376,6 +389,7 @@ class Model:
             wrote=False,
             graph=None if self.graph is None else dict(self.graph),
             blobs=dict(self.blobs),
+            indexed=set(self.indexed),
         )
 
     def update(self, id: int, field: str, value) -> None:

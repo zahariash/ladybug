@@ -28,7 +28,13 @@ from rules.transactions import apply, op, statement
 from session import ONE_THREAD, Session, diff, enabled, gated
 from strategies import small_ids
 
-gated("limit_files", "limit_db_size", "failed_checkpoint_partitions", "wal_write_failure")
+gated(
+    "limit_files",
+    "limit_db_size",
+    "failed_checkpoint_partitions",
+    "wal_write_failure",
+    "failed_checkpoint_first_index",
+)
 # What a failed statement's error says about its transaction, besides that it failed.
 FORCED_CHECKPOINT_FAILED = "but the checkpoint it requires failed"
 APPLIED_ON_REOPEN = "applied when the database reopens"
@@ -326,6 +332,8 @@ class RecoveryRules(Session):
         fail it. A checkpoint reuses free pages before it grows the file, so a full disk fails
         only the writes that need more than the free space."""
         self.started_over = False
+        if not self.first_keys_checkpointed():
+            return
         size = os.path.getsize(self.path) + slack
         if cap == "db_size":
             if "limit_db_size" in self.options.skipped or not self.reopen_capped(size):
@@ -352,6 +360,8 @@ class RecoveryRules(Session):
         if state.poisoned or state.on_reopen is not None:
             end = "crash" if end == "lift" else end
         if state.wal_failed or (end == "close" and cap != "db_size" and not self.closes_safe()):
+            end = "crash"
+        if not self.first_index_safe():
             end = "crash"
         if end == "lift":
             # Lifting a size cap takes a reopen, whose close may lose a doubtful COPY; only a
@@ -383,6 +393,25 @@ class RecoveryRules(Session):
         if "limit_files" in skipped or not self.checkpoint_failures_safe():
             return False
         return not closes or self.closes_safe()
+
+    def first_keys_checkpointed(self) -> bool:
+        """Checkpoints first while a primary-key index has keys but none at a checkpoint yet: a
+        checkpoint that fails then, followed by one that succeeds, leaves the index empty on disk
+        (failed_checkpoint_first_index). False when that checkpoint may not run now."""
+        gated = "failed_checkpoint_first_index" in self.options.skipped
+        if not (gated and self.model.first_index_pending()):
+            return True
+        if not self.checkpoint_keeps_snapshots():
+            return False
+        self.ok("CHECKPOINT")
+        self.model.checkpointed()
+        return True
+
+    def first_index_safe(self) -> bool:
+        """Whether a checkpoint may succeed in this worker after one failed: not while a
+        primary-key index has keys but none at a checkpoint yet (see first_keys_checkpointed)."""
+        gated = "failed_checkpoint_first_index" in self.options.skipped
+        return not (gated and self.model.first_index_pending())
 
     def checkpoint_failures_safe(self) -> bool:
         """With a partitioned table, a checkpoint that fails segfaults rolling back
@@ -416,7 +445,7 @@ class RecoveryRules(Session):
         return True
 
     def limited_checkpoint(self, state: Limited) -> None:
-        if not self.checkpoint_keeps_snapshots():
+        if not (self.checkpoint_keeps_snapshots() and self.first_index_safe()):
             return
         failure = self.attempt(lambda: self.ok("CHECKPOINT"))
         if failure is None:
@@ -475,6 +504,8 @@ class RecoveryRules(Session):
         """COMMIT while another connection holds the buffer pool full, then a crash or a reopen:
         recovery must agree with what COMMIT reported, also when applying the committed
         transaction failed after its commit record was written."""
+        if not self.first_keys_checkpointed():
+            return
         conn = data.draw(st.sampled_from(self.free_sessions()))
         holder = data.draw(st.sampled_from([0, *(c for c in self.free_sessions() if c != conn)]))
         pending = self.model.fork()
@@ -500,7 +531,7 @@ class RecoveryRules(Session):
         recovered = pending if outcome in ("applied", "on_reopen") else self.model
         if outcome == "applied":
             self.model = pending
-        if end == "crash":
+        if end == "crash" or not self.first_index_safe():
             self.crash_engine()
         else:
             self.reopen_engine(clean=False)

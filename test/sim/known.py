@@ -155,6 +155,12 @@ KNOWN_BUGS = [
         "and closing the database aborts on the WAL flush (not filed)",
     ),
     Known(
+        "failed_checkpoint_first_index",
+        "#1406: after a checkpoint fails (a full disk) while a table's primary-key index has keys "
+        "but none at a checkpoint yet, the next one that succeeds leaves the index empty on disk: "
+        "after the next open, lookups miss every key and duplicates are accepted",
+    ),
+    Known(
         "pool_commit_crash",
         "#1377: a COMMIT that fails on a full buffer pool after its WAL record is written is "
         "applied after a crash (fix: PR #1380)",
