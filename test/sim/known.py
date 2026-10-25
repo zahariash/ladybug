@@ -121,7 +121,38 @@ KNOWN_BUGS = [
     ),
     Known(
         "second_writer",
-        "#1316: after a refused BEGIN TRANSACTION, the connection's next statement segfaults",
+        "#1316: after a refused BEGIN TRANSACTION, the connection's next statement segfaults "
+        "(fix: PR #1375)",
+    ),
+    Known(
+        "pinned_checkpoint",
+        "#1304: after a CHECKPOINT taken while a read-only transaction is open, a crash during "
+        "the next checkpoint, or a failed one, loses the commits since (fix: PR #1378)",
+    ),
+    Known(
+        "graphs",
+        "#1304: a crash after a CHECKPOINT taken while a read-only transaction is open leaves a "
+        "database with a named graph unopenable: the graph shadow file is missing (fix: PR #1379)",
+    ),
+    Known(
+        "limit_files",
+        "#1199: when the automatic checkpoint after a commit fails, the committed statement fails "
+        "too (fix: PR #1361)",
+    ),
+    Known(
+        "limit_db_size",
+        "#1386: after a write or checkpoint is refused at max_db_size, the next checkpoint, or the "
+        "one closing the database runs, segfaults",
+    ),
+    Known(
+        "pool_commit_crash",
+        "#1377: a COMMIT that fails on a full buffer pool after its WAL record is written is "
+        "applied after a crash (fix: PR #1380)",
+    ),
+    Known(
+        "checksums",
+        "#1357: opening a database with the other enable_checksums setting drops its WAL "
+        "(fix: PR #1358)",
     ),
 ]
 

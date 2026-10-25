@@ -136,3 +136,46 @@ def test_rules_mark_the_errors_they_expect() -> None:
                 assert "['expected'] = True" in body or "raise" in body, (
                     f"{path.name}:{node.lineno}"
                 )
+
+
+def test_write_outcomes_follow_what_the_error_says() -> None:
+    from rules.recovery import write_outcome
+
+    assert write_outcome(None, copy=False) == "applied"
+    old = "Transaction committed successfully, but the post-commit checkpoint failed. ..."
+    assert write_outcome(old, copy=False) == "auto_checkpoint"
+    assert write_outcome(old, copy=True) == "applied"
+    forced = "Transaction committed successfully, but the checkpoint it requires failed. ..."
+    assert write_outcome(forced, copy=True) == "doubtful"
+    reopen = "... logging its abort failed, so it is applied when the database reopens; ..."
+    assert write_outcome(reopen, copy=False) == "on_reopen"
+    assert write_outcome("IO exception: File too large", copy=False) == "failed"
+
+
+def test_size_caps_are_powers_of_two_of_at_least_8_mib() -> None:
+    from rules.recovery import capped_size
+
+    assert capped_size(1) == 8 << 20
+    assert capped_size(8 << 20) == 8 << 20
+    assert capped_size((8 << 20) + 1) == 16 << 20
+
+
+def test_graph_ops_and_blobs_change_the_model_as_their_statements_do() -> None:
+    from model import blob_lengths, blob_query
+    from rules.recovery import graph_apply, graph_statement
+
+    model = Model(graph={})
+    assert graph_statement(model, "gn_insert", 3, -1) == "CREATE (:GN {id: 3, v: -1})"
+    graph_apply(model, "gn_insert", 3, -1)
+    assert graph_statement(model, "gn_insert", 3, 5) is None
+    graph_apply(model, "gn_set", 3, 5)
+    graph_apply(model, "gn_set", 4, 5)
+    assert model.graph == {3: 5} and model.updated_since_checkpoint
+    graph_apply(model, "gn_delete", 3, 0)
+    assert model.graph == {}
+    model.next_blob_id = 9
+    ids = model.take_blob_ids(2)
+    assert ids == range(9, 11) and model.next_blob_id == 11
+    assert blob_lengths(ids, 3) == {9: 6, 10: 9}
+    query = blob_query(ids, 3)
+    assert "range(9, 10)" in query and "repeat(CAST(i AS STRING) + '-', 3)" in query

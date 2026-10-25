@@ -87,6 +87,29 @@ FOCUS = {
         "tables",
         "transaction",
     },
+    # Commits and checkpoints that fail or are interrupted, and recovery after them: pinned
+    # checkpoints, full disks, size caps, a full buffer pool, the named graph; without the query
+    # battery's longer checks and the DDL that recovery rules do not need.
+    "recovery": {
+        "bulk_copy",
+        "columns",
+        "count_keys",
+        "count_restricted",
+        "drop_macro",
+        "in_lists",
+        "lookup_join",
+        "macros",
+        "pk_index",
+        "pk_ranges",
+        "prepared_ddl",
+        "race",
+        "race_bulk",
+        "rel_columns",
+        "rename_table",
+        "repeated_aggregate",
+        "secondary_index",
+        "tables",
+    },
     # Transactions on several connections over person and Knows writes and column DDL.
     "sessions": {
         "bulk_copy",

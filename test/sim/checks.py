@@ -9,7 +9,7 @@ from contextlib import contextmanager
 import hypothesis.strategies as st
 from hypothesis.stateful import invariant, precondition, rule
 from model import C_FP, Model, cs_key, filler, text_query, two_hops, walk_ends
-from session import Session, diff, gated
+from session import GRAPH, Session, diff, gated
 from strategies import (
     CK2_SEED_SOURCE,
     CSR_BANDS,
@@ -87,6 +87,12 @@ class Checks(Session):
             rows = self.rows("MATCH (c:CS) RETURN count(*), sum(c.n)")
             expected = [(self.model.keys.count(), self.model.keys.total())]
             assert rows == expected, (rows, expected)
+        if self.model.graph is not None:
+            actual, expected = self.graph_rows(), self.model.graph_rows()
+            assert actual == expected, diff(actual, expected)
+        if self.has_blobs():
+            actual, expected = self.blob_rows(), Counter(self.model.blobs.items())
+            assert actual == expected, diff(actual, expected)
         for i, values in self.model.tables.items():
             # SERIAL ids must be unique; values are compared as a multiset.
             rows = self.rows(f"MATCH (t:T{i}) RETURN t.id, t.v")
@@ -104,9 +110,14 @@ class Checks(Session):
     def catalog_matches_model(self):
         if not self.engine:
             return
-        # show_tables leaves out the tables FTS and HNSW indexes keep, but lists partitions.
-        names = {name for (name,) in self.rows("CALL show_tables() RETURN name")}
-        tables = {name for name in names if not name.startswith("L_p")}
+        # show_tables leaves out the tables FTS and HNSW indexes keep, but lists partitions, and
+        # the named graphs' tables, marked with the graph.
+        query = "CALL show_tables() RETURN name, `database name`"
+        listed = self.rows(query)
+        graph_tables = {name for name, db in listed if db == f"{GRAPH}(graph)"}
+        tables = {name for name, db in listed if db != f"{GRAPH}(graph)"}
+        tables = {name for name in tables if not name.startswith("L_p")}
+        assert graph_tables == ({"GN"} if self.model.graph is not None else set()), listed
         expected = USER_TABLES | {f"T{i}" for i in self.model.tables}
         if self.has_partitions():
             expected.add("L")
@@ -114,6 +125,8 @@ class Checks(Session):
             expected |= {"C", "CK", "CK2"}
         if self.has_string_keys():
             expected.add("CS")
+        if self.has_blobs():
+            expected.add("Blob")
         if self.options.loaded:
             expected.add("Doc")
         assert tables == expected, tables

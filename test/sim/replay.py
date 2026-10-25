@@ -31,6 +31,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -66,9 +67,11 @@ class Replayer:
         self.reopen_loads = trace[0].get("reopen_loads", self.loads)
         self.engine = None
 
-    def open(self, inject=None, loads=None) -> None:
+    def open(self, inject=None, loads=None, overrides=None) -> None:
         self.engine = None
-        config = {**self.config, "max_num_threads": 1} if inject else self.config
+        config = {**self.config, **(overrides or {})}
+        if inject:
+            config["max_num_threads"] = 1
         loads = self.reopen_loads if loads is None else loads
         self.engine = Engine(self.path, config, loads, inject, self.debug)
 
@@ -88,8 +91,23 @@ class Replayer:
             self.engine.run(op["name"], op["params"])
         elif kind == "reopen":
             self.engine.close()
-            self.open()
+            self.open(overrides=op.get("config"))
         elif kind == "crash":
+            self.engine.kill()
+            self.open(overrides=op.get("config"))
+        elif kind == "open_again":
+            self.open()
+        elif kind == "limit":
+            self.engine.limit(op["size"])
+        elif kind == "kill_at":
+            self.engine.kill_at(op["syscall"], op["n"])
+            try:
+                self.engine.execute(op["query"], {})
+            except AssertionError:
+                if self.engine.process.exitcode != -signal.SIGKILL:
+                    raise
+            except EngineError:
+                pass
             self.engine.kill()
             self.open()
         elif kind == "crash_during":
@@ -245,7 +263,7 @@ def simplifications(op: dict) -> list[list[dict]]:
     options = []
     if op["op"] == "crash":
         options.append([dict(op="reopen")])
-    elif op["op"] in ("crash_during", "crash_at"):
+    elif op["op"] in ("crash_during", "crash_at", "kill_at"):
         statement = dict(op="execute", conn=0, query=op["query"], params={})
         options += [[statement, dict(op="reopen")], [statement, dict(op="crash")]]
     elif op["op"] == "prepared":
@@ -480,8 +498,12 @@ def shrink(trace: list, failure: tuple, out: str, args) -> tuple[list, tuple] | 
 
 def describe(op: dict) -> str:
     detail = op.get("query") or op.get("name") or ""
-    if op["op"] == "crash_at":
+    if op["op"] in ("crash_at", "kill_at"):
         detail = f"{op['syscall']} #{op['n']} in {detail}"
+    elif op["op"] == "limit":
+        detail = f"files to {op['size']} bytes"
+    elif op.get("config"):
+        detail = f"with {op['config']}"
     elif op["op"] == "race":
         detail = f"{len(op['writes'])} writes, {op['readers']} readers"
     return f"{op['op']:12} {detail[:110]}"

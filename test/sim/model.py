@@ -329,6 +329,10 @@ class Model:
     docs: dict = field(default_factory=dict)  # id -> Doc
     doc_indexes: dict = field(default_factory=dict)  # "doc_fts"/"doc_vec" -> stemmer/metric
     next_bulk_id: int = BULK_ID_START
+    # GN's rows in the named graph, id -> v, once the graph exists.
+    graph: dict | None = None
+    blobs: dict = field(default_factory=dict)  # id -> length of Blob.s
+    next_blob_id: int = 0
 
     def new_person(self, **values) -> dict:
         return {column: values.get(column, default) for column, default in self.columns.items()}
@@ -370,6 +374,8 @@ class Model:
             keys=self.keys.copy(),
             dropped_columns=set(self.dropped_columns),
             wrote=False,
+            graph=None if self.graph is None else dict(self.graph),
+            blobs=dict(self.blobs),
         )
 
     def update(self, id: int, field: str, value) -> None:
@@ -402,6 +408,26 @@ class Model:
 
     def person_rows(self) -> Counter:
         return Counter(canonical((id, *p.values())) for id, p in self.persons.items())
+
+    def graph_rows(self) -> Counter:
+        return Counter((self.graph or {}).items())
+
+    def take_blob_ids(self, count: int) -> range:
+        ids = range(self.next_blob_id, self.next_blob_id + count)
+        self.next_blob_id += count
+        return ids
+
+
+def blob_lengths(ids: range, units: int) -> dict:
+    """The lengths of the strings blob_query writes."""
+    return {i: units * (len(str(i)) + 1) for i in ids}
+
+
+def blob_query(ids: range, units: int) -> str:
+    """Blob rows of distinct long strings, which make the data file grow at the next checkpoint
+    (identical strings would share a dictionary entry)."""
+    rows = f"UNWIND range({ids.start}, {ids.stop - 1}) AS i"
+    return f"{rows} CREATE (:Blob {{id: i, s: repeat(CAST(i AS STRING) + '-', {units})}})"
 
 
 def walk_ends(pairs: Counter, src: int, lo: int, hi: int) -> Counter:

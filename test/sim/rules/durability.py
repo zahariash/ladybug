@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import shutil
+from collections import Counter
 
 import hypothesis.strategies as st
 from hypothesis.stateful import precondition, rule
@@ -148,20 +149,23 @@ class DurabilityRules(Session):
         return "CHECKPOINT", after
 
     def crash_state(self, model: Model | None = None) -> tuple:
-        """Person's rows, and C's rows (count, fingerprint, strings) and CK's edge count: in the
-        engine, or in `model`."""
+        """Person's rows; C's rows (count, fingerprint, strings) and CK's edge count; the named
+        graph's rows and Blob's: in the engine, or in `model`."""
         if model is not None:
             persons, big = model.person_rows(), model.big
             texts = big.text_count_size()[0]
             state = (big.count(), big.fingerprint(), texts, sum(model.ck.values()))
-            return persons, state if self.has_csr() else ()
+            blobs = Counter(model.blobs.items())
+            return persons, state if self.has_csr() else (), model.graph_rows(), blobs
         state = ()
         if self.has_csr():
             query = f"MATCH (c:C) RETURN count(*), sum({C_FP}), count(c.s)"
             [(rows, fingerprint, texts)] = self.rows(query)
             [(edges,)] = self.rows("MATCH ()-[k:CK]->() RETURN count(*)")
             state = (rows, fingerprint, texts, edges)
-        return self.person_rows(), state
+        graph = self.graph_rows() if self.model.graph is not None else Counter()
+        blobs = self.blob_rows() if self.has_blobs() else Counter()
+        return self.person_rows(), state, graph, blobs
 
     def check_crash(self, op: str, after: Model) -> None:
         """After a crash, the data is all of the statement or none of it."""
@@ -175,7 +179,8 @@ class DurabilityRules(Session):
         assert actual == before, (
             f"after a crash during {op}, the data is neither the state before nor after it: "
             f"{diff(actual[0], before[0])}; C rows and CK edges {actual[1]}, before {before[1]}, "
-            f"after {self.crash_state(after)[1]}"
+            f"after {self.crash_state(after)[1]}; graph {diff(actual[2], before[2])}; "
+            f"blobs {diff(actual[3], before[3])}"
         )
         # An interrupted statement may still have reserved rows, as for an interrupted COPY.
         self.model.persons_ever = after.persons_ever

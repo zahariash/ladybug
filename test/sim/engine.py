@@ -7,7 +7,10 @@ answer within TIMEOUT_SECONDS is killed and reported as hung, with the native st
 thread. With debug=True the worker runs under gdb, so a crash reports its native stack too.
 
 A worker can also run under strace, which kills it at the n-th call of one syscall: a crash
-point that does not depend on timing.
+point that does not depend on timing. strace either starts the worker or attaches to it while it
+runs, which keeps what the worker holds in memory (open snapshots, a pinned WAL) up to the kill.
+A worker can also limit the size of every file it writes (RLIMIT_FSIZE), so that writes past it
+fail as on a full disk.
 """
 
 from __future__ import annotations
@@ -18,12 +21,14 @@ import hashlib
 import multiprocessing
 import os
 import re
+import resource
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 
 TIMEOUT_SECONDS = int(os.environ.get("SIM_TIMEOUT_SECONDS", 300))
 PR_SET_PTRACER, PR_SET_PTRACER_ANY = 0x59616D61, ctypes.c_ulong(-1)
@@ -101,13 +106,21 @@ def hold(conn, held: list) -> int:
     return len(held)
 
 
+def limit_files(size: int | None) -> None:
+    """Fails writes that would make any file larger than `size` bytes; None lifts the limit."""
+    hard = resource.getrlimit(resource.RLIMIT_FSIZE)[1]
+    resource.setrlimit(resource.RLIMIT_FSIZE, (hard if size is None else size, hard))
+
+
 def serve(conns: list, db, connect, named: dict, held: list, message: tuple):
     """Handles one request: ("race", writes, queries, readers); ("prepared", connection,
     query, params), which prepares the query and executes it twice; ("columns", connection,
     query, params), the result's column names and rows; ("prepare", name,
     connection, query, params), which keeps the statement for ("run", name, params);
     ("hold", connection) and ("release",), which fill the buffer pool with unconsumed
-    results and free them; or (connection, query, params)."""
+    results and free them; ("limit", size), see limit_files; or (connection, query, params)."""
+    if message[0] == "limit":
+        return limit_files(message[1])
     if message[0] == "hold":
         return hold(conns[message[1]], held)
     if message[0] == "release":
@@ -147,8 +160,10 @@ def worker_main(
     """Opens the database with `config`, runs `loads` and serves requests until None.
     `tracer` = (library, directory) loads crash_trace.c's library, which writes the backtrace of
     a crash to the directory."""
-    # Lets the parent's gdb attach (ptrace_scope 1 only allows ancestors otherwise).
+    # Lets the parent's gdb and strace attach (ptrace_scope 1 only allows ancestors otherwise).
     ctypes.CDLL(None).prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0)
+    # A write past the file-size limit then fails with EFBIG instead of killing the worker.
+    signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
     if tracer:
         os.environ["SIM_CRASH_TRACE_DIR"] = tracer[1]
         ctypes.CDLL(tracer[0])
@@ -318,7 +333,7 @@ class Engine:
             target=worker_main, args=(child, path, config, loads, tracer), daemon=True
         )
         self.pid, self.request, self.build = None, "open", {}
-        self.gdb_output = None
+        self.gdb_output, self.strace = None, None
         if inject:
             env = dict(SIM_STRACE_SYSCALL=inject[0], SIM_STRACE_WHEN=str(inject[1]))
             executable = wrapper_executable("strace", STRACE_WRAPPER)
@@ -388,6 +403,43 @@ class Engine:
         self.send(("release",), "release results")
         self.reply()
 
+    def limit(self, size: int | None) -> None:
+        """Limits the size of every file the worker writes; None lifts the limit."""
+        self.send(("limit", size), f"limit files to {size} bytes")
+        self.reply()
+
+    def kill_at(self, syscall: str, n: int) -> None:
+        """Attaches strace to every thread of the running worker, to kill it at the n-th call of
+        `syscall` from now on. stop_strace detaches it if the worker survives."""
+        self.strace = subprocess.Popen(
+            ["strace", "-f", "-qq", "-o", "/dev/null", "-p", str(self.pid)]
+            + ["-e", f"trace={syscall}", "-e", f"inject={syscall}:signal=KILL:when={n}"],
+            stdin=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        deadline = time.monotonic() + 30
+        while not self.traced_by(self.strace.pid):
+            if self.strace.poll() is not None or time.monotonic() > deadline:
+                raise AssertionError(f"strace could not attach to the worker {self.pid}")
+            time.sleep(0.01)
+
+    def traced_by(self, tracer: int) -> bool:
+        try:
+            tasks = os.listdir(f"/proc/{self.pid}/task")
+            for task in tasks:
+                with open(f"/proc/{self.pid}/task/{task}/status") as f:
+                    if f"TracerPid:\t{tracer}\n" not in f.read():
+                        return False
+        except OSError:
+            return False
+        return True
+
+    def stop_strace(self) -> None:
+        if self.strace:
+            self.strace.terminate()  # strace detaches before it exits
+            self.strace.wait()
+            self.strace = None
+
     def start(self, query: str) -> None:
         """Sends a statement without waiting for it, to kill the worker while it runs."""
         self.send((0, query, {}), query)
@@ -439,6 +491,7 @@ class Engine:
         return "\n" + native_stacks(output)
 
     def close(self) -> None:
+        self.stop_strace()
         self.send(None, "close")
         self.reply()
         self.process.join()
@@ -454,6 +507,7 @@ class Engine:
         self.process.kill()
         self.process.join()
         self.pipe.close()
+        self.stop_strace()
         self.stop_gdb()
 
     def stop_gdb(self) -> None:

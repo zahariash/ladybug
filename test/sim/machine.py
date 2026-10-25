@@ -17,10 +17,11 @@ from rules.data import DataRules
 from rules.durability import DurabilityRules
 from rules.extensions import ExtensionRules
 from rules.prepared import PreparedRules
+from rules.recovery import RecoveryRules
 from rules.sessions import SessionRules
 from rules.transactions import TransactionRules
 from search import SearchChecks
-from session import FAILURES
+from session import BLOB_SCHEMA, FAILURES, GRAPH, GRAPH_SCHEMA
 from strategies import CK2_SEED, CS_ROWS, CSR_ROWS
 
 SCHEMA = [
@@ -41,6 +42,7 @@ class LadybugSim(
     SessionRules,
     ExtensionRules,
     DurabilityRules,
+    RecoveryRules,
     BigRules,
     SearchChecks,
     Checks,
@@ -53,8 +55,9 @@ class LadybugSim(
         compression=st.booleans(),
         checkpoint_threshold=st.sampled_from([-1, 0, 4096]),
         c_fill=st.sampled_from(["copy", "create"]),
+        checksums=st.booleans(),
     )
-    def open_db(self, threads, compression, checkpoint_threshold, c_fill):
+    def open_db(self, threads, compression, checkpoint_threshold, c_fill, checksums):
         # The files of the current workload live with its trace, so a failure can be replayed.
         self.files = os.path.join(self.options.traces or self.dir, f"current-{os.getpid()}")
         shutil.rmtree(self.files, ignore_errors=True)
@@ -67,6 +70,7 @@ class LadybugSim(
             # The engine's default: recovery drops a WAL tail a crash tore, which the crash checks
             # then verify; the Python driver's default refuses to open the database instead.
             throw_on_wal_replay_failure=False,
+            enable_checksums=checksums,
         )
         self.c_fill = c_fill
         self.new_database()
@@ -96,6 +100,12 @@ class LadybugSim(
         if art_pk:
             self.ok("CREATE ART INDEX person_pk FOR (p:Person) ON (p.id)")
             self.model.pk_index = "person_pk"
+        if self.has_blobs():
+            self.ok(BLOB_SCHEMA)
+        if self.has_graph():
+            self.ok(f"CREATE GRAPH {GRAPH}")
+            self.in_graph(lambda: self.ok(GRAPH_SCHEMA))
+            self.model.graph = {}
         if self.has_csr():
             create = "MATCH (a:C {id: $a}), (b:C {id: $b}) CREATE (a)-[:CK2 {w: 0}]->(b)"
             for src, dst in CK2_SEED:

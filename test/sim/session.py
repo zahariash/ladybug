@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import sys
 import time
 from collections import Counter
@@ -32,6 +33,11 @@ DUPLICATE_KEY = "duplicated primary key"
 C_SORTED = "ALTER TABLE C SET SORTED BY (id ASC) CSR"
 # A COPY on several threads stores rows out of input order; the declaration is not checked.
 ONE_THREAD = "CALL threads=1"
+# The named graph and its table. USE GRAPH switches the default graph of every connection, so
+# rules switch to it only around their own statements (Session.in_graph).
+GRAPH = "g"
+GRAPH_SCHEMA = "CREATE NODE TABLE GN(id INT64 PRIMARY KEY, v INT64)"
+BLOB_SCHEMA = "CREATE NODE TABLE Blob(id INT64 PRIMARY KEY, s STRING)"
 
 
 def copy_c(start: int, count: int) -> str:
@@ -209,6 +215,17 @@ class Session:
         """Whether C and CK exist: only while the csr rules run."""
         return "csr" not in self.options.skipped
 
+    def has_graph(self) -> bool:
+        """Whether the named graph g exists: only while its rules run."""
+        return "graphs" not in self.options.skipped
+
+    def has_blobs(self) -> bool:
+        """Whether Blob, whose long strings storage_limit writes, exists: while either of its
+        limits runs."""
+        skipped = self.options.skipped
+        limits = {"limit_files", "limit_db_size"}
+        return "storage_limit" not in skipped and not limits <= skipped
+
     def has_string_keys(self) -> bool:
         """Whether CS exists: only while its rules run."""
         return self.has_csr() and "string_keys" not in self.options.skipped
@@ -293,7 +310,13 @@ class Session:
         op["outcome"] = "ok"
         return result
 
-    def open_engine(self, inject: tuple[str, int] | None = None, crashed: bool = False) -> None:
+    def open_engine(
+        self,
+        inject: tuple[str, int] | None = None,
+        crashed: bool = False,
+        overrides: dict | None = None,
+    ) -> None:
+        """Starts a worker on the database; `overrides` change settings for this worker only."""
         self.engine = None
         self.kept = {}
         # A new worker has new connections, without transactions.
@@ -304,7 +327,7 @@ class Session:
         # replays the WAL but leaves the column-ID gaps it found.
         if getattr(self, "model", None) is not None and not crashed:
             self.model.checkpointed()
-        config = self.config
+        config = {**self.config, **(overrides or {})}
         if inject:
             # With one worker thread, the caller and the worker take turns, so the n-th call
             # of a syscall is the same call in every run.
@@ -325,12 +348,69 @@ class Session:
         self.started_over = True
         self.new_database(fresh=True)
 
-    def reopen_engine(self) -> None:
-        self.traced(dict(op="reopen"), lambda: (self.engine.close(), self.open_engine()))
-
-    def crash_engine(self) -> None:
+    def reopen_engine(self, overrides: dict | None = None, clean: bool = True) -> None:
+        """Closes the database and opens it again; `clean` is false when the checkpoint that
+        closing runs may have failed, so that recovery replays the WAL."""
         self.started_over = False
-        self.traced(dict(op="crash"), lambda: (self.engine.kill(), self.open_engine(crashed=True)))
+        op = dict(op="reopen", **({"config": overrides} if overrides else {}))
+        self.traced(
+            op,
+            lambda: (self.engine.close(), self.open_engine(crashed=not clean, overrides=overrides)),
+        )
+
+    def crash_engine(self, overrides: dict | None = None) -> None:
+        self.started_over = False
+        op = dict(op="crash", **({"config": overrides} if overrides else {}))
+        self.traced(
+            op, lambda: (self.engine.kill(), self.open_engine(crashed=True, overrides=overrides))
+        )
+
+    def open_again(self) -> None:
+        """Opens the database with the workload's settings after an open that failed."""
+        self.traced(dict(op="open_again"), lambda: self.open_engine(crashed=True))
+
+    def limit_files(self, size: int | None) -> None:
+        """Fails the worker's writes past `size` bytes of any file, as a full disk would; None
+        lifts the limit. A new worker starts without one."""
+        self.traced(dict(op="limit", size=size), lambda: self.engine.limit(size))
+
+    def kill_at(self, query: str, syscall: str, n: int) -> None:
+        """Kills the running worker at the n-th call of `syscall` in the statement, by strace
+        attached to it, or after the statement if it makes fewer, and opens the engine again.
+        Unlike crash_at_syscall_point, the worker keeps what it holds until then: open snapshots
+        and a WAL that a pinned checkpoint kept."""
+
+        self.started_over = False
+
+        def call():
+            self.engine.kill_at(syscall, n)
+            try:
+                self.engine.execute(query, {})
+            except AssertionError:
+                if self.engine.process.exitcode != -signal.SIGKILL:
+                    raise
+            except EngineError:
+                pass
+            self.engine.kill()
+            self.open_engine(crashed=True)
+
+        self.traced(dict(op="kill_at", query=query, syscall=syscall, n=n), call)
+
+    def in_graph(self, call):
+        """Runs `call` with the named graph as the default graph, which every connection
+        shares, and switches back to the main graph after it, unless the worker died."""
+        self.ok(f"USE GRAPH {GRAPH}")
+        try:
+            return call()
+        finally:
+            if self.engine is not None and self.engine.process.is_alive():
+                self.ok("USE GRAPH main")
+
+    def graph_rows(self) -> Counter:
+        return Counter(self.in_graph(lambda: self.rows("MATCH (n:GN) RETURN n.id, n.v")))
+
+    def blob_rows(self) -> Counter:
+        return Counter(self.rows("MATCH (b:Blob) RETURN b.id, size(b.s)"))
 
     def crash_during_statement(self, query: str, delay: float) -> None:
         """Sends a statement, kills the engine `delay` seconds later and opens it again."""

@@ -15,7 +15,7 @@ import hypothesis.strategies as st
 from engine import EngineError
 from hypothesis.stateful import precondition, rule
 from model import Model
-from rules.transactions import apply, op, statement
+from rules.transactions import NO_TRANSACTION, apply, op, statement
 from session import Session, enabled, gated
 from strategies import clusters, near_boundaries, small_ids
 
@@ -130,11 +130,22 @@ class SessionRules(Session):
 
     @enabled("second_writer", writes=False)
     @precondition(lambda self: self.session_writer() is not None and self.free_sessions())
-    @rule(data=st.data())
-    def second_writer(self, data):
+    @rule(data=st.data(), then=st.sampled_from(["read", "write", "read_only", "commit"]))
+    def second_writer(self, data, then):
+        """A refused BEGIN leaves the connection without a transaction: its next statement runs
+        on its own, a write fails beside the writer, a read-only BEGIN opens a snapshot and
+        COMMIT finds nothing to commit."""
         conn = data.draw(st.sampled_from(self.free_sessions()))
         self.fails("BEGIN TRANSACTION", None, ONE_WRITER, conn)
-        self.check("MATCH (p:Person) RETURN count(*)", {}, [(len(self.model.persons),)], conn=conn)
+        if then == "write":
+            self.fails(f"CREATE (:Person {{id: {data.draw(small_ids)}}})", None, ONE_WRITER, conn)
+        elif then == "read_only" and self.snapshots_safe() and self.no_pending_update():
+            self.ok("BEGIN TRANSACTION READ ONLY", conn=conn)
+            self.txns[conn] = Txn("read", self.model.fork())
+        elif then == "commit":
+            self.fails("COMMIT", None, NO_TRANSACTION, conn)
+        persons = [(len(self.model.persons),)]
+        self.check("MATCH (p:Person) RETURN count(*)", {}, persons, conn=conn)
 
     @enabled("sessions", writes=False)
     @rule(

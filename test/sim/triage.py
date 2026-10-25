@@ -18,7 +18,7 @@ import re
 FRAME = re.compile(r"^#(\d+) (lbug::\S+)")
 PAD = "UNWIND range(1, n) AS i RETURN 'pad-' + CAST(i AS STRING)"
 # Steps that end the worker process; what follows runs in a new one.
-LIFETIME_ENDS = ("crash", "reopen", "crash_during", "crash_at")
+LIFETIME_ENDS = ("crash", "reopen", "crash_during", "crash_at", "kill_at", "open_again")
 
 
 def top_frames(message: str, count: int = 3) -> list[str]:
@@ -155,10 +155,21 @@ def cypher(trace: list, failing: int, failure: str, config: dict) -> str:
             text = "// kill the process (SIGKILL), then open the database again"
         elif kind == "reopen":
             text = "// close the database and open it again"
+        elif kind == "open_again":
+            text = "// open the database again"
+        elif kind == "limit" and op["size"] is None:
+            text = "// lift the file size limit"
+        elif kind == "limit":
+            text = f"// writes past {op['size']} bytes of any file fail (RLIMIT_FSIZE)"
         elif kind == "crash_during":
             text = f"{terminated(statement)}  // killed {op['delay']:.2f} s after it started"
         elif kind == "crash_at":
             text = f"{terminated(statement)}  // killed at {op['syscall']} call {op['n']}"
+        elif kind == "kill_at":
+            text = (
+                f"{terminated(statement)}  // killed at its {op['syscall']} call {op['n']} "
+                "(strace attached to the running process)"
+            )
         elif kind == "race":
             text = f"// race: {len(op['writes'])} writes against {op['readers']} readers"
         elif kind == "hold":
@@ -167,6 +178,8 @@ def cypher(trace: list, failing: int, failure: str, config: dict) -> str:
             text = "// free those results"
         else:
             continue
+        if op.get("config"):
+            text += f", with {', '.join(f'{k}={v}' for k, v in op['config'].items())}"
         if op.get("expected"):
             text += "  // fails, as expected"
         if i == failing:
@@ -176,16 +189,18 @@ def cypher(trace: list, failing: int, failure: str, config: dict) -> str:
 
 
 def stages(trace: list, failing: int) -> list[dict]:
-    """The steps up to the failing one, split into worker lifetimes. Each stage ends in "crash",
-    "reopen", "crash_during", "crash_at" or "last"; the step that ends a stage is its "end"."""
-    result, steps = [], []
+    """The steps up to the failing one, split into worker lifetimes. Each stage ends in one of
+    LIFETIME_ENDS or "last"; the step that ends a stage is its "end". A stage opens with the
+    settings the step before it gives ("config"), and may be expected not to open."""
+    result, steps, opening = [], [], {}
     for op in trace[1 : failing + 1]:
         if op["op"] in LIFETIME_ENDS:
-            result.append(dict(steps=steps, end=op))
+            result.append(dict(steps=steps, end=op, **opening))
             steps = []
+            opening = dict(config=op.get("config") or {}, open_fails=bool(op.get("expected")))
         elif op["op"] != "failure":
             steps.append(op)
-    result.append(dict(steps=steps, end=dict(op="last")))
+    result.append(dict(steps=steps, end=dict(op="last"), **opening))
     return result
 
 
@@ -196,7 +211,10 @@ it, and 2 when it cannot tell:  PYTHONPATH=<python build> python {name}
 
 {cypher}"""
 
+import ctypes
 import os
+import resource
+import signal
 import subprocess
 import sys
 import tempfile
@@ -213,16 +231,31 @@ TIMEOUT = 300
 PAD = "UNWIND range(1, $n) AS i RETURN 'pad-' + CAST(i AS STRING)"
 
 
+def attach_strace(syscall, n):
+    """strace, attached to every thread of this process, kills it at the n-th call from now."""
+    ctypes.CDLL(None).prctl(0x59616D61, ctypes.c_ulong(-1), 0, 0, 0)  # lets strace attach
+    tracer = subprocess.Popen(["strace", "-f", "-qq", "-o", "/dev/null", "-p", str(os.getpid()),
+                               "-e", f"trace={{syscall}}",
+                               "-e", f"inject={{syscall}}:signal=KILL:when={{n}}"])
+    tasks = f"/proc/{{os.getpid()}}/task"
+    while not all(f"TracerPid:\\t{{tracer.pid}}\\n" in open(f"{{tasks}}/{{t}}/status").read()
+                  for t in os.listdir(tasks)):
+        time.sleep(0.01)
+
+
 def run_stage(path, index):
     import ladybug as lb
 
+    signal.signal(signal.SIGXFSZ, signal.SIG_IGN)  # a write past the size limit fails instead
     stage = STAGES[index]
-    config = dict(CONFIG, max_num_threads=1) if stage["end"]["op"] == "crash_at" else CONFIG
+    config = dict(CONFIG, **stage.get("config", {{}}))
+    if stage["end"]["op"] == "crash_at":
+        config["max_num_threads"] = 1
     try:
         db = lb.Database(path, **config)
     except RuntimeError as e:
         print(f"stage {{index}} open: {{str(e).splitlines()[0]}}", flush=True)
-        os._exit(3)
+        os._exit(0 if stage.get("open_fails") else 3)
     conns, named, held = {{}}, {{}}, []
 
     def conn(i):
@@ -253,6 +286,10 @@ def run_stage(path, index):
                             break
             elif op["op"] == "release":
                 held.clear()
+            elif op["op"] == "limit":
+                hard = resource.getrlimit(resource.RLIMIT_FSIZE)[1]
+                size = hard if op["size"] is None else op["size"]
+                resource.setrlimit(resource.RLIMIT_FSIZE, (size, hard))
             elif op["op"] == "race":
                 print("a race step: replay the trace with replay.py instead", flush=True)
                 os._exit(4)
@@ -268,6 +305,10 @@ def run_stage(path, index):
         time.sleep(end["delay"])
         os._exit(0)
     if end["op"] == "crash_at":  # strace kills the process at the recorded call
+        conn(0).execute(end["query"])
+        os._exit(0)
+    if end["op"] == "kill_at":
+        attach_strace(end["syscall"], end["n"])
         conn(0).execute(end["query"])
         os._exit(0)
     conns.clear()
@@ -287,7 +328,7 @@ def outcome(path, index):
     except subprocess.TimeoutExpired:
         return "hung"
     sys.stdout.write(result.stdout)
-    if end["op"] in ("crash_during", "crash_at") and result.returncode in (0, -9, 137):
+    if end["op"] in ("crash_during", "crash_at", "kill_at") and result.returncode in (0, -9, 137):
         return "ok"
     if result.returncode < 0:
         return "died"

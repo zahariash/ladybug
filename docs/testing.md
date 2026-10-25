@@ -108,6 +108,20 @@ Session rules (`--sim-focus sessions`) interleave transactions on three more con
 step per rule: read-only snapshots, a write transaction, writes that must fail beside it, and
 the query battery against what each connection should see.
 
+Recovery rules (`--sim-focus recovery`) make commits and checkpoints fail or stop halfway, then
+crash or reopen, and check that every write that succeeded survives and every one that failed
+does not. `pinned_checkpoint` writes around a `CHECKPOINT` taken while a read-only transaction is
+open, which keeps the WAL, then kills the engine during the next checkpoint: strace attaches to
+the running worker, so that the snapshot and the kept WAL last until the kill. `storage_limit`
+limits every file the worker writes (`RLIMIT_FSIZE`, as a full disk) or reopens under a
+`max_db_size` just above the data file, writes rows of long strings into `Blob` to grow it, and
+ends by lifting the limit, a crash or a close; an automatic checkpoint that fails must not fail
+the commit before it. `commit_pressure_crash` commits while another connection holds the buffer
+pool full, and `reopen_checksums` opens a crashed database with the other `enable_checksums`
+setting, which must refuse the WAL. With the `graphs` rules, a named graph `g` holds a table
+`GN`; `USE GRAPH` switches every connection, so rules switch to it around their own statements
+only.
+
 ### Triaging a failure
 
 Crashes, hangs and errors where the original statement succeeded are replayed without the

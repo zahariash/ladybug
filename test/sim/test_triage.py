@@ -126,3 +126,41 @@ def test_after_last_fresh_starts_the_trace_at_the_last_fresh_database() -> None:
     trace = [head, step, fresh, step, dict(fresh, loads=["first''"]), step]
     assert triage.after_last_fresh(trace) == [dict(head, loads=["first''"]), step]
     assert triage.after_last_fresh([head, step]) == [head, step]
+
+
+FAILURE_TRACE = [
+    dict(op="open", config=dict(enable_checksums=True), loads=[]),
+    dict(op="execute", conn=0, query="CREATE (:T3 {id: 1})", params={}),
+    dict(op="crash", config=dict(enable_checksums=False), outcome="error: x", expected=True),
+    dict(op="open_again"),
+    dict(op="limit", size=4096),
+    dict(op="execute", conn=0, query="CALL threads=1", params={}),
+    dict(op="kill_at", query="CHECKPOINT", syscall="fsync", n=2),
+    dict(op="execute", conn=0, query="MATCH (t:T3) RETURN t.id", params={}),
+]
+
+
+def test_stages_carry_the_settings_and_expected_failure_of_their_open() -> None:
+    stages = triage.stages(FAILURE_TRACE, 7)
+    assert [stage["end"]["op"] for stage in stages] == ["crash", "open_again", "kill_at", "last"]
+    assert stages[1]["config"] == dict(enable_checksums=False) and stages[1]["open_fails"]
+    assert stages[2]["config"] == {} and not stages[2]["open_fails"]
+    assert [op["op"] for op in stages[2]["steps"]] == ["limit", "execute"]
+
+
+def test_cypher_describes_limits_overrides_and_attached_kills() -> None:
+    text = triage.cypher(FAILURE_TRACE, 7, "error: x", {})
+    assert "then open the database again, with enable_checksums=False  // fails" in text
+    assert "// writes past 4096 bytes of any file fail (RLIMIT_FSIZE)" in text
+    assert "CHECKPOINT;  // killed at its fsync call 2 (strace attached" in text
+    source = triage.script(FAILURE_TRACE, 7, "error", "x", {}, "trace.min.py")
+    ast.parse(source)
+    assert "def attach_strace" in source
+
+
+def test_replay_simplifies_an_attached_kill_to_the_statement_and_a_crash() -> None:
+    options = replay.simplifications(FAILURE_TRACE[6])
+    assert [[op["op"] for op in option] for option in options] == [
+        ["execute", "reopen"],
+        ["execute", "crash"],
+    ]
