@@ -35,6 +35,17 @@ APPLIED_ON_REOPEN = "applied when the database reopens"
 POISONED = "refuses further writes"
 DB_SIZE_CAP = "Maximum database size"
 CHECKSUMS = "enableChecksums"
+# What a write or checkpoint that a storage limit fails may say; anything else is a finding.
+STORAGE_ERRORS = (
+    "IO exception",
+    "File too large",
+    "Buffer manager exception",
+    "Checkpoint rollback failed",
+    POISONED,
+    COMMITTED_BUT,
+    FORCED_CHECKPOINT_FAILED,
+    APPLIED_ON_REOPEN,
+)
 # max_db_size is a power of two of at least two page groups of 1024 pages.
 MIN_DB_SIZE = 8 * 1024 * 1024
 # Blob stops growing here, since the data checks read every row after every step.
@@ -51,7 +62,7 @@ write_op = st.one_of(op, graph_op)
 # checkpoint, CHECKPOINT, and COPY, whose checkpoint is part of the statement.
 limited_op = st.one_of(
     write_op,
-    st.tuples(st.just("blob"), st.integers(1, 500), st.integers(10, 1000)),
+    st.tuples(st.just("blob"), st.integers(1, 500), st.integers(10, 4000)),
     st.tuples(st.just("checkpoint"), st.none(), st.none()),
     st.tuples(st.just("copy"), st.integers(1, 3000), st.none()),
 )
@@ -255,7 +266,7 @@ class RecoveryRules(Session):
         before=st.lists(write_op, max_size=4),
         after=st.lists(write_op, max_size=6),
         close_reader=st.booleans(),
-        end=st.sampled_from(["crash", "kill_at", "reopen", "full_close"]),
+        end=st.sampled_from(["crash", "kill_at", "kill_at", "reopen", "full_close"]),
         data=st.data(),
     )
     def pinned_checkpoint(self, before, after, close_reader, end, data):
@@ -274,15 +285,17 @@ class RecoveryRules(Session):
         for kind, a, b in after:
             self.write(kind, a, b)
         if end == "kill_at" and shutil.which("strace"):
+            # A small checkpoint makes few calls; later ones would kill it after it finished.
             syscall = data.draw(st.sampled_from(sorted(SYSCALLS)))
-            n = data.draw(st.integers(1, SYSCALLS[syscall]))
+            n = data.draw(st.integers(1, min(8, SYSCALLS[syscall])))
             # One thread makes the n-th call the same call in every run.
             self.ok(ONE_THREAD)
             self.kill_at("CHECKPOINT", syscall, n)
         elif end == "reopen":
             self.reopen_engine()
         elif end == "full_close" and "limit_files" not in self.options.skipped:
-            self.limit_files(os.path.getsize(self.path))
+            # Writes past the WAL's size fail, so the checkpoint that closing runs fails too.
+            self.limit_files(self.wal_size())
             self.reopen_engine(clean=False)
         else:
             self.crash_engine()
@@ -291,7 +304,7 @@ class RecoveryRules(Session):
     @enabled("storage_limit")
     @precondition(lambda self: self.has_blobs())
     @rule(
-        cap=st.sampled_from(["files", "db_size"]),
+        cap=st.sampled_from(["files", "wal", "db_size"]),
         slack=st.sampled_from([0, 4096, 1 << 16, 1 << 20, 1 << 23]),
         ops=st.lists(limited_op, min_size=1, max_size=10),
         pin=st.booleans(),
@@ -300,10 +313,13 @@ class RecoveryRules(Session):
     )
     def storage_limit(self, cap, slack, ops, pin, end, data):
         """Writes, checkpoints and COPY against a full disk (every file limited to the data
-        file's size plus `slack`) or a database size cap just above it, optionally with a reader
-        that pins the checkpoints. Then the limit is lifted and a CHECKPOINT must succeed, or a
-        crash, or a close whose checkpoint may fail. A write that succeeded must survive and one
-        that failed must not; the automatic checkpoint after a commit must not fail it."""
+        file's size plus `slack`), a file limit just above the WAL's size, which also fails the
+        checkpoint writes past it, or a database size cap just above the data file, optionally
+        with a reader that pins the checkpoints. Then the limit is lifted and a CHECKPOINT must
+        succeed, or a crash, or a close whose checkpoint may fail. A write that succeeded must
+        survive and one that failed must not; the automatic checkpoint after a commit must not
+        fail it. A checkpoint reuses free pages before it grows the file, so a full disk fails
+        only the writes that need more than the free space."""
         self.started_over = False
         size = os.path.getsize(self.path) + slack
         if cap == "db_size":
@@ -311,6 +327,8 @@ class RecoveryRules(Session):
                 return
         elif "limit_files" in self.options.skipped:
             return
+        elif cap == "wal":
+            self.limit_files(self.wal_size() + slack)
         else:
             self.limit_files(size)
         if pin:
@@ -343,6 +361,10 @@ class RecoveryRules(Session):
                 recovered[1].forget(id)
         self.check_recovered(*recovered)
 
+    def wal_size(self) -> int:
+        wal = f"{self.path}.wal"
+        return os.path.getsize(wal) if os.path.exists(wal) else 0
+
     def reopen_capped(self, size: int) -> bool:
         """Reopens the database under the smallest size cap that holds `size` bytes; false when
         it does not open under it, after opening it again without."""
@@ -362,7 +384,9 @@ class RecoveryRules(Session):
         if failure is None:
             self.model.checkpointed()
             state.doubt.clear()
-        elif POISONED in failure:
+            return
+        assert any(error in failure for error in STORAGE_ERRORS), failure
+        if POISONED in failure:
             self.after_poison(state)
 
     def limited_write(self, write: Write, copy: bool, state: Limited) -> None:
@@ -373,6 +397,8 @@ class RecoveryRules(Session):
         )
         if outcome != "failed":
             assert write.error is None, f"expected an error with {write.error!r}"
+        elif not (write.error and write.error in failure):
+            assert any(error in failure for error in STORAGE_ERRORS), failure
         if copy:
             self.model.persons_ever = True  # a COPY reserves rows even when it fails
         if outcome in ("applied", "doubtful"):
