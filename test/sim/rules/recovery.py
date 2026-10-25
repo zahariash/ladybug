@@ -28,7 +28,7 @@ from rules.transactions import apply, op, statement
 from session import ONE_THREAD, Session, diff, enabled, gated
 from strategies import small_ids
 
-gated("limit_files", "limit_db_size", "limit_partitions", "limit_close")
+gated("limit_files", "limit_db_size", "failed_checkpoint_partitions", "wal_write_failure")
 # What a failed statement's error says about its transaction, besides that it failed.
 FORCED_CHECKPOINT_FAILED = "but the checkpoint it requires failed"
 APPLIED_ON_REOPEN = "applied when the database reopens"
@@ -127,6 +127,7 @@ class Limited:
     on_reopen: Model | None = None  # the data after recovery applies a rolled-back transaction
     doubt: set = field(default_factory=set)  # persons of a COPY no checkpoint has made durable
     poisoned: bool = False  # writes fail until a restart
+    wal_failed: bool = False  # a WAL write failed (wal_write_failure: only a crash is safe now)
 
 
 class RecoveryRules(Session):
@@ -306,7 +307,7 @@ class RecoveryRules(Session):
         self.check_recovered()
 
     @enabled("storage_limit")
-    @precondition(lambda self: self.has_blobs())
+    @precondition(lambda self: self.has_blobs() and self.checkpoint_failures_safe())
     @rule(
         cap=st.sampled_from(["files", "wal", "db_size"]),
         slack=st.sampled_from([0, 4096, 1 << 16, 1 << 20, 1 << 23]),
@@ -332,20 +333,25 @@ class RecoveryRules(Session):
         elif not self.files_limit_safe(closes=False):
             return
         elif cap == "wal":
-            self.limit_files(self.wal_size() + slack)
+            # An automatic checkpoint's failed WAL write is only a warning; room for the WAL
+            # keeps the failed writes to statements, which the wal_write_failure gate sees.
+            room = slack if self.closes_safe() else max(slack, 1 << 20)
+            self.limit_files(self.wal_size() + room)
         else:
             self.limit_files(size)
         if pin:
             self.open_reader(data)
         state = Limited()
         for kind, a, b in ops:
+            if state.wal_failed:
+                break
             if kind == "checkpoint":
                 self.limited_checkpoint(state)
             elif (write := self.plan_write(kind, a, b)) is not None:
                 self.limited_write(write, kind == "copy", state)
         if state.poisoned or state.on_reopen is not None:
             end = "crash" if end == "lift" else end
-        if end == "close" and cap != "db_size" and not self.files_limit_safe(closes=True):
+        if state.wal_failed or (end == "close" and cap != "db_size" and not self.closes_safe()):
             end = "crash"
         if end == "lift":
             # Lifting a size cap takes a reopen, whose close may lose a doubtful COPY; only a
@@ -371,12 +377,27 @@ class RecoveryRules(Session):
         self.check_recovered(*recovered)
 
     def files_limit_safe(self, closes: bool) -> bool:
-        """Whether a file limit stays clear of the known full-disk crashes: a checkpoint with a
-        partitioned table (limit_partitions) and a close after a refused write (limit_close)."""
+        """Whether a file limit stays clear of the known full-disk bugs: a failed checkpoint
+        with a partitioned table, and a close that writes the WAL past the limit."""
         skipped = self.options.skipped
-        if "limit_files" in skipped or ("limit_partitions" in skipped and self.has_partitions()):
+        if "limit_files" in skipped or not self.checkpoint_failures_safe():
             return False
-        return not (closes and "limit_close" in skipped)
+        return not closes or self.closes_safe()
+
+    def checkpoint_failures_safe(self) -> bool:
+        """With a partitioned table, a checkpoint that fails segfaults rolling back
+        (failed_checkpoint_partitions)."""
+        gated = "failed_checkpoint_partitions" in self.options.skipped
+        return not (gated and self.has_partitions())
+
+    def closes_safe(self) -> bool:
+        """Closing under a file limit writes the WAL, and a failed WAL write leaves it unusable:
+        the next commit waits forever and closing aborts (wal_write_failure)."""
+        return "wal_write_failure" not in self.options.skipped
+
+    def wal_write_failed(self, failure: str, state: Limited) -> None:
+        if ".wal " in failure and "wal_write_failure" in self.options.skipped:
+            state.wal_failed = True
 
     def wal_size(self) -> int:
         wal = f"{self.path}.wal"
@@ -403,6 +424,7 @@ class RecoveryRules(Session):
             state.doubt.clear()
             return
         assert any(error in failure for error in STORAGE_ERRORS), failure
+        self.wal_write_failed(failure, state)
         if POISONED in failure:
             self.after_poison(state)
 
@@ -416,6 +438,8 @@ class RecoveryRules(Session):
             assert write.error is None, f"expected an error with {write.error!r}"
         elif not (write.error and write.error in failure):
             assert any(error in failure for error in STORAGE_ERRORS), failure
+        if failure is not None:
+            self.wal_write_failed(failure, state)
         if copy:
             self.model.persons_ever = True  # a COPY reserves rows even when it fails
         if outcome in ("applied", "doubtful"):
@@ -433,7 +457,7 @@ class RecoveryRules(Session):
 
     def after_poison(self, state: Limited) -> None:
         """Once writes are refused, a refused BEGIN must leave the connection usable."""
-        if state.poisoned:
+        if state.poisoned or state.wal_failed:
             return
         state.poisoned = True
         if "second_writer" not in self.options.skipped:
@@ -441,7 +465,7 @@ class RecoveryRules(Session):
             self.ok("RETURN 1")
 
     @enabled("pool_commit_crash")
-    @precondition(lambda self: len(self.free_sessions()) >= 1)
+    @precondition(lambda self: len(self.free_sessions()) >= 1 and self.checkpoint_failures_safe())
     @rule(
         ops=st.lists(op, min_size=1, max_size=6),
         end=st.sampled_from(["crash", "reopen"]),
