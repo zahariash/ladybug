@@ -119,7 +119,8 @@ bool ExtensionInstaller::installExtension() {
     auto localLibFilePath =
         extension::ExtensionUtils::getLocalPathForExtensionLib(&context, info.name);
     if (vfs->fileOrPathExists(localLibFilePath) && !info.forceInstall) {
-        // The extension has been installed, skip downloading from the repo.
+        // Files placed here ahead of time are kept and INSTALL works offline; FORCE INSTALL and
+        // UPDATE re-download.
         return false;
     }
     auto localDirForSharedLib = extension::ExtensionUtils::getLocalPathForSharedLib(&context);

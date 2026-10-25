@@ -1,5 +1,6 @@
 add_lbug_api_test(api_test
         api_test.cpp
+        extension_install_test.cpp
         file_search_path_test.cpp
         partition_routing_test.cpp
         system_config_test.cpp
