@@ -1,0 +1,29 @@
+name: Test extension guards (restore)
+on:
+  push:
+    branches: [test/extension-deploy-guards]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  make-artifacts:
+    strategy:
+      matrix:
+        artifact: [linux-x86_64, linux-aarch64, osx-arm64, osx-x86_64, win-x86_64]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Take the build from upstream run 36931752247
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT: ${{ matrix.artifact }}
+        run: gh run download 36931752247 -R LadybugDB/ladybug -n "lbug-extensions-$ARTIFACT" -D build
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: lbug-extensions-${{ matrix.artifact }}
+          path: build
+
+  smoke:
+    needs: make-artifacts
+    uses: ./.github/workflows/smoke-test-extensions.yml
+    with:
+      line: v0.21.0
