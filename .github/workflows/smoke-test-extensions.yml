@@ -73,7 +73,7 @@ jobs:
           }
 
       - name: Download this platform's new build
-        if: ${{ inputs.line != '' }}
+        if: ${{ inputs.line }}
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: lbug-extensions-${{ matrix.artifact }}
@@ -92,7 +92,8 @@ jobs:
             python scripts/extension/smoke_test.py --line "$LINE" --repo new \
               --baseline https://extension.ladybugdb.com/
           else
-            # Word splitting turns the space-separated inputs into argument lists.
+            # Word splitting, with globbing off, turns the space-separated inputs into argument lists.
+            set -f
             # shellcheck disable=SC2086
             python scripts/extension/smoke_test.py --line $LINES --repo "$REPO" --extension $EXTENSIONS
           fi

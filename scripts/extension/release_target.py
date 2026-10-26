@@ -14,6 +14,8 @@ import sys
 
 
 def release_target(nightly, ref_type, ref_name, extension_version, tags):
+    if not re.fullmatch(r"\d+\.\d+\.\d+", extension_version):
+        raise SystemExit(f"Unexpected LBUG_EXTENSION_VERSION {extension_version!r}")
     if nightly:
         return "vdev"
     minor = ".".join(extension_version.split(".")[:2])
