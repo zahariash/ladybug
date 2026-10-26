@@ -179,7 +179,12 @@ def serve(directory):
 
 def resolve(source):
     """A repository URL, or a local releases/ directory to serve over HTTP."""
-    return serve(source) if os.path.isdir(source) else source.rstrip("/") + "/"
+    if os.path.isdir(source):
+        return serve(source)
+    # The URL goes into a quoted INSTALL ... FROM '<url>' statement.
+    if not re.fullmatch(r"https?://[^'\\\s]+", source):
+        raise SystemExit(f"Unexpected repository URL {source!r}")
+    return source.rstrip("/") + "/"
 
 
 def main():

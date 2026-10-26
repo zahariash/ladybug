@@ -25,7 +25,7 @@ def release_target(nightly, ref_type, ref_name, extension_version, tags):
         return f"v{extension_version}"
     raise SystemExit(
         f"Refusing to write releases/v{extension_version} from {ref_type} {ref_name}: "
-        f"{minor} is released ({', '.join(released)}), so only a v{minor}.* tag may rebuild it. "
+        f"{minor} is released ({', '.join(released)}), so only a v{minor}.N release tag may rebuild it. "
         f"Nightly runs write vdev."
     )
 

@@ -79,8 +79,9 @@ jobs:
           name: lbug-extensions-${{ matrix.artifact }}
           path: new/${{ inputs.line }}/${{ matrix.plat }}
 
-      # A deploy fails only on extensions that load with what the CDN serves now
-      # and stop loading with the new build.
+      # A deploy fails when an extension loads with what the CDN serves now and not with
+      # the new build, when the new build lacks an extension the CDN serves, or when the
+      # CDN cannot be reached.
       - name: Smoke test
         env:
           LINE: ${{ inputs.line }}
