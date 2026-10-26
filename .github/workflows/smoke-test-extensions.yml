@@ -1,8 +1,8 @@
 name: Smoke Test Extensions
 
 # Installs and loads extensions with every Ladybug release that downloads them,
-# on every platform the extensions are built for. Called before a deploy with the
-# line being built, or dispatched to check what a repository serves now.
+# on every platform the extensions are built for. Called before a release deploy
+# with the line being built, or dispatched to check what a repository serves now.
 
 on:
   workflow_call:
@@ -65,7 +65,16 @@ jobs:
         shell: pwsh
         run: |
           $dst = "$env:RUNNER_TEMP\slp_openssl.exe"
-          Invoke-WebRequest -Uri "https://slproweb.com/download/Win64OpenSSL_Light-3_5_9.exe" -OutFile $dst
+          # Retries connection failures too, which -MaximumRetryCount does not.
+          for ($i = 1; $i -le 5; $i++) {
+            try {
+              Invoke-WebRequest -Uri "https://slproweb.com/download/Win64OpenSSL_Light-3_5_9.exe" -OutFile $dst
+              break
+            } catch {
+              if ($i -eq 5) { throw }
+              Start-Sleep -Seconds 10
+            }
+          }
           Start-Process -FilePath $dst -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART" -Wait
           if (-not (Test-Path "$env:SystemRoot\System32\libssl-3-x64.dll")) {
             Write-Error "OpenSSL DLLs were not copied to System32"

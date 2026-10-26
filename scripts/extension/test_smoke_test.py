@@ -1,3 +1,5 @@
+import contextlib
+import io
 import unittest
 import urllib.error
 from unittest import mock
@@ -65,10 +67,30 @@ class ListExtensionsTest(unittest.TestCase):
 
 
 class MainTest(unittest.TestCase):
+    def run_main(self, *args):
+        output = io.StringIO()
+        with mock.patch("sys.argv", ["smoke_test.py", *args]), contextlib.redirect_stdout(output), \
+                mock.patch.object(smoke_test.tempfile, "mkdtemp", return_value="work"):
+            return smoke_test.main(), output.getvalue()
+
     def test_non_release_lines_skip_before_any_network_call(self):
-        with mock.patch("sys.argv", ["smoke_test.py", "--line", "vdev"]), \
-                mock.patch.object(smoke_test, "released_versions", side_effect=AssertionError("network")):
-            self.assertEqual(smoke_test.main(), 0)
+        with mock.patch.object(smoke_test, "released_versions", side_effect=AssertionError("network")):
+            self.assertEqual(self.run_main("--line", "vdev")[0], 0)
+
+    @staticmethod
+    def listing(url):
+        return ["fts"] if url.startswith("https://new/") else ["fts", "json"]
+
+    def test_a_dropped_extension_fails_the_run(self):
+        # Every check loads, but the baseline serves json and the tested tree does not.
+        with mock.patch.object(smoke_test, "released_versions", return_value=["0.21.0"]), \
+                mock.patch.object(smoke_test, "extension_line", return_value="v0.21.0"), \
+                mock.patch.object(smoke_test, "make_venv", return_value="python"), \
+                mock.patch.object(smoke_test, "check", return_value=None), \
+                mock.patch.object(smoke_test, "list_extensions", side_effect=self.listing):
+            result, output = self.run_main("--line", "v0.21.0", "--repo", "https://new/", "--baseline", "https://cdn/")
+        self.assertEqual(result, 1)
+        self.assertRegex(output, r"json +FAILED: the baseline serves it")
 
 
 class MissingFromTest(unittest.TestCase):

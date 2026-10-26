@@ -153,6 +153,8 @@ jobs:
     needs:
       - release-target
       - build-extensions
+    # No released engine reads vdev, so a nightly has nothing to check.
+    if: ${{ needs.release-target.outputs.version != 'vdev' }}
     uses: ./.github/workflows/smoke-test-extensions.yml
     permissions:
       contents: read
@@ -163,5 +165,8 @@ jobs:
     needs:
       - package-built-extensions
       - smoke-test-extensions
+    if: >-
+      ${{ !cancelled() && needs.package-built-extensions.result == 'success' &&
+      contains(fromJSON('["success", "skipped"]'), needs.smoke-test-extensions.result) }}
     uses: ./.github/workflows/deploy-extension.yml
     secrets: inherit
