@@ -1,10 +1,11 @@
-"""Installs and loads published extensions with the Ladybug releases that read them.
+"""Installs and loads an extension line with every Ladybug release that reads it.
 
 Every check runs in its own process with an empty home directory, so a cached
 extension cannot hide what the repository serves, and a crash at exit fails it.
-Each line is tested with its newest patch release, or with every patch release
-when listed in --all-patches. Releases come from PyPI; the line a release reads
-comes from LBUG_EXTENSION_VERSION in its tag's CMakeLists.txt.
+Releases come from PyPI; the line a release reads comes from LBUG_EXTENSION_VERSION
+in its tag's CMakeLists.txt. With --baseline, a failure counts only when the same
+check passes against the baseline, so an extension that already fails there, for
+example because it needs a library that is not shipped, does not fail the run.
 """
 
 import argparse
@@ -25,7 +26,6 @@ from concurrent.futures import ThreadPoolExecutor
 OFFICIAL_REPO = "https://extension.ladybugdb.com/"
 CMAKE_URL = "https://raw.githubusercontent.com/LadybugDB/ladybug/v{}/CMakeLists.txt"
 PYPI_URL = "https://pypi.org/pypi/ladybug/json"
-KNOWN_FAILURES = pathlib.Path(__file__).with_name("smoke_test_known_failures.txt")
 LINE_PATTERN = re.compile(r"v(\d+)\.(\d+)\.(\d+)")
 CHECK_TIMEOUT_SECONDS = 300
 
@@ -76,29 +76,12 @@ def extension_line(version):
     return "v" + match.group(1)
 
 
-def engines_for_line(line, versions, all_patches):
-    major_minor = LINE_PATTERN.fullmatch(line).groups()[:2]
-    candidates = [v for v in versions if tuple(v.split(".")[:2]) == major_minor]
-    engines = [v for v in candidates if extension_line(v) == line]
-    return engines if all_patches else engines[-1:]
-
-
-def load_known_failures():
-    """Maps (line, platform, extension) to a reason; line and platform may be "*"."""
-    known = {}
-    for raw in KNOWN_FAILURES.read_text().splitlines():
-        entry, _, reason = raw.partition("#")
-        if entry.strip():
-            line, plat, extension = entry.split()
-            known[(line, plat, extension)] = reason.strip()
-    return known
-
-
-def known_reason(known, line, plat, extension):
-    for key in ((line, plat, extension), ("*", plat, extension), (line, "*", extension), ("*", "*", extension)):
-        if key in known:
-            return known[key]
-    return None
+def engines_for_line(line, versions):
+    match = LINE_PATTERN.fullmatch(line)
+    if not match:
+        return []
+    candidates = [v for v in versions if tuple(v.split(".")[:2]) == match.groups()[:2]]
+    return [v for v in candidates if extension_line(v) == line]
 
 
 def make_venv(work_dir, python, version):
@@ -140,28 +123,30 @@ def serve(directory):
     return f"http://127.0.0.1:{server.server_port}/"
 
 
+def resolve(source):
+    """A repository URL, or a local releases/ directory to serve over HTTP."""
+    return serve(source) if os.path.isdir(source) else source.rstrip("/") + "/"
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    source = parser.add_mutually_exclusive_group()
-    source.add_argument("--repo", default=OFFICIAL_REPO, help="extension repository URL")
-    source.add_argument("--serve", metavar="DIR", help="serve a local releases directory and test it")
-    parser.add_argument("--line", nargs="*", default=[], help="lines to test, e.g. v0.21.0 (default: all)")
-    parser.add_argument("--all-patches", nargs="*", default=[], help="lines to test with every patch release")
-    parser.add_argument("--extension", nargs="*", default=[], help="extensions to test (default: all)")
+    parser.add_argument("--line", nargs="+", required=True, help="lines to test, e.g. v0.21.0")
+    parser.add_argument("--repo", default=OFFICIAL_REPO, help="repository URL or local releases/ directory")
+    parser.add_argument("--baseline", help="repository URL or directory; only failures that pass there count")
+    parser.add_argument("--extension", nargs="*", default=[], help="extensions to test (default: all in the line)")
     parser.add_argument("--python", default="3.12", help="Python version for the release venvs")
     parser.add_argument("--jobs", type=int, default=4, help="checks to run at once")
     args = parser.parse_args()
 
-    repo = serve(args.serve) if args.serve else args.repo.rstrip("/") + "/"
+    repo = resolve(args.repo)
+    baseline = resolve(args.baseline) if args.baseline else None
     plat = get_platform()
-    lines = args.line or [d for d in list_dirs(repo) if LINE_PATTERN.fullmatch(d)]
     versions = released_versions()
-    known = load_known_failures()
     work_dir = pathlib.Path(tempfile.mkdtemp(prefix="extension-smoke-"))
 
     checks = []
-    for line in sorted(lines, key=lambda l: version_key(l[1:])):
-        engines = engines_for_line(line, versions, line in args.all_patches)
+    for line in args.line:
+        engines = engines_for_line(line, versions)
         if not engines:
             print(f"{line}: skipped, no release on PyPI reads it")
             continue
@@ -173,20 +158,22 @@ def main():
 
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
         errors = list(pool.map(lambda c: check(c[3], repo, c[2], work_dir), checks))
+        retest = [c for c, error in zip(checks, errors) if error and baseline]
+        baseline_errors = pool.map(lambda c: check(c[3], baseline, c[2], work_dir), retest)
+        passes_with_baseline = {c[:3] for c, error in zip(retest, baseline_errors) if error is None}
 
-    unexpected = 0
+    failures = 0
     for (line, engine, extension, _), error in zip(checks, errors):
-        reason = known_reason(known, line, plat, extension)
         if error is None:
-            status = "ok" if reason is None else f"ok, listed in {KNOWN_FAILURES.name}"
-        elif reason is not None:
-            status = f"known failure ({reason}): {error}"
+            status = "ok"
+        elif baseline and (line, engine, extension) not in passes_with_baseline:
+            status = f"fails with the baseline too: {error}"
         else:
             status = f"FAILED: {error}"
-            unexpected += 1
+            failures += 1
         print(f"{line:9} {engine:8} {extension:14} {status}")
-    print(f"{len(checks)} checks, {unexpected} unexpected failures")
-    return 1 if unexpected else 0
+    print(f"{len(checks)} checks, {failures} failures")
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":
