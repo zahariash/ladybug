@@ -1388,3 +1388,110 @@ TEST_F(ApiTest, PreparedRelScanAfterCheckpointRenumbersColumns) {
         ASSERT_TRUE(conn->query("CHECKPOINT")->isSuccess());
     }
 }
+
+TEST_F(ApiTest, PreparedChainCountInWriteTransaction) {
+    ASSERT_TRUE(conn->query("CREATE NODE TABLE N939(id INT64 PRIMARY KEY)")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE REL TABLE K939(FROM N939 TO N939)")->isSuccess());
+    ASSERT_TRUE(conn->query("UNWIND range(0, 9) AS i CREATE (:N939 {id: i})")->isSuccess());
+    ASSERT_TRUE(conn->query("MATCH (a:N939), (b:N939) WHERE b.id = a.id + 1 "
+                            "CREATE (a)-[:K939]->(b)")
+                    ->isSuccess());
+    auto count =
+        conn->prepare("MATCH (a:N939)-[:K939]->(b:N939)-[:K939]->(c:N939) RETURN count(*)");
+    ASSERT_TRUE(count->isSuccess()) << count->getErrorMessage();
+    auto& manager = conn->getClientContext()->getCachedPreparedStatementManager();
+    ASSERT_TRUE(manager.getCachedStatement(count->getName())->planNeedsReadOnlyTransaction);
+    const auto execute = [&]() {
+        auto result = conn->execute(count.get());
+        EXPECT_TRUE(result->isSuccess()) << result->getErrorMessage();
+        return TestHelper::convertResultToString(*result);
+    };
+    ASSERT_EQ(execute(), std::vector<std::string>{"8"});
+    // A read-only transaction keeps the chain plan.
+    ASSERT_TRUE(conn->query("BEGIN TRANSACTION READ ONLY")->isSuccess());
+    ASSERT_EQ(execute(), std::vector<std::string>{"8"});
+    ASSERT_TRUE(conn->query("COMMIT")->isSuccess());
+    ASSERT_TRUE(manager.getCachedStatement(count->getName())->planNeedsReadOnlyTransaction);
+    ASSERT_TRUE(conn->query("BEGIN TRANSACTION")->isSuccess());
+    ASSERT_TRUE(conn->query("UNWIND range(10, 19) AS i CREATE (:N939 {id: i})")->isSuccess());
+    ASSERT_TRUE(conn->query("MATCH (a:N939), (b:N939) WHERE a.id >= 9 AND b.id = a.id + 1 "
+                            "CREATE (a)-[:K939]->(b)")
+                    ->isSuccess());
+    ASSERT_EQ(execute(), std::vector<std::string>{"18"});
+    ASSERT_TRUE(conn->query("ROLLBACK")->isSuccess());
+    ASSERT_EQ(execute(), std::vector<std::string>{"8"});
+}
+
+TEST_F(ApiTest, PreparedCsrCountsAfterNodeInsert) {
+    ASSERT_TRUE(conn->query("CREATE NODE TABLE U939(id INT64 PRIMARY KEY)")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE REL TABLE F939(FROM U939 TO U939)")->isSuccess());
+    ASSERT_TRUE(conn->query("UNWIND range(0, 2) AS i CREATE (:U939 {id: i})")->isSuccess());
+    ASSERT_TRUE(conn->query("MATCH (a:U939), (b:U939) WHERE [a.id, b.id] IN [[0, 1], [0, 2], "
+                            "[1, 2]] CREATE (a)-[:F939]->(b)")
+                    ->isSuccess());
+    ASSERT_TRUE(conn->query("ALTER TABLE U939 SET SORTED BY (id ASC) CSR")->isSuccess());
+    // Each query takes a rewrite that reads a primary key as the node offset: OFFSET_COUNT,
+    // REACHABLE_COUNT and TOP_K_DEGREES.
+    const std::vector<std::pair<std::string, std::string>> queries = {
+        {"MATCH (a:U939)-[:F939]->(b) WHERE a.id = 100 RETURN count(*)", "3"},
+        {"MATCH (a:U939 {id: 100})-[:F939*1..3]->(b:U939) RETURN count(distinct b)", "3"},
+        {"MATCH (u:U939)-[:F939]->(v) RETURN u.id, count(v) AS deg ORDER BY deg DESC LIMIT 1",
+            "100|3"}};
+    auto& manager = conn->getClientContext()->getCachedPreparedStatementManager();
+    std::vector<std::unique_ptr<PreparedStatement>> statements;
+    for (const auto& [query, expected] : queries) {
+        auto statement = conn->prepare(query);
+        ASSERT_TRUE(statement->isSuccess()) << statement->getErrorMessage();
+        ASSERT_EQ(manager.getCachedStatement(statement->getName())->planCsrTableEpochs.size(), 1u)
+            << query;
+        statements.push_back(std::move(statement));
+    }
+    ASSERT_TRUE(conn->query("CREATE (:U939 {id: 100})")->isSuccess());
+    ASSERT_TRUE(conn->query("MATCH (a:U939), (b:U939) WHERE a.id = 100 AND b.id < 3 "
+                            "CREATE (a)-[:F939]->(b)")
+                    ->isSuccess());
+    for (auto i = 0u; i < queries.size(); i++) {
+        auto result = conn->execute(statements[i].get());
+        ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+        EXPECT_EQ(TestHelper::convertResultToString(*result),
+            std::vector<std::string>{queries[i].second})
+            << queries[i].first;
+    }
+}
+
+TEST_F(ApiTest, ChainCountKeepsReaderSnapshot) {
+    ASSERT_TRUE(conn->query("CREATE NODE TABLE S939(id INT64 PRIMARY KEY)")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE REL TABLE T939(FROM S939 TO S939)")->isSuccess());
+    ASSERT_TRUE(conn->query("UNWIND range(0, 39) AS i CREATE (:S939 {id: i})")->isSuccess());
+    ASSERT_TRUE(conn->query("MATCH (a:S939), (b:S939) WHERE b.id = (a.id * 7 + 1) % 40 OR "
+                            "b.id = (a.id + 3) % 40 CREATE (a)-[:T939]->(b)")
+                    ->isSuccess());
+    const std::string pattern = "MATCH (a:S939)-[:T939]->(b:S939)-[:T939]->(c:S939) ";
+    ASSERT_NE(conn->query("EXPLAIN " + pattern + "RETURN count(*)")
+                  ->toString()
+                  .find("COUNT_EXTEND_CHAIN"),
+        std::string::npos);
+    // The chain count against the same pattern counted without the rewrite.
+    const auto counts = [&](Connection& connection) {
+        auto chain = connection.query(pattern + "RETURN count(*)");
+        auto rows = connection.query(pattern + "RETURN sum(1)");
+        EXPECT_TRUE(chain->isSuccess()) << chain->getErrorMessage();
+        EXPECT_TRUE(rows->isSuccess()) << rows->getErrorMessage();
+        return std::make_pair(TestHelper::convertResultToString(*chain),
+            TestHelper::convertResultToString(*rows));
+    };
+    auto reader = std::make_unique<Connection>(database.get());
+    ASSERT_TRUE(reader->query("BEGIN TRANSACTION READ ONLY")->isSuccess());
+    const auto before = counts(*reader);
+    ASSERT_EQ(before.first, before.second);
+    ASSERT_TRUE(conn->query("MATCH (a:S939) WHERE a.id % 5 = 0 DETACH DELETE a")->isSuccess());
+    ASSERT_TRUE(conn->query("UNWIND range(40, 99) AS i CREATE (:S939 {id: i})")->isSuccess());
+    ASSERT_TRUE(conn->query("MATCH (a:S939), (b:S939) WHERE a.id >= 40 AND b.id = a.id - 39 "
+                            "CREATE (a)-[:T939]->(b)")
+                    ->isSuccess());
+    ASSERT_EQ(counts(*reader), before);
+    ASSERT_TRUE(reader->query("COMMIT")->isSuccess());
+    const auto after = counts(*conn);
+    ASSERT_EQ(after.first, after.second);
+    ASSERT_NE(after.first, before.first);
+}

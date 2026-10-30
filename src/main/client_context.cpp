@@ -19,6 +19,7 @@
 #include "main/database.h"
 #include "main/database_manager.h"
 #include "main/db_config.h"
+#include "optimizer/count_rel_table_optimizer.h"
 #include "optimizer/optimizer.h"
 #include "parser/parser.h"
 #include "parser/visitor/standalone_call_rewriter.h"
@@ -31,6 +32,8 @@
 #include "storage/buffer_manager/spiller.h"
 #include "storage/storage_manager.h"
 #include "storage/storage_utils.h"
+#include "storage/table/table.h"
+#include "transaction/transaction.h"
 #include "transaction/transaction_context.h"
 #include <format>
 #include <processor/warning_context.h>
@@ -388,6 +391,24 @@ static void bindParametersNoLock(PreparedStatement& preparedStatement,
     }
 }
 
+static bool countRewritesStillHold(const CachedPreparedStatement& cachedStatement,
+    const ClientContext& context) {
+    if (cachedStatement.planNeedsReadOnlyTransaction) {
+        auto* transaction = transaction::Transaction::Get(context);
+        if (transaction != nullptr && transaction->isWriteTransaction()) {
+            return false;
+        }
+    }
+    auto* storageManager = storage::StorageManager::Get(context);
+    for (const auto& [tableID, changeEpoch] : cachedStatement.planCsrTableEpochs) {
+        if (!storageManager->containsTable(tableID) ||
+            storageManager->getTable(tableID)->getChangeEpoch() != changeEpoch) {
+            return false;
+        }
+    }
+    return true;
+}
+
 std::unique_ptr<QueryResult> ClientContext::executeWithParams(PreparedStatement* preparedStatement,
     std::unordered_map<std::string, std::unique_ptr<Value>> inputParams,
     std::optional<uint64_t> queryID) { // NOLINT(performance-unnecessary-value-param): It doesn't
@@ -412,15 +433,32 @@ std::unique_ptr<QueryResult> ClientContext::executeWithParams(PreparedStatement*
     }
     // LCOV_EXCL_STOP
     auto cachedStatement = cachedPreparedStatementManager->getCachedStatement(name);
+    // Read the CSR tables' epochs in the auto transaction that runs a reused plan, so that another
+    // connection's commit cannot land between the check and the snapshot.
+    const bool beginsTransaction = !cachedStatement->planCsrTableEpochs.empty() &&
+                                   transactionContext->isAutoTransaction() &&
+                                   !transactionContext->hasActiveTransaction();
+    if (beginsTransaction) {
+        try {
+            transactionContext->beginAutoTransaction(preparedStatement->isReadOnly());
+        } catch (std::exception& e) {
+            return QueryResult::getQueryResultWithError(e.what());
+        }
+    }
     const bool planStale =
-        cachedStatement->planVersion != localDatabase->getCatalog()->getPlanVersion();
+        cachedStatement->planVersion != localDatabase->getCatalog()->getPlanVersion() ||
+        !countRewritesStillHold(*cachedStatement, *this);
     // Statements with parameters baked into a plan (e.g. parameter-valued SKIP/LIMIT
     // frozen to uint64_t) must rebind/replan on every execution instead of reusing any
     // cached plan (https://github.com/LadybugDB/ladybug/issues/985).
     // Likewise, a catalog change (e.g. ALTER TABLE ADD) or a checkpoint that renumbered column
-    // IDs invalidates the bound logical plan (https://github.com/LadybugDB/ladybug/issues/1158).
+    // IDs invalidates the bound logical plan (https://github.com/LadybugDB/ladybug/issues/1158),
+    // and so does a write transaction or a table change that a count rewrite in it rules out.
     if (useCachedPlan && !cachedStatement->hasBakedParameters && !planStale) {
         return executeNoLock(preparedStatement, cachedStatement, queryID, {}, true);
+    }
+    if (beginsTransaction) {
+        transactionContext->rollback();
     }
     // rebind
     auto [newPreparedStatement, newCachedStatement] =
@@ -442,6 +480,9 @@ std::unique_ptr<QueryResult> ClientContext::executeWithParams(PreparedStatement*
         cachedStatement->boundParameters = std::move(newCachedStatement->boundParameters);
         cachedStatement->hasBakedParameters = newCachedStatement->hasBakedParameters;
         cachedStatement->planVersion = newCachedStatement->planVersion;
+        cachedStatement->planNeedsReadOnlyTransaction =
+            newCachedStatement->planNeedsReadOnlyTransaction;
+        cachedStatement->planCsrTableEpochs = std::move(newCachedStatement->planCsrTableEpochs);
         cachedStatement->physicalPlanCache.reset();
         cachedStatement->sinkResultSetDescriptors.clear();
         // The pool holds operator trees cloned from the previous template (bound for the
@@ -613,6 +654,12 @@ ClientContext::PrepareResult ClientContext::prepareNoLock(
                 cachedStatement->boundParameters = expressionBinder->getBoundParameters();
                 cachedStatement->hasBakedParameters =
                     hasBakedParameters(cachedStatement->boundParameters);
+                cachedStatement->planNeedsReadOnlyTransaction =
+                    optimizer::CountRelTableOptimizer::needsReadOnlyTransaction(
+                        *cachedStatement->logicalPlan);
+                cachedStatement->planCsrTableEpochs =
+                    optimizer::CountRelTableOptimizer::getCsrTableEpochs(
+                        *cachedStatement->logicalPlan);
             },
             preparedStatement->isReadOnly(),
             preparedStatement->getStatementType() == StatementType::TRANSACTION,

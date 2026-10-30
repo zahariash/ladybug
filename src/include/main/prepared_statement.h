@@ -74,6 +74,11 @@ struct CachedPreparedStatement {
     // logical/physical plan is stale and must be rebound (see
     // https://github.com/LadybugDB/ladybug/issues/1158).
     uint64_t planVersion = 0;
+    // What the plan's count rewrites assume about the execution that runs it (see
+    // optimizer::CountRelTableOptimizer): no write transaction, and CSR node tables unchanged
+    // since the change epoch paired with them. The plan is rebound when that no longer holds.
+    bool planNeedsReadOnlyTransaction = false;
+    std::vector<std::pair<common::table_id_t, uint64_t>> planCsrTableEpochs;
 
     // Pool of cloned physical plans ready for reuse, keyed by executing thread.
     // Cloning the cached template per execution costs hundreds of small allocations
