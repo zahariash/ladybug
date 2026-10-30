@@ -25,7 +25,7 @@ NodeGroupCollection::NodeGroupCollection(MemoryManager& mm, const std::vector<Lo
 }
 
 void NodeGroupCollection::append(const Transaction* transaction,
-    const std::vector<ValueVector*>& vectors) {
+    std::span<const column_id_t> columnIDs, const std::vector<ValueVector*>& vectors) {
     const auto numRowsToAppend = vectors[0]->state->getSelVector().getSelSize();
     DASSERT(numRowsToAppend == vectors[0]->state->getSelVector().getSelSize());
     for (auto i = 1u; i < vectors.size(); i++) {
@@ -51,10 +51,11 @@ void NodeGroupCollection::append(const Transaction* transaction,
         lastNodeGroup->moveNextRowToAppend(numToAppendInNodeGroup);
         pushInsertInfo(transaction, lastNodeGroup, numToAppendInNodeGroup);
         numTotalRows += numToAppendInNodeGroup;
-        lastNodeGroup->append(transaction, vectors, numRowsAppended, numToAppendInNodeGroup);
+        lastNodeGroup->append(transaction, columnIDs, vectors, numRowsAppended,
+            numToAppendInNodeGroup);
         numRowsAppended += numToAppendInNodeGroup;
     }
-    stats.update(vectors);
+    stats.update(columnIDs, vectors);
 }
 
 void NodeGroupCollection::append(const Transaction* transaction,
@@ -63,12 +64,14 @@ void NodeGroupCollection::append(const Transaction* transaction,
     for (auto& nodeGroup : other.nodeGroups.getAllGroups(otherLock)) {
         append(transaction, columnIDs, *nodeGroup);
     }
-    mergeStats(columnIDs, other.getStats(otherLock));
+    // other has the same columns as this collection; the columns outside columnIDs were dropped,
+    // so nothing reads the stats merged into them.
+    mergeStats(other.getStats(otherLock));
 }
 
 void NodeGroupCollection::append(const Transaction* transaction,
     const std::vector<column_id_t>& columnIDs, const NodeGroup& nodeGroup) {
-    DASSERT(nodeGroup.getDataTypes().size() == columnIDs.size());
+    DASSERT(nodeGroup.getDataTypes().size() == types.size());
     const auto lock = nodeGroups.lock();
     if (nodeGroups.isEmpty(lock)) {
         auto newGroup =
@@ -182,11 +185,24 @@ void NodeGroupCollection::addColumn(TableAddColumnState& addColumnState,
     PageAllocator* pageAllocator) {
     DASSERT((pageAllocator == nullptr) == (residency == ResidencyState::IN_MEMORY));
     const auto lock = nodeGroups.lock();
+    // Stats and types grow together, so that rollbackAddColumn can undo a partial add.
     auto& newColumnStats = stats.addNewColumn(addColumnState.propertyDefinition.getType());
+    types.push_back(addColumnState.propertyDefinition.getType().copy());
     for (const auto& nodeGroup : nodeGroups.getAllGroups(lock)) {
         nodeGroup->addColumn(addColumnState, pageAllocator, &newColumnStats);
     }
-    types.push_back(addColumnState.propertyDefinition.getType().copy());
+}
+
+void NodeGroupCollection::rollbackAddColumn(column_id_t columnID, PageAllocator* pageAllocator) {
+    const auto lock = nodeGroups.lock();
+    if (types.size() <= columnID) {
+        return;
+    }
+    stats.removeLastColumns(types.size() - columnID);
+    types.resize(columnID);
+    for (const auto& nodeGroup : nodeGroups.getAllGroups(lock)) {
+        nodeGroup->rollbackAddColumn(columnID, pageAllocator);
+    }
 }
 
 uint64_t NodeGroupCollection::getEstimatedMemoryUsage() const {

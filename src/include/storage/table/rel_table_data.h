@@ -68,6 +68,8 @@ public:
     bool delete_(transaction::Transaction* transaction, common::ValueVector& boundNodeIDVector,
         const common::ValueVector& relIDVector);
     void addColumn(TableAddColumnState& addColumnState, PageAllocator& pageAllocator);
+    // Removes column columnID and every column added after it.
+    void rollbackAddColumn(common::column_id_t columnID, PageAllocator& pageAllocator);
 
     bool checkIfNodeHasRels(transaction::Transaction* transaction,
         common::ValueVector* srcNodeIDVector) const;

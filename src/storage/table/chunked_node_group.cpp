@@ -163,16 +163,19 @@ void InMemChunkedNodeGroup::setNumRows(const offset_t numRows_) {
 }
 
 uint64_t ChunkedNodeGroup::append(const Transaction* transaction,
-    const std::vector<ValueVector*>& columnVectors, row_idx_t startRowInVectors,
-    uint64_t numValuesToAppend) {
+    std::span<const column_id_t> columnIDs, const std::vector<ValueVector*>& columnVectors,
+    row_idx_t startRowInVectors, uint64_t numValuesToAppend) {
     DASSERT(residencyState != ResidencyState::ON_DISK);
-    DASSERT(columnVectors.size() == chunks.size());
+    DASSERT(columnIDs.empty() ? columnVectors.size() == chunks.size() :
+                                columnVectors.size() == columnIDs.size());
     const auto numRowsToAppendInChunk = std::min(numValuesToAppend, capacity - numRows);
     try {
         for (auto i = 0u; i < columnVectors.size(); i++) {
             const auto columnVector = columnVectors[i];
-            chunks[i]->append(columnVector, columnVector->state->getSelVector().slice(
-                                                startRowInVectors, numRowsToAppendInChunk));
+            const auto columnID = columnIDs.empty() ? i : columnIDs[i];
+            DASSERT(columnID < chunks.size());
+            chunks[columnID]->append(columnVector, columnVector->state->getSelVector().slice(
+                                                       startRowInVectors, numRowsToAppendInChunk));
         }
     } catch ([[maybe_unused]] std::exception& e) {
         handleAppendException(chunks, numRows);
@@ -537,6 +540,16 @@ void ChunkedNodeGroup::addColumn(MemoryManager& mm, const TableAddColumnState& a
     if (residencyState == ResidencyState::ON_DISK) {
         DASSERT(pageAllocator);
         chunks.back()->flush(*pageAllocator);
+    }
+}
+
+void ChunkedNodeGroup::rollbackAddColumn(column_id_t columnID, PageAllocator* pageAllocator) {
+    while (chunks.size() > columnID) {
+        if (residencyState == ResidencyState::ON_DISK) {
+            DASSERT(pageAllocator);
+            chunks.back()->reclaimStorage(*pageAllocator);
+        }
+        chunks.pop_back();
     }
 }
 

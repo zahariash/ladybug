@@ -139,7 +139,7 @@ public:
 
     // Return the max node offset during insertions.
     common::offset_t validateUniquenessConstraint(const transaction::Transaction* transaction,
-        const std::vector<common::ValueVector*>& propertyVectors) const;
+        common::ValueVector& pkVector) const;
 
     void initInsertState(main::ClientContext* context, TableInsertState& insertState) override;
     void insert(transaction::Transaction* transaction, TableInsertState& insertState) override;
@@ -263,6 +263,8 @@ public:
 private:
     void validatePkNotExists(const transaction::Transaction* transaction,
         common::ValueVector* pkVector) const;
+    // Removes column columnID and every column added after it.
+    void rollbackAddColumn(common::column_id_t columnID, PageAllocator& pageAllocator);
 
     visible_func getVisibleFunc(const transaction::Transaction* transaction) const;
     common::DataChunk constructDataChunkForColumns(

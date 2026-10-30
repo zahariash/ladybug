@@ -1,5 +1,7 @@
 #include "processor/operator/persistent/insert_executor.h"
 
+#include <algorithm>
+
 #include "catalog/catalog.h"
 #include "catalog/catalog_entry/node_table_catalog_entry.h"
 #include "common/exception/runtime.h"
@@ -44,10 +46,14 @@ void NodeTableInsertInfo::init(const ResultSet& resultSet, main::ClientContext* 
     for (auto& evaluator : columnDataEvaluators) {
         evaluator->init(resultSet, context);
         columnDataVectors.push_back(evaluator->resultVector.get());
-        columnIDs.push_back(columnIDs.size());
     }
     // Null table means every partition is routed remotely; PK validation is the wrapper's job.
-    pkVector = table == nullptr ? nullptr : columnDataVectors[table->getPKColumnID()];
+    if (table != nullptr) {
+        const auto pkIdx = std::find(columnIDs.begin(), columnIDs.end(), table->getPKColumnID()) -
+                           columnIDs.begin();
+        DASSERT(static_cast<size_t>(pkIdx) < columnDataVectors.size());
+        pkVector = columnDataVectors[pkIdx];
+    }
 }
 
 void NodeInsertExecutor::init(ResultSet* resultSet, const ExecutionContext* context) {
@@ -192,6 +198,7 @@ nodeID_t NodeInsertExecutor::insert(main::ClientContext* context) {
         }
         storage::NodeTableInsertState insertState{*info.nodeIDVector, *tableInfo.pkVector,
             tableInfo.columnDataVectors};
+        insertState.columnIDs = tableInfo.columnIDs;
         targetTable->initInsertState(context, insertState);
         targetTable->insert(transaction, insertState);
         resultNodeID = info.getNodeID();
@@ -250,7 +257,7 @@ void NodeInsertExecutor::skipInsert(nodeID_t nodeID, main::ClientContext* contex
 bool NodeInsertExecutor::checkConflict(const Transaction* transaction,
     storage::NodeTable* table) const {
     if (info.conflictAction == ConflictAction::ON_CONFLICT_DO_NOTHING) {
-        auto offset = table->validateUniquenessConstraint(transaction, tableInfo.columnDataVectors);
+        auto offset = table->validateUniquenessConstraint(transaction, *tableInfo.pkVector);
         if (offset != INVALID_OFFSET) {
             // Conflict. Skip insertion.
             info.updateNodeID({offset, table->getTableID()});
@@ -309,6 +316,7 @@ internalID_t RelInsertExecutor::insert(main::ClientContext* context) {
     }
     storage::RelTableInsertState insertState{*info.srcNodeIDVector, *info.dstNodeIDVector,
         tableInfo.columnDataVectors};
+    insertState.columnIDs = tableInfo.columnIDs;
     tableInfo.table->initInsertState(context, insertState);
     tableInfo.table->insert(Transaction::Get(*context), insertState);
     writeColumnVectors(info.columnVectors, tableInfo.columnDataVectors);

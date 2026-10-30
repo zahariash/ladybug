@@ -13,24 +13,21 @@ using namespace lbug::transaction;
 namespace lbug {
 namespace storage {
 
-static std::vector<LogicalType> getTypesForLocalRelTable(const catalog::TableCatalogEntry& table) {
+static std::vector<LogicalType> getTypesForLocalRelTable(const RelTable& table) {
     std::vector<LogicalType> types;
-    types.reserve(table.getNumProperties() + 2);
-    // Pre-append src and dst node ID columns.
+    // Pre-append the src node ID column; the rel table's NBR_ID column holds the dst node IDs.
     types.push_back(LogicalType::INTERNAL_ID());
-    types.push_back(LogicalType::INTERNAL_ID());
-    for (auto& property : table.getProperties()) {
-        types.push_back(property.getType().copy());
+    const auto direction = table.getStorageDirections()[0];
+    for (auto i = 0u; i < table.getNumColumns(); i++) {
+        types.push_back(table.getColumn(i, direction)->getDataType().copy());
     }
     return types;
 }
 
-LocalRelTable::LocalRelTable(const catalog::TableCatalogEntry* tableEntry, const Table& table,
-    MemoryManager& mm)
-    : LocalTable{table} {
-    localNodeGroup = std::make_unique<NodeGroup>(mm, 0, false,
-        getTypesForLocalRelTable(*tableEntry), INVALID_ROW_IDX);
+LocalRelTable::LocalRelTable(const Table& table, MemoryManager& mm) : LocalTable{table} {
     const auto& relTable = table.cast<RelTable>();
+    localNodeGroup = std::make_unique<NodeGroup>(mm, 0, false, getTypesForLocalRelTable(relTable),
+        INVALID_ROW_IDX);
     for (auto relDirection : relTable.getStorageDirections()) {
         directedIndices.emplace_back(relDirection);
     }
@@ -74,7 +71,17 @@ bool LocalRelTable::insert(Transaction*, TableInsertState& state) {
     for (auto i = 0u; i < insertState.propertyVectors.size(); i++) {
         insertVectors.push_back(insertState.propertyVectors[i]);
     }
-    localNodeGroup->append(&DUMMY_TRANSACTION, insertVectors, 0, numRowsToAppend);
+    insertColumnIDs.clear();
+    if (!insertState.columnIDs.empty()) {
+        insertColumnIDs.push_back(LOCAL_BOUND_NODE_ID_COLUMN_ID);
+        insertColumnIDs.push_back(LOCAL_NBR_NODE_ID_COLUMN_ID);
+        for (const auto columnID : insertState.columnIDs) {
+            insertColumnIDs.push_back(rewriteLocalColumnID(
+                RelDataDirection::FWD /* This is a dummy direction */, columnID));
+        }
+    }
+    localNodeGroup->append(&DUMMY_TRANSACTION, insertColumnIDs, insertVectors, 0,
+        numRowsToAppend);
 
     for (auto i = 0u; i < numRowsToAppend; i++) {
         const auto rowToInsert = static_cast<row_idx_t>(numRowsInLocalTable + i);

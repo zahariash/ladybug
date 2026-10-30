@@ -262,6 +262,7 @@ public:
 
     void addColumn(TableAddColumnState& addColumnState, PageAllocator* pageAllocator,
         ColumnStats* newColumnStats) override;
+    void rollbackAddColumn(common::column_id_t columnID, PageAllocator* pageAllocator) override;
 
     void checkpoint(MemoryManager& memoryManager, NodeGroupCheckpointState& state) override;
     void reclaimStorage(PageAllocator& pageAllocator, const common::UniqLock& lock) const override;
