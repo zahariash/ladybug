@@ -481,7 +481,9 @@ class RecoveryRules(Session):
             state.on_reopen = state.on_reopen or self.model.fork()
             write.change(state.on_reopen)
             self.after_poison(state)
-        elif outcome == "failed" and POISONED in failure:
+        # An error that says writes are refused means a poisoned WAL, for a doubtful COPY too, so
+        # no CHECKPOINT can run before a restart.
+        if failure is not None and POISONED in failure:
             self.after_poison(state)
 
     def after_poison(self, state: Limited) -> None:
