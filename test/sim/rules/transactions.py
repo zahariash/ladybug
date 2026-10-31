@@ -1,0 +1,279 @@
+"""Rules for explicit transactions and statement atomicity.
+
+A transaction applies its writes to a fork of the model. It sees its own writes, COMMIT keeps
+them, and ROLLBACK or a crash before COMMIT drops them. A statement that fails inside the
+transaction rolls all of it back; the statements after it run on their own, and COMMIT then
+fails because no transaction is active.
+"""
+
+from __future__ import annotations
+
+import hypothesis.strategies as st
+from engine import EngineError
+from hypothesis.stateful import precondition, rule
+from model import Model, two_hops
+from session import DUPLICATE_KEY, Session, enabled, gated
+from strategies import (
+    CSR_BANDS,
+    ck_src_ids,
+    clusters,
+    csr_ids,
+    csr_src_ids,
+    extra_columns,
+    ints,
+    macro_ids,
+    small_ids,
+    table_ids,
+)
+
+ENDS = ["commit", "rollback", "crash"]
+gated("txn_ddl", "txn_error", *(f"txn_{end}" for end in ENDS))
+NO_TRANSACTION = "No active transaction"
+
+op = st.one_of(
+    st.tuples(st.just("insert"), small_ids, ints),
+    st.tuples(st.just("set_age"), small_ids, ints),
+    st.tuples(st.just("delete"), small_ids, st.none()),
+    st.tuples(st.just("knows"), small_ids, small_ids),
+    st.tuples(st.just("ck"), ck_src_ids, csr_ids),
+    st.tuples(st.just("unck"), csr_ids, csr_ids),
+    st.tuples(st.just("ck2"), csr_src_ids, csr_ids),
+    st.tuples(st.just("unck2"), csr_src_ids, csr_ids),
+    st.tuples(st.just("create_table"), table_ids, st.none()),
+    st.tuples(st.just("insert_t"), table_ids, st.integers(-1000, 1000)),
+    st.tuples(st.just("create_macro"), macro_ids, st.integers(-5, 5)),
+    st.tuples(st.just("duplicate"), small_ids, st.none()),
+    st.tuples(st.just("add_column"), extra_columns, st.integers(-5, 5)),
+    st.tuples(st.just("drop_column"), extra_columns, st.none()),
+    st.tuples(st.just("drop_table"), table_ids, st.none()),
+    st.tuples(st.just("drop_macro"), macro_ids, st.none()),
+)
+PERSON_OPS = {"insert", "set_age", "delete", "knows", "duplicate"}
+DDL_OPS = {"create_table", "create_macro", "add_column", "drop_column", "drop_table", "drop_macro"}
+gated("txn_column_gap", "rollback_add", "txn_prepared_ddl")
+
+
+def statement(model: Model, kind: str, a, b) -> tuple[str, dict, str | None] | None:
+    """The statement for an op, and the error it must fail with, or None for a no-op."""
+    if kind == "insert":
+        if a in model.persons:
+            return None
+        return "CREATE (:Person {id: $id, age: $v})", dict(id=a, v=b), None
+    if kind == "set_age":
+        return "MATCH (p:Person {id: $id}) SET p.age = $v", dict(id=a, v=b), None
+    if kind == "delete":
+        return "MATCH (p:Person {id: $id}) DETACH DELETE p", dict(id=a), None
+    if kind == "knows":
+        query = "MATCH (x:Person {id: $a}), (y:Person {id: $b}) CREATE (x)-[:Knows {since: 0}]->(y)"
+        return query, dict(a=a, b=b), None
+    if kind == "ck":
+        return "MATCH (x:C {id: $a}), (y:C {id: $b}) CREATE (x)-[:CK]->(y)", dict(a=a, b=b), None
+    if kind == "unck":
+        return "MATCH (x:C {id: $a})-[k:CK]->(y:C {id: $b}) DELETE k", dict(a=a, b=b), None
+    if kind == "ck2":
+        query = "MATCH (x:C {id: $a}), (y:C {id: $b}) CREATE (x)-[:CK2 {w: 0}]->(y)"
+        return query, dict(a=a, b=b), None
+    if kind == "unck2":
+        return "MATCH (x:C {id: $a})-[k:CK2]->(y:C {id: $b}) DELETE k", dict(a=a, b=b), None
+    if kind == "create_table":
+        if a in model.tables:
+            return None
+        return f"CREATE NODE TABLE T{a}(id SERIAL PRIMARY KEY, v INT64)", {}, None
+    if kind == "insert_t":
+        if a not in model.tables:
+            return None
+        return f"CREATE (:T{a} {{v: $v}})", dict(v=b), None
+    if kind == "create_macro":
+        if a in model.macros:
+            return None
+        return f"CREATE MACRO m{a}(x) AS x + {b}", {}, None
+    if kind == "add_column":
+        query = f"ALTER TABLE Person ADD {a} INT64 DEFAULT {b}"
+        return query, {}, "already has property" if a in model.columns else None
+    if kind == "drop_column":
+        query = f"ALTER TABLE Person DROP {a}"
+        return query, {}, None if a in model.columns else "does not have property"
+    if kind == "drop_table":
+        return (f"DROP TABLE T{a}", {}, None) if a in model.tables else None
+    if kind == "drop_macro":
+        return (f"DROP MACRO m{a}", {}, None) if a in model.macros else None
+    if a not in model.persons:
+        return None
+    return "CREATE (:Person {id: $id})", dict(id=a), DUPLICATE_KEY
+
+
+def apply(model: Model, kind: str, a, b) -> None:
+    model.wrote |= kind not in DDL_OPS
+    if kind == "insert":
+        model.add_persons({a: model.new_person(age=b)})
+    elif kind == "set_age":
+        model.update(a, "age", b)
+    elif kind == "delete":
+        model.forget(a)
+    elif kind == "knows" and a in model.persons and b in model.persons:
+        model.knows[(a, b, 0)] += 1
+    elif kind == "ck" and model.big.exists(a) and model.big.exists(b):
+        model.ck[(a, b)] += 1
+    elif kind == "unck":
+        model.ck.pop((a, b), None)
+    elif kind == "ck2" and model.big.exists(a) and model.big.exists(b):
+        model.ck2[(a, b, 0)] += 1
+    elif kind == "unck2":
+        for key in [k for k in model.ck2 if k[:2] == (a, b)]:
+            del model.ck2[key]
+    elif kind == "create_table":
+        model.tables[a] = []
+    elif kind == "insert_t":
+        model.tables[a].append(b)
+    elif kind == "create_macro":
+        model.macros[a] = b
+    elif kind == "add_column":
+        model.add_column(a, b)
+        model.added_in_txn = True
+    elif kind == "drop_column":
+        model.drop_column(a)
+    elif kind == "drop_table":
+        del model.tables[a]
+    elif kind == "drop_macro":
+        del model.macros[a]
+
+
+class TransactionRules(Session):
+    def allowed_ops(self) -> list:
+        skipped = self.options.skipped
+        return [
+            kind
+            for kind in ("insert", "set_age", "delete", "knows", "insert_t", "duplicate")
+            + tuple(DDL_OPS)
+            if not (kind in DDL_OPS and "txn_ddl" in skipped)
+            and not (kind == "duplicate" and "txn_error" in skipped)
+            and not (kind == "drop_column" and "txn_column_gap" in skipped)
+            and not (kind in ("create_macro", "drop_macro") and "macros" in skipped)
+            and not (kind == "drop_macro" and "drop_macro" in skipped)
+            and not (kind in PERSON_OPS and "persons" in skipped)
+        ] + (["ck", "unck", "ck2", "unck2"] if "csr" not in skipped else [])
+
+    def runs(self, model: Model, kind: str, a) -> bool:
+        """Whether an op runs: its kind is allowed, and it hits no bug in known.py: re-adding a
+        dropped column, or adding one after a drop since the last checkpoint."""
+        if kind not in self.allowed_ops():
+            return False
+        skipped = self.options.skipped
+        if (
+            kind in ("add_column", "drop_column", "drop_table", "create_table")
+            and model.wrote
+            and "txn_prepared_ddl" in skipped
+        ):
+            return False
+        if kind == "insert" and model.added_in_txn and "txn_prepared_ddl" in skipped:
+            return False
+        if not self.snapshot_write_safe(kind, a):
+            return False
+        if kind != "add_column":
+            return True
+        if a in model.dropped_columns and "readd_column" in skipped:
+            return False
+        if model.rolled_back_add and "rollback_add" in skipped:
+            return False
+        return not (model.dropped_since_checkpoint and "txn_column_gap" in skipped)
+
+    def column_gap_safe(self) -> bool:
+        """A transaction's new rows are misplaced once a column was dropped and another added,
+        or a column other than the last dropped, since the last checkpoint."""
+        gap = self.model.added_after_drop or self.model.middle_dropped
+        return "txn_column_gap" not in self.options.skipped or not gap
+
+    @enabled("transaction")
+    @precondition(lambda self: self.column_gap_safe())
+    @rule(ops=st.lists(op, min_size=1, max_size=12), data=st.data())
+    def transaction(self, ops, data):
+        """Runs ops in a transaction, checks that it sees its own writes, then ends it."""
+        ends = [end for end in ENDS if f"txn_{end}" not in self.options.skipped]
+        end = data.draw(st.sampled_from(ends or ["commit"]))
+        pending = self.model.fork()  # what the transaction sees
+        active = True
+        self.ok("BEGIN TRANSACTION")
+        for kind, a, b in ops:
+            target = pending if active else self.model
+            if not self.runs(target, kind, a):
+                continue
+            step = statement(target, kind, a, b)
+            if step is None:
+                continue
+            query, params, error = step
+            if error is None:
+                self.ok(query, params)
+                apply(target, kind, a, b)
+                continue
+            self.fails(query, params, error)
+            # The failed statement rolled the transaction back; later ones run on their own.
+            self.model.discarded(pending)
+            active = False
+        if active:
+            self.check_own_writes(pending, data)
+        self.end(end, pending, active)
+
+    def check_own_writes(self, pending: Model, data) -> None:
+        """The query battery inside the transaction, against its own writes."""
+        x, limit = data.draw(st.integers(-200, 200)), data.draw(st.integers(1, 20))
+        id, cluster = data.draw(small_ids), data.draw(clusters)
+        self.check_view(pending, 0, x, id, limit, cluster, alone=True)
+
+    def end(self, end: str, pending: Model, active: bool) -> None:
+        if not active:
+            self.fails("COMMIT" if end == "commit" else "ROLLBACK", None, NO_TRANSACTION)
+            return
+        self.model.discarded(pending)
+        if end == "commit":
+            self.ok("COMMIT")
+            self.model = pending
+        elif end == "rollback":
+            self.ok("ROLLBACK")
+        else:
+            self.crash_engine()
+
+    @enabled("txn_missing_group")
+    @precondition(lambda self: self.has_csr())
+    @rule(
+        a=csr_src_ids,
+        m0=csr_src_ids,
+        m1=st.sampled_from([id for band in CSR_BANDS[1:] for id in band]),
+        x=csr_src_ids,
+        y=csr_src_ids,
+    )
+    def two_hop_across_missing_group(self, a, m0, m1, x, y):
+        """A two-hop match in a write transaction whose middle nodes lie on both sides of a node
+        group CK2 lacks: committed a->m0 and a->m1, uncommitted m0->x and m1->y. The transaction
+        must see both walks; the ROLLBACK keeps CK2's sources in C's first node group."""
+        if not all(self.model.big.exists(id) for id in (a, m0, m1, x, y)):
+            return
+        create = "MATCH (s:C {id: $s}), (d:C {id: $d}) CREATE (s)-[:CK2 {w: $w}]->(d)"
+        for m in (m0, m1):
+            self.ok(create, dict(s=a, d=m, w=0))
+            self.model.ck2[(a, m, 0)] += 1
+        pending = self.model.fork()
+        self.ok("BEGIN TRANSACTION")
+        for s, d in ((m0, x), (m1, y)):
+            self.ok(create, dict(s=s, d=d, w=1))
+            pending.ck2[(s, d, 1)] += 1
+        walks = two_hops(pending.ck2_pairs(), [a])
+        query = "MATCH (a:C)-[:CK2]->(m:C)-[:CK2]->(b:C) WHERE a.id = $a RETURN m.id, b.id"
+        self.check(query, dict(a=a), [(m, b) for _, m, b in walks.elements()], alone=True)
+        self.ok("ROLLBACK")
+
+    @enabled("atomic_statement")
+    @precondition(lambda self: any(id < 41 for id in self.model.persons))
+    @rule(new=st.lists(small_ids, min_size=1, max_size=5, unique=True), data=st.data())
+    def failing_statement_is_atomic(self, new, data):
+        """A multi-row CREATE that hits a duplicate key midway must leave nothing behind."""
+        existing = data.draw(st.sampled_from(sorted(i for i in self.model.persons if i < 41)))
+        ids = [i for i in new if i not in self.model.persons]
+        ids.insert(data.draw(st.integers(0, len(ids))), existing)
+        try:
+            self.run("UNWIND $ids AS i CREATE (:Person {id: i})", dict(ids=ids))
+        except EngineError as e:
+            self.trace[-1]["expected"] = True
+            assert DUPLICATE_KEY in str(e), e
+            self.model.persons_ever = True
+            return
+        raise AssertionError(f"inserting existing id {existing} among {ids} succeeded")

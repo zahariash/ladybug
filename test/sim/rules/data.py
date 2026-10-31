@@ -1,0 +1,278 @@
+"""Rules that write data: persons, Knows edges, bulk COPY, the partitioned table, CK and CK2
+edges."""
+
+from __future__ import annotations
+
+import os
+import tempfile
+
+import hypothesis.strategies as st
+from hypothesis.stateful import precondition, rule
+from engine import EngineError
+from session import DUPLICATE_KEY, Session, enabled
+from strategies import (
+    VECTOR_CAPACITY,
+    ck_src_ids,
+    clusters,
+    csr_ids,
+    csr_src_ids,
+    csv_names,
+    doubles,
+    ints,
+    names,
+    near_boundaries,
+    small_ids,
+)
+
+NO_PK_INDEX = "COPY into a non-empty primary-key node table without a hash index"
+
+
+def csv_field(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return '"' + value.replace('"', '""') + '"'
+    return str(value)
+
+
+def copy_query(csv: str, rows) -> str:
+    """The parallel CSV reader rejects quoted newlines."""
+    newline = any(isinstance(name, str) and "\n" in name for name, _ in rows)
+    return f'COPY Person FROM "{csv}"' + (" (parallel=false)" if newline else "")
+
+
+class DataRules(Session):
+    @enabled("persons")
+    @rule(id=small_ids, name=names, age=ints, score=doubles)
+    def insert_person(self, id, name, age, score):
+        params = dict(id=id, name=name, age=age, score=score)
+        query = "CREATE (:Person {id: $id, name: $name, age: $age, score: $score})"
+        if id in self.model.persons:
+            self.fails(query, params, DUPLICATE_KEY)
+            return
+        self.ok(query, params)
+        self.model.add_persons({id: self.model.new_person(name=name, age=age, score=score)})
+
+    @enabled("persons")
+    @rule(id=small_ids, field=st.sampled_from(["name", "age", "score"]), data=st.data())
+    def update_person(self, id, field, data):
+        value = data.draw({"name": names, "age": ints, "score": doubles}[field])
+        if not self.snapshot_write_safe("update", id):
+            return
+        self.ok(f"MATCH (p:Person {{id: $id}}) SET p.{field} = $v", dict(id=id, v=value))
+        self.model.update(id, field, value)
+
+    @enabled("persons")
+    @precondition(lambda self: len(self.model.persons) > VECTOR_CAPACITY // 2)
+    @rule(data=st.data(), age=ints)
+    def update_near_boundary(self, data, age):
+        """An update of a person by a vector boundary, which update_person's small ids never
+        reach."""
+        id = data.draw(near_boundaries(list(self.model.persons)))
+        if not self.snapshot_write_safe("update", id):
+            return
+        self.ok("MATCH (p:Person {id: $id}) SET p.age = $v", dict(id=id, v=age))
+        self.model.update(id, "age", age)
+
+    @enabled("persons")
+    @rule(id=small_ids)
+    def delete_person(self, id):
+        if not self.snapshot_write_safe("delete", id):
+            return
+        self.ok("MATCH (p:Person {id: $id}) DETACH DELETE p", dict(id=id))
+        self.model.forget(id)
+
+    @enabled("persons")
+    @rule(data=st.data(), since=ints)
+    def insert_knows(self, data, since):
+        """Between existing persons about half the time, so that edges are common."""
+        endpoint = small_ids
+        if self.model.persons:
+            endpoint = st.one_of(st.sampled_from(sorted(self.model.persons)), small_ids)
+        src, dst = data.draw(endpoint), data.draw(endpoint)
+        self.ok(
+            "MATCH (a:Person {id: $a}), (b:Person {id: $b}) CREATE (a)-[:Knows {since: $s}]->(b)",
+            dict(a=src, b=dst, s=since),
+        )
+        if src in self.model.persons and dst in self.model.persons:
+            self.model.knows[(src, dst, since)] += 1
+
+    @enabled("persons")
+    @rule(src=small_ids, dst=small_ids)
+    def delete_knows(self, src, dst):
+        self.ok(
+            "MATCH (a:Person {id: $a})-[k:Knows]->(b:Person {id: $b}) DELETE k",
+            dict(a=src, b=dst),
+        )
+        for key in [k for k in self.model.knows if k[:2] == (src, dst)]:
+            del self.model.knows[key]
+
+    @enabled("knows")
+    @rule(src=small_ids, dst=small_ids, since=ints)
+    def update_knows(self, src, dst, since):
+        self.ok(
+            "MATCH (a:Person {id: $a})-[k:Knows]->(b:Person {id: $b}) SET k.since = $s",
+            dict(a=src, b=dst, s=since),
+        )
+        self.model.set_since(src, dst, since)
+
+    @enabled("knows")
+    @precondition(lambda self: self.model.persons and self.checkpoint_keeps_snapshots())
+    @rule(data=st.data(), count=st.integers(1, 200), missing=st.booleans())
+    def copy_knows(self, data, count, missing):
+        """COPYs edges between existing persons; with an unknown endpoint the whole COPY
+        fails and adds nothing."""
+        ids = st.sampled_from(sorted(self.model.persons))
+        edges = [
+            (data.draw(ids), data.draw(ids), data.draw(st.one_of(st.none(), ints)))
+            for _ in range(count)
+        ]
+        if missing:
+            edges.insert(data.draw(st.integers(0, count)), (edges[0][0], -1, 0))
+        fd, csv = tempfile.mkstemp(suffix=".csv", dir=self.files)
+        w = "" if self.model.knows_w is None else f",{self.model.knows_w}"
+        with os.fdopen(fd, "w") as f:
+            f.writelines(f"{s},{d},{'' if v is None else v}{w}\n" for s, d, v in edges)
+        if missing:
+            self.fails(f'COPY Knows FROM "{csv}"', None, "Unable to find primary key value -1")
+            return
+        self.ok(f'COPY Knows FROM "{csv}"')
+        self.model.knows.update(edges)
+
+    def write_bulk_csv(self, rows: list[tuple[str | None, int]]) -> tuple[str, dict]:
+        """Writes rows of (name, age) with fresh ids; returns the file and the new persons."""
+        ids = self.model.take_bulk_ids(len(rows))
+        csv = os.path.join(self.files, f"bulk{ids.start}.csv")
+        added = {}
+        with open(csv, "w") as f:
+            for id, (name, age) in zip(ids, rows, strict=True):
+                added[id] = self.model.new_person(name=name, age=age, score=age / 4)
+                values = [csv_field(v) for v in added[id].values()]
+                f.write(",".join([str(id), *values]) + "\n")
+        return csv, added
+
+    @enabled("bulk_rows")
+    @precondition(lambda self: len(self.model.persons) < 3 * VECTOR_CAPACITY)
+    @rule(size=st.integers(VECTOR_CAPACITY // 2, VECTOR_CAPACITY + 200))
+    def add_bulk_persons(self, size):
+        """Adds bulk persons in one statement, so that rows past vector boundaries exist for the
+        other rules, also under --sim-focus sessions, where bulk_copy is off."""
+        ids = self.model.take_bulk_ids(size)
+        query = "UNWIND range($lo, $hi) AS i CREATE (:Person {id: i, age: i % 1000})"
+        self.ok(query, dict(lo=ids.start, hi=ids.stop - 1))
+        self.model.add_persons({id: self.model.new_person(age=id % 1000) for id in ids})
+
+    @enabled("bulk_copy")
+    @precondition(lambda self: self.checkpoint_keeps_snapshots() and self.copy_person_safe())
+    @rule(rows=st.lists(st.tuples(csv_names, st.integers(-1000, 1000)), min_size=1, max_size=3000))
+    def bulk_copy(self, rows):
+        csv, added = self.write_bulk_csv(rows)
+        query = copy_query(csv, rows)
+        if self.model.pk_index is None and self.model.persons:
+            self.fails(query, None, NO_PK_INDEX)
+            return
+        if self.model.pk_index is None and self.model.persons_ever:
+            # Deleted rows count as rows until they are compacted, so the COPY may be refused.
+            try:
+                self.ok(query)
+            except EngineError as e:
+                self.trace[-1]["expected"] = True
+                assert NO_PK_INDEX in str(e), e
+                return
+        else:
+            self.ok(query)
+        self.model.add_persons(added)
+
+    @enabled("partitions")
+    @rule(id=small_ids, cluster=clusters)
+    def insert_partitioned(self, id, cluster):
+        query = "CREATE (:L {id: $id, cluster: $c})"
+        if (id, cluster) in self.model.partitioned:
+            self.fails(query, dict(id=id, c=cluster), DUPLICATE_KEY)
+            return
+        self.ok(query, dict(id=id, c=cluster))
+        self.model.partitioned.add((id, cluster))
+
+    @enabled("partitions")
+    @rule(id=small_ids)
+    def delete_partitioned(self, id):
+        self.ok("MATCH (n:L {id: $id}) DELETE n", dict(id=id))
+        self.model.partitioned = {(i, c) for i, c in self.model.partitioned if i != id}
+
+    @enabled("csr")
+    @rule(src=ck_src_ids, dst=csr_ids)
+    def insert_ck(self, src, dst):
+        self.ok(
+            "MATCH (a:C {id: $a}), (b:C {id: $b}) CREATE (a)-[:CK]->(b)", dict(a=src, b=dst)
+        )
+        if self.model.big.exists(src) and self.model.big.exists(dst):
+            self.model.ck[(src, dst)] += 1
+        self.check_csr_degree(src)
+
+    @enabled("csr")
+    @rule(data=st.data())
+    def delete_ck(self, data):
+        """An existing edge's endpoints about half the time."""
+        pair = st.tuples(csr_ids, csr_ids)
+        if self.model.ck:
+            pair = st.one_of(st.sampled_from(sorted(self.model.ck)), pair)
+        src, dst = data.draw(pair)
+        self.ok("MATCH (a:C {id: $a})-[k:CK]->(b:C {id: $b}) DELETE k", dict(a=src, b=dst))
+        self.model.ck.pop((src, dst), None)
+        self.check_csr_degree(src)
+
+    @enabled("csr")
+    @precondition(lambda self: self.checkpoint_keeps_snapshots())
+    @rule(edges=st.lists(st.tuples(ck_src_ids, csr_ids), min_size=1, max_size=300))
+    def copy_ck(self, edges):
+        """A COPY into an empty CK, or into node groups that already hold edges."""
+        edges = [(s, d) for s, d in edges if self.model.big.exists(s) and self.model.big.exists(d)]
+        if not edges:
+            return
+        fd, csv = tempfile.mkstemp(suffix=".csv", dir=self.files)
+        with os.fdopen(fd, "w") as f:
+            f.writelines(f"{s},{d}\n" for s, d in edges)
+        self.ok(f'COPY CK FROM "{csv}"')
+        self.model.ck.update(edges)
+        self.check_csr_degree(edges[0][0])
+
+    @enabled("csr")
+    @rule(src=csr_src_ids, dst=csr_ids, w=st.integers(-3, 3))
+    def insert_ck2(self, src, dst, w):
+        query = "MATCH (a:C {id: $a}), (b:C {id: $b}) CREATE (a)-[:CK2 {w: $w}]->(b)"
+        self.ok(query, dict(a=src, b=dst, w=w))
+        if self.model.big.exists(src) and self.model.big.exists(dst):
+            self.model.ck2[(src, dst, w)] += 1
+        self.check_csr_degree(src, "CK2")
+
+    @enabled("csr")
+    @rule(data=st.data())
+    def delete_ck2(self, data):
+        """An existing edge's endpoints about half the time."""
+        pair = st.tuples(csr_src_ids, csr_ids)
+        if self.model.ck2:
+            pair = st.one_of(st.sampled_from(sorted(self.model.ck2_pairs())), pair)
+        src, dst = data.draw(pair)
+        self.ok("MATCH (a:C {id: $a})-[k:CK2]->(b:C {id: $b}) DELETE k", dict(a=src, b=dst))
+        for key in [k for k in self.model.ck2 if k[:2] == (src, dst)]:
+            del self.model.ck2[key]
+        self.check_csr_degree(src, "CK2")
+
+    @enabled("csr")
+    @precondition(lambda self: self.checkpoint_keeps_snapshots())
+    @rule(
+        edges=st.lists(
+            st.tuples(csr_src_ids, csr_ids, st.integers(-3, 3)), min_size=1, max_size=300
+        )
+    )
+    def copy_ck2(self, edges):
+        exists = self.model.big.exists
+        edges = [(s, d, w) for s, d, w in edges if exists(s) and exists(d)]
+        if not edges:
+            return
+        fd, csv = tempfile.mkstemp(suffix=".csv", dir=self.files)
+        with os.fdopen(fd, "w") as f:
+            f.writelines(f"{s},{d},{w}\n" for s, d, w in edges)
+        self.ok(f'COPY CK2 FROM "{csv}"')
+        self.model.ck2.update(edges)
+        self.check_csr_degree(edges[0][0], "CK2")

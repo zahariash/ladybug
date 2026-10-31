@@ -34,12 +34,180 @@ TEST_F(MyTest, TestCaseName) {
 - `test/binder/` - Query binder tests
 - `test/planner/` - Query planner tests
 - `test/optimizer/` - Query optimizer tests
+- `test/sim/` - Random workloads checked against a model (see below)
 
 ## Node.js API
 
 Tests live in `tools/nodejs_api/test/` and use the Node.js built-in test runner (`node --test`). Run with `npm test` from `tools/nodejs_api/`.
 
 For guidelines on writing and reviewing these tests, see [Node.js API — Testing Guide](../tools/nodejs_api/docs/nodejs_testing.md).
+
+## Workload Simulation
+
+`test/sim/` is a Hypothesis state machine that runs random workloads through the Python package
+and checks the database against an in-memory model of what it should contain. Steps cover writes
+with edge values, transactions (with DDL, ending in commit, rollback or a crash), bulk `COPY`
+of nodes and edges, a partitioned table, DDL (macros, tables,
+`ALTER TABLE`, the primary-key index, and with `--sim-extensions` full-text and vector indexes),
+checkpoints, reopens, crashes between and in the middle of statements, and writes racing
+concurrent readers. The database runs in a worker process, so a crash is a SIGKILL followed by
+WAL replay, and a segfault or a hang fails the test. Databases open with
+`throw_on_wal_replay_failure` off, the engine's default, so replay drops the WAL tail a kill tore
+and the checks verify what remains. Query results are compared with the model
+on a freshly prepared statement, on its cached plan, through the driver and on a single-threaded
+connection. Failures shrink to a minimal sequence of steps, except those that depend on timing.
+
+Besides small tables, every workload has C, a node table of two node groups (2^17 rows and a
+second one past a vector end; `SIM_C_GROUPS=3` makes it three), with two rel tables. The rules
+draw C ids from bands at size boundaries: CSR leaf regions, vectors, segments, the end of each
+node group. CK's sources lie in the first and the last group, so that with three groups its middle
+node group exists and is empty. CK2's sources lie in the first group only, so its rel table lacks
+the others, and multi-hop checks (`hop_one`, `hop_two`, `hop_varlen`, `hop_mixed`,
+`hop_optional`, `band_degrees`, each a gate of its own) read nodes of every group in and out of
+offset order. C has a column `v = id % 1000` and a string `s` that is NULL, inline or longer by
+id, filled by COPY or by CREATE in each new database. Rules append rows across vector ends,
+update and delete rows at the band ids, add, drop and rename columns, give hubs CSR lists of 1023
+to 4097 edges and fill one CSR leaf region before a checkpoint; checks compare aggregates over C,
+rows at band ids, the rows that differ from the formulas (one scan that computes them in Cypher)
+and the top of an `ORDER BY` with a model that keeps only the changes. CS holds 20,000 string
+keys of 13 to 40 bytes, which rules extend by COPY and CREATE, delete and look up.
+`--sim-focus heavy` turns off the Person rules, Person's DDL and the macro rules to spend the
+steps on C and CS.
+
+```bash
+make python
+PYTHONPATH=tools/python_api/build uv run --no-project --with hypothesis --with pytest \
+    pytest test/sim --sim-examples 200 --sim-steps 50
+```
+
+Rules that hit known bugs are listed in `test/sim/known.py` and stay off unless `--sim-known` is
+given; `--sim-skip <name>` turns off more, `--sim-focus extensions` keeps only the extension
+rules, `--sim-focus races` keeps writes racing readers (node and edge writes, and bulk edge
+writes over a large node table) with checkpoints, reopens and crashes, and `--sim-keep` keeps
+the database directories. They live in `/tmp/lbug-sim-run-<pid>`,
+which a run removes at the end; the next run removes those of runs that were killed. With
+`--sim-extensions "LOAD EXTENSION fts;LOAD EXTENSION vector"` (or `LOAD EXTENSION '<path>'` for
+extensions built from `extension/`), the Doc table and the rules of each loaded extension are
+added.
+`SIM_TIMEOUT_SECONDS` (300 by default) bounds how long one statement may take; a hang reports the
+native stack of every engine thread. A crash reports the engine frames of the thread that crashed:
+with a C compiler installed, workers load `test/sim/crash_trace.c`, which writes the backtrace
+without slowing the worker, so races that gdb's timing hides still crash. `--sim-gdb` starts
+workers under gdb instead, for the stacks of every thread. With `strace` installed, crash points
+kill the engine at the n-th call of a file syscall, which does not depend on timing;
+`--sim-enable <name>` turns a known-bug rule back on, e.g. to verify a fix.
+
+Every workload records its engine interactions in a trace, each step tagged with its rule.
+Traces live in `.hypothesis/traces/` (`--sim-trace-dir`); a failing workload is kept there as
+`failed/<signature>/trace.json`, with the failure as the trace's last entry, and the run ends by
+printing each failure's directory and the command that starts its triage. Hypothesis saves
+failing examples per set of enabled rules and replays them first when a run with the same
+options starts again.
+
+Session rules (`--sim-focus sessions`) interleave transactions on three more connections, one
+step per rule: read-only snapshots, a write transaction, writes that must fail beside it, and
+the query battery against what each connection should see.
+
+Recovery rules (`--sim-focus recovery`) make commits and checkpoints fail or stop halfway, then
+crash or reopen, and check that every write that succeeded survives and every one that failed
+does not. `pinned_checkpoint` writes around a `CHECKPOINT` taken while a read-only transaction is
+open, which keeps the WAL, then kills the engine during the next checkpoint: strace attaches to
+the running worker, so that the snapshot and the kept WAL last until the kill. `storage_limit`
+limits every file the worker writes (`RLIMIT_FSIZE`, as a full disk) or reopens under a
+`max_db_size` just above the data file, writes rows of long strings into `Blob` to grow it, and
+ends by lifting the limit, a crash or a close; an automatic checkpoint that fails must not fail
+the commit before it. `commit_pressure_crash` commits while another connection holds the buffer
+pool full, and `reopen_checksums` opens a crashed database with the other `enable_checksums`
+setting, which must refuse the WAL. With the `graphs` rules, a named graph `g` holds a table
+`GN`; `USE GRAPH` switches every connection, so rules switch to it around their own statements
+only.
+
+### Triaging a failure
+
+Crashes, hangs and errors where the original statement succeeded are replayed without the
+model:
+
+```bash
+PYTHONPATH=tools/python_api/build uv run --no-project --with hypothesis \
+    python test/sim/replay.py .hypothesis/traces/failed/<signature>/trace.json \
+    --runs 5 --minimize --emit
+```
+
+`--runs` retries timing-dependent failures. `--minimize` delta-debugs the trace to the fewest
+steps that still fail the same way, replaces steps with simpler ones (a crash with a clean
+reopen, a timed or syscall crash with the statement and a crash, a prepared statement with a
+plain one, another connection with the first), drops the database settings the failure does not
+need, and shrinks the statements: the setup statements, table columns, column defaults and
+list-parameter values it does not need go, and range() bounds are halved while it still fails.
+`--emit` reruns it once under gdb and writes, next to the trace:
+
+- `trace.min.cypher`: the statements in order, with the connection, crash and reopen steps
+  marked and the failing statement flagged;
+- `trace.min.py`: a standalone script, one process per worker lifetime, that exits 1 while the
+  failure recurs; running it against another build (`PYTHONPATH=<build>`) tells whether that
+  build fixes it;
+- `finding.json`: the kind of failure, its signature (the failing operation, the statement with
+  literals abstracted, the innermost engine frames or the error text), the settings it needs,
+  the build and the commands run.
+
+`--shrink` then reduces the steps further with
+[shrinkray](https://github.com/DRMacIver/shrinkray), which cuts anywhere in the statements and
+parameters, the database settings and the setup, as long as the steps still fail with the same
+signature (`--fixed <build>`: and do not fail on that build, which keeps the reduction on a bug the
+build fixes). It works in `shrink/` next to the trace and emits the same three files there. Each
+candidate is a replay and shrinkray tries thousands, with most of the gain in the first minutes,
+so it stops after `--shrink-minutes` (10) and keeps the smallest case so far: worth it for a
+finding about to be reported, not for every one. Install shrinkray without its local language
+model, which these runs do not use (`--no-llm`):
+
+```bash
+uv venv /path/to/venv --python 3.13 && uv pip install --python /path/to/venv/bin/python \
+    --no-deps shrinkray && uv pip install --python /path/to/venv/bin/python click chardet trio \
+    textual textual-plotext humanize libcst exceptiongroup binaryornot black tree-sitter \
+    tree-sitter-language-pack
+```
+
+and pass `--shrinkray /path/to/venv/bin/shrinkray` if it is not on `PATH`.
+
+Two findings with the same signature are almost always one bug; the same frames or statement
+shape after different steps usually mean one cause reached two ways. Before reporting, try the
+script's variants (a node or a rel table, the last or a middle column, a crash or a clean
+reopen) to state which conditions matter, check whether an open fix covers it by running the
+script on that build, and add the failing rule or variant to `test/sim/known.py`, so that
+later runs reach new bugs. Steps that call a parameterized statement a second time can meet
+the Python driver's cache of prepared statements; rule the driver out before blaming the
+engine.
+
+Wrong results have no engine failure to replay, so the oracle is the wrong answer itself: the
+failure record holds the query that showed it and the rows it returned, and the run's summary
+prints the command, e.g.
+
+```bash
+python test/sim/replay.py <trace> --probe "MATCH (p:Person) RETURN p.id, p.c2" \
+    --rows '[[1, 0]]' --pin "ADD c2 INT64 DEFAULT 1" --minimize
+```
+
+which keeps the steps for which the probe still returns one of those rows and writes
+`trace.probe.min.json` and `trace.probe.min.cypher`. Dropping a step can change the right answer
+too, so `--pin` keeps the steps that define it (here the default the rows should have), and the
+minimized steps need a check by hand that the rows are still wrong for them. Statements keep their
+parameters in the listing: drivers reuse a parameterized statement's plan, which some failures
+need.
+
+`--differential` (instead of `--rows` and `--pin`) needs no right answer: the probe runs the ways
+a check runs a query (a fresh plan, the cached plan, the driver, the single-threaded connection)
+and with the plan optimizer off, and the oracle is that they split into the same groups as on
+the original replay. It fits failures of one plan or one path, not data that every path reads
+wrong, and it also works with `--shrink`, which then reduces the probe as well. A split that
+depends on thread timing shows in some replays only: with `--runs N` a candidate counts when any
+of N replays shows it, and shrinkray notices the flakiness itself and confirms each candidate by
+repeated runs.
+
+The simulator's own logic (model, search oracles, trace minimization, rule helpers) has unit
+tests next to it that need no database: `pytest test/sim -k "not simulation"`.
+
+The end-to-end runner also has a mode for the cached-plan path: with `E2E_REEXECUTE=1`, every
+read-only query is prepared once and executed twice, and the second result is checked.
 
 ## Running Tests
 
