@@ -18,7 +18,7 @@ from rules.durability import DurabilityRules
 from rules.extensions import ExtensionRules
 from rules.prepared import PreparedRules
 from rules.recovery import RecoveryRules
-from rules.sessions import SessionRules
+from rules.sessions import SLOW_WAITS, SessionRules
 from rules.transactions import TransactionRules
 from search import SearchChecks
 from session import BLOB_SCHEMA, FAILURES, GRAPH, GRAPH_SCHEMA
@@ -56,8 +56,9 @@ class LadybugSim(
         checkpoint_threshold=st.sampled_from([-1, 0, 4096]),
         c_fill=st.sampled_from(["copy", "create"]),
         checksums=st.booleans(),
+        multi_writes=st.booleans(),
     )
-    def open_db(self, threads, compression, checkpoint_threshold, c_fill, checksums):
+    def open_db(self, threads, compression, checkpoint_threshold, c_fill, checksums, multi_writes):
         # The files of the current workload live with its trace, so a failure can be replayed.
         self.files = os.path.join(self.options.traces or self.dir, f"current-{os.getpid()}")
         shutil.rmtree(self.files, ignore_errors=True)
@@ -71,7 +72,13 @@ class LadybugSim(
             # then verify; the Python driver's default refuses to open the database instead.
             throw_on_wal_replay_failure=False,
             enable_checksums=checksums,
+            # Explicit, since the drivers' defaults differ; a failure shrinks to single-writer
+            # when it does not need overlapping writers.
+            enable_multi_writes=(
+                multi_writes if self.options.writers == "both" else self.options.writers == "multi"
+            ),
         )
+        self.slow_waits = SLOW_WAITS
         self.c_fill = c_fill
         self.new_database()
 

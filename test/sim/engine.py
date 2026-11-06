@@ -90,6 +90,66 @@ def race(db, connect, writer, writes: list, queries: list[str], num_readers: int
     return observations, errors
 
 
+def race_writers(db, connect, writers: list, queries: list[str], num_readers: int) -> tuple:
+    """Runs each list of `writers` on a connection of its own while readers repeatedly read
+    `queries`; returns every state each reader saw and the errors of the writers and readers."""
+    done = threading.Event()
+    observations = [[] for _ in range(num_readers)]
+    errors = []
+
+    def reader(out: list) -> None:
+        conn = connect(db)
+        try:
+            while not done.is_set():
+                out.append(read_state(conn, queries))
+            out.append(read_state(conn, queries))
+        except Exception as e:
+            errors.append(f"reader: {e}")
+        finally:
+            conn.close()
+
+    def writer(writes: list) -> None:
+        conn = connect(db)
+        try:
+            for query, params in writes:
+                conn.execute(query, params)
+        except Exception as e:
+            errors.append(f"writer: {query}: {e}")
+        finally:
+            conn.close()
+
+    readers = [threading.Thread(target=reader, args=(out,)) for out in observations]
+    pool = [threading.Thread(target=writer, args=(writes,)) for writes in writers]
+    for thread in readers + pool:
+        thread.start()
+    for thread in pool:
+        thread.join()
+    done.set()
+    for thread in readers:
+        thread.join()
+    return observations, errors
+
+
+def start_writers(db, connect, writers: list, acks: str) -> None:
+    """Starts a thread per list of `writers`; each appends a line with its index to `acks` once a
+    statement's commit returned, in a write that outlives a kill of this process, and on an error
+    a line with its index and the error, and stops."""
+    fd = os.open(acks, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+
+    def writer(index: int, writes: list) -> None:
+        conn = connect(db)
+        for query, params in writes:
+            try:
+                conn.execute(query, params)
+            except Exception as e:
+                os.write(fd, f"{index} {str(e).splitlines()[0]}\n".encode())
+                return
+            os.write(fd, f"{index}\n".encode())
+
+    for index, writes in enumerate(writers):
+        threading.Thread(target=writer, args=(index, writes), daemon=True).start()
+
+
 # Results of decreasing size that ("hold", ...) keeps unconsumed until the buffer pool is full.
 PAD_ROWS = (200000, 20000, 2000, 200)
 PAD_QUERY = "UNWIND range(1, $n) AS i RETURN 'pad-' + CAST(i AS STRING)"
@@ -129,6 +189,11 @@ def serve(conns: list, db, connect, named: dict, held: list, message: tuple):
     if message[0] == "race":
         _, writes, queries, num_readers = message
         return race(db, connect, conns[0], writes, queries, num_readers)
+    if message[0] == "race_writers":
+        _, writers, queries, num_readers = message
+        return race_writers(db, connect, writers, queries, num_readers)
+    if message[0] == "start_writers":
+        return start_writers(db, connect, message[1], message[2])
     if message[0] == "prepared":
         _, conn, query, params = message
         statement = conns[conn].prepare(query, params)
@@ -447,6 +512,14 @@ class Engine:
     def race(self, writes: list, queries: list[str], num_readers: int) -> tuple[list, list]:
         self.send(("race", writes, queries, num_readers), f"race reading {queries}")
         return self.reply()
+
+    def race_writers(self, writers: list, queries: list[str], num_readers: int) -> tuple:
+        self.send(("race_writers", writers, queries, num_readers), f"race of writers {queries}")
+        return self.reply()
+
+    def start_writers(self, writers: list, acks: str) -> None:
+        self.send(("start_writers", writers, acks), "start writers")
+        self.reply()
 
     def reply(self):
         if not self.pipe.poll(TIMEOUT_SECONDS):

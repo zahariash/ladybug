@@ -64,9 +64,12 @@ class Checks(Session):
         query = "MATCH (a:Person)-[k:Knows]->(b:Person) RETURN a.id, b.id, k.since"
         actual = Counter(self.rows(query))
         assert actual == self.model.knows, diff(actual, self.model.knows)
+        total = sum(self.model.knows.values())
+        # Without the endpoints it counts edges whose node is gone, which the join above drops.
+        rows = self.rows("MATCH ()-[k:Knows]->() RETURN count(*)")
+        assert rows == [(total,)], (rows, total)
         if self.model.knows_w is not None:
             # Every edge, old or new, carries the default of the added property.
-            total = sum(self.model.knows.values())
             query = "MATCH (:Person)-[k:Knows]->(:Person) RETURN k.w, count(*)"
             actual = self.rows(query)
             assert actual == ([(self.model.knows_w, total)] if total else []), actual
@@ -582,10 +585,10 @@ class Checks(Session):
                 )
                 sources = {s for s, _ in pairs if s < 40}
                 check(query, {}, list(two_hops(pairs, sources).elements()))
+        both, c = ck + ck2, csr_id(id)
+        query = f"MATCH (a:C)-[:CK|:CK2]->(b:C) WHERE a.id = {c} RETURN b.id"
+        check(query, {}, [(d,) for s, d in both.elements() if s == c])
         if "hop_mixed" not in skipped:
-            both, c = ck + ck2, csr_id(id)
-            query = f"MATCH (a:C)-[:CK|:CK2]->(b:C) WHERE a.id = {c} RETURN b.id"
-            check(query, {}, [(d,) for s, d in both.elements() if s == c])
             query = (
                 f"MATCH (a:C)-[:CK|:CK2]->(m:C)-[:CK|:CK2]->(b:C) WHERE a.id = {c} "
                 "RETURN m.id, b.id"

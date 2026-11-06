@@ -110,6 +110,40 @@ FOCUS = {
         "secondary_index",
         "tables",
     },
+    # Overlapping write transactions, and concurrent commits against readers and crashes.
+    "writers": {
+        "atomic_statement",
+        "big_appends",
+        "big_ddl",
+        "big_deletes",
+        "big_strings",
+        "big_updates",
+        "bulk_copy",
+        "bulk_rows",
+        "checksums",
+        "columns",
+        "crash_at_syscall",
+        "crash_during",
+        "dense_region",
+        "graphs",
+        "hub_edges",
+        "lookup_join",
+        "partitions",
+        "pinned_checkpoint",
+        "pk_index",
+        "pk_ranges",
+        "pool_commit_crash",
+        "prepared_ddl",
+        "race",
+        "race_bulk",
+        "rel_columns",
+        "rename_table",
+        "secondary_index",
+        "storage_limit",
+        "string_keys",
+        "tables",
+        "transaction",
+    },
     # Transactions on several connections over person and Knows writes and column DDL.
     "sessions": {
         "bulk_copy",
@@ -150,6 +184,12 @@ def pytest_addoption(parser) -> None:
         "--sim-focus",
         choices=sorted(FOCUS),
         help="turn off the rules outside one area; checkpoints, reopens and crashes stay on",
+    )
+    group.addoption(
+        "--sim-writers",
+        choices=["both", "single", "multi"],
+        default="both",
+        help="single- or multi-writer workloads; by default each workload draws one",
     )
     group.addoption(
         "--sim-extensions",
@@ -196,6 +236,7 @@ def sim_options(pytestconfig) -> Iterator[Options]:
         debug=pytestconfig.getoption("sim_gdb"),
         traces=pytestconfig.getoption("sim_trace_dir"),
         scratch=scratch,
+        writers=pytestconfig.getoption("sim_writers"),
     )
     if not pytestconfig.getoption("sim_keep"):
         shutil.rmtree(scratch, ignore_errors=True)

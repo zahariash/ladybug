@@ -172,6 +172,10 @@ def cypher(trace: list, failing: int, failure: str, config: dict) -> str:
             )
         elif kind == "race":
             text = f"// race: {len(op['writes'])} writes against {op['readers']} readers"
+        elif kind == "race_writers":
+            text = f"// race: {len(op['writers'])} writers against {op['readers']} readers"
+        elif kind == "crash_writers":
+            text = f"// {len(op['writers'])} writers, killed after {op['delay']} s; reopen"
         elif kind == "hold":
             text = f"{where}// keep results of {PAD} unconsumed until the buffer pool is full"
         elif kind == "release":

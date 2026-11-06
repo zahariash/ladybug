@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import pathlib
+from collections import Counter
 from types import SimpleNamespace
 
 import conftest
@@ -11,10 +12,33 @@ import pytest
 from known import known_rules
 from model import Model
 from rules.data import copy_query, csv_field
-from rules.durability import DurabilityRules
+from rules.durability import (
+    DurabilityRules,
+    check_survivors,
+    check_writer_reads,
+    ck_state,
+    read_acks,
+    edge_fingerprint,
+    writer_states,
+)
 from rules.prepared import TEMPLATES, expected_rows, params_for
-from rules.transactions import apply, statement
-from session import DUPLICATE_KEY, RULE_NAMES, Options
+from rules.sessions import SessionRules, Txn
+from rules.transactions import apply, replay, seen_by, statement
+from session import DUPLICATE_KEY, RULE_NAMES, Options, Session
+from writesets import (
+    GATED_EDGE,
+    GATED_HIDDEN,
+    GATED_INSERT,
+    GATED_REINSERT,
+    PERSON,
+    WW_CATALOG,
+    WW_DELETE,
+    WW_UPDATE,
+    Others,
+    Writes,
+    conflict,
+    record,
+)
 
 
 def test_known_bugs_and_focus_groups_name_registered_rules() -> None:
@@ -179,3 +203,271 @@ def test_graph_ops_and_blobs_change_the_model_as_their_statements_do() -> None:
     assert blob_lengths(ids, 3) == {9: 6, 10: 9}
     query = blob_query(ids, 3)
     assert "range(9, 10)" in query and "repeat(CAST(i AS STRING) + '-', 3)" in query
+
+
+def overlapped(**writes) -> Others:
+    """One open transaction that wrote `writes`."""
+    return Others(open=[Writes(**writes)])
+
+
+def test_writes_conflict_with_what_overlapping_transactions_wrote() -> None:
+    view = small_model()
+    own = Writes()
+    assert conflict("set_age", 1, 5, view, own, overlapped(updated={(1, 0)})) == WW_UPDATE
+    assert conflict("set_age", 2, 5, view, own, overlapped(updated={(1, 0)})) is None
+    assert conflict("delete", 1, None, view, own, overlapped(deleted={1})) == WW_DELETE
+    # Update and delete of one row do not conflict, in either order.
+    assert conflict("set_age", 1, 5, view, own, overlapped(deleted={1})) is None
+    assert conflict("delete", 1, None, view, own, overlapped(updated={(1, 0)})) is None
+    # A row the transaction does not see matches nothing.
+    assert conflict("set_age", 9, 5, view, own, overlapped(updated={9})) is None
+    # DETACH DELETE deletes the edges it sees.
+    deleted = overlapped(edges_deleted={("knows", 1, 2)})
+    assert conflict("delete", 2, None, view, own, deleted) == WW_DELETE
+
+
+def test_catalog_conflicts_are_per_entry_and_staged_inserts_block_column_changes() -> None:
+    view, own = small_model(), Writes()
+    assert conflict("create_table", 1, None, view, own, overlapped(catalog={"T1"})) == WW_CATALOG
+    assert conflict("create_table", 2, None, view, own, overlapped(catalog={"T1"})) is None
+    assert conflict("add_column", "c1", 1, view, own, overlapped(catalog={PERSON})) == WW_CATALOG
+    assert conflict("insert", 7, 1, view, own, overlapped(catalog={PERSON})) == WW_CATALOG
+    assert conflict("add_column", "c1", 1, view, own, overlapped(staged={PERSON})) == WW_CATALOG
+    # Inserts that are already committed no longer block the change.
+    committed = Others(committed=[Writes(staged={PERSON})])
+    assert conflict("add_column", "c1", 1, view, own, committed) is None
+    assert conflict("drop_table", 1, None, view, own, overlapped(staged={"T1"})) == WW_CATALOG
+
+
+def test_overlaps_the_engine_gets_wrong_are_gated() -> None:
+    view, own = small_model(), Writes()
+    assert conflict("insert", 7, 1, view, own, overlapped(inserted={7})) == GATED_INSERT
+    assert conflict("knows", 1, 2, view, own, overlapped(deleted={2})) == GATED_EDGE
+    added = overlapped(edges_added={("knows", 2, 1)})
+    assert conflict("delete", 1, None, view, own, added) == GATED_EDGE
+
+
+def test_deleting_edges_conflicts_only_over_the_snapshots() -> None:
+    view, own = small_model(), Writes()
+    view.ck[(1, 2)] = 1
+    deleted = overlapped(edges_deleted={("ck", 1, 2)})
+    assert conflict("unck", 1, 2, view, own, deleted) == WW_DELETE
+    own.own_edges[("ck", 1, 2)] = 1  # the one it sees is its own
+    assert conflict("unck", 1, 2, view, own, deleted) is None
+
+
+def test_commit_replay_removes_only_the_edges_the_transaction_saw() -> None:
+    view, committed = small_model(), small_model()
+    view.ck[(1, 2)] = 2
+    committed.ck[(1, 2)] = 3  # another transaction committed one more since the snapshot
+    replay(committed, "unck", 1, 2, seen_by(view, "unck", 1, 2))
+    assert committed.ck[(1, 2)] == 1
+    view.ck2[(1, 2, 0)] = 1
+    committed.ck2[(1, 2, 0)] = 1
+    committed.ck2[(1, 2, 5)] = 1
+    replay(committed, "unck2", 1, 2, seen_by(view, "unck2", 1, 2))
+    assert committed.ck2 == {(1, 2, 5): 1}
+
+
+def test_writer_states_hold_a_prefix_of_each_writers_edges() -> None:
+    plans = [(1, [10, 11]), (2, [20])]
+    states = writer_states((0, 0), plans)
+    fp = edge_fingerprint
+    assert (1, fp(1, 10)) in states
+    assert (2, fp(1, 10) + fp(2, 20)) in states
+    assert (3, fp(1, 10) + fp(1, 11) + fp(2, 20)) in states
+    assert (1, fp(1, 11)) not in states  # the second edge without the first
+    assert len(states) == 6
+
+
+def test_writer_reads_must_be_consistent_and_never_go_back() -> None:
+    model = small_model()
+    base = ck_state(model)
+    plans = [(1, [10]), (2, [20])]
+    first = small_model()
+    first.ck[(1, 10)] += 1
+    final = small_model()
+    final.ck[(1, 10)] += 1
+    final.ck[(2, 20)] += 1
+    check_writer_reads([[base, ck_state(first), ck_state(final)]], base, plans, ck_state(final))
+    with pytest.raises(AssertionError, match="went back"):
+        reads = [ck_state(first), base, ck_state(final)]
+        check_writer_reads([reads], base, plans, ck_state(final))
+    torn = list(ck_state(first))
+    torn[2] = ((0,),)  # one query of the transaction missed the edge the others saw
+    with pytest.raises(AssertionError, match="no prefix"):
+        check_writer_reads([[tuple(torn), ck_state(final)]], base, plans, ck_state(final))
+    # With the gate on, only that query-to-query check is off.
+    check_writer_reads([[tuple(torn), ck_state(final)]], base, plans, ck_state(final), False)
+    with pytest.raises(AssertionError):
+        check_writer_reads([[ck_state(first)]], base, plans, ck_state(final))
+
+
+def test_a_crash_keeps_every_returned_commit_as_a_prefix_of_each_writer() -> None:
+    targets = [10, 11, 12]
+    assert check_survivors(0, targets, Counter(), 0) == 0
+    assert check_survivors(0, targets, Counter({10: 1, 11: 1}), 1) == 2  # one that never returned
+    with pytest.raises(AssertionError, match="only 1 survived"):
+        check_survivors(0, targets, Counter({10: 1}), 2)
+    with pytest.raises(AssertionError, match="not its first"):
+        check_survivors(0, targets, Counter({11: 1}), 1)  # the first commit lost, the second kept
+
+
+def test_acks_count_finished_lines_and_report_errors() -> None:
+    acked, errors = read_acks(["0\n", "1\n", "0\n", "1 Runtime exception: boom\n", "0"])
+    assert acked == {0: 2, 1: 1}
+    assert errors == ["1 Runtime exception: boom"]
+
+
+def test_an_update_stays_with_the_row_its_snapshot_saw() -> None:
+    committed = small_model()
+    apply(committed, "insert", 5, 1)
+    updater = committed.fork()
+    seen = seen_by(updater, "set_age", 5, 100)
+    apply(committed, "delete", 5, None)
+    apply(committed, "insert", 5, 7)  # another row under the same id
+    replay(committed, "set_age", 5, 100, seen)
+    assert committed.persons[5]["age"] == 7
+    replay(committed, "set_age", 5, 50, seen_by(committed, "set_age", 5, 50))
+    assert committed.persons[5]["age"] == 50
+
+
+def test_updating_a_reinserted_row_does_not_conflict_with_an_update_of_the_old_one() -> None:
+    view = small_model()
+    apply(view, "insert", 5, 1)
+    old = Writes()
+    record(old, "set_age", 5, 100, view)
+    assert conflict("set_age", 5, 0, view, Writes(), Others(open=[old])) == WW_UPDATE
+    apply(view, "delete", 5, None)
+    apply(view, "insert", 5, 7)
+    assert conflict("set_age", 5, 0, view, Writes(), Others(open=[old])) is None
+
+
+def rollback_session(model, *open_writes, commit_log=()):
+    txns = {i: Txn("write", model.fork(), writes=w) for i, w in enumerate(open_writes)}
+    return SimpleNamespace(model=model, txns=txns, commit_log=list(commit_log))
+
+
+def test_a_rollback_rewinds_serial_only_beside_an_insert_into_the_same_table() -> None:
+    model = small_model()
+    txn = Txn("write", model.fork(), writes=Writes(staged={"T0"}))
+    Session.rolled_back(rollback_session(model, Writes(staged={"T1"})), txn)
+    assert not model.serial_rewound
+    Session.rolled_back(rollback_session(model, Writes(staged={"Person"})), txn)
+    assert not model.serial_rewound
+    Session.rolled_back(rollback_session(model, Writes(staged={"T0"})), txn)
+    assert model.serial_rewound
+    model = small_model()
+    earlier = rollback_session(model, commit_log=[(0, Writes(staged={"T0"}))])
+    Session.rolled_back(earlier, txn)
+    assert not model.serial_rewound  # committed before the transaction began, ids already moved on
+    model = small_model()
+    later = rollback_session(model, commit_log=[(1, Writes(staged={"T0"}))])
+    Session.rolled_back(later, Txn("write", model.fork(), writes=Writes(staged={"T0"})))
+    assert model.serial_rewound
+
+
+def committing_session(model, overlapped: bool):
+    return SimpleNamespace(
+        model=model,
+        multi_writes=True,
+        session_writer=lambda: 2 if overlapped else None,
+        commit_log=[],
+        note_commit=lambda writes: None,
+    )
+
+
+def test_a_commit_sets_no_rollback_flag() -> None:
+    model = small_model()
+    view = model.fork()
+    apply(view, "add_column", "c0", 1)
+    txn = Txn("write", view, ops=[("add_column", "c0", 1, None)])
+    SessionRules.commit_txn(committing_session(model, False), txn)
+    assert "c0" in model.columns and not model.rolled_back_add and not model.rolled_back_macro
+
+
+def test_a_macro_committed_beside_another_writer_keeps_later_drops_from_recovery() -> None:
+    for overlapped in (False, True):
+        model = small_model()
+        view = model.fork()
+        apply(view, "create_macro", 0, 1)
+        txn = Txn("write", view, ops=[("create_macro", 0, 1, None)])
+        SessionRules.commit_txn(committing_session(model, overlapped), txn)
+        assert model.rolled_back_macro == overlapped
+
+
+def test_deletes_and_edges_replay_only_what_the_snapshot_matched() -> None:
+    committed = small_model()
+    view = committed.fork()
+    seen_delete = seen_by(view, "delete", 5, None)  # no row 5 in the snapshot: matches nothing
+    seen_edge = seen_by(view, "knows", 5, 1)
+    seen_update = seen_by(view, "set_age", 5, 100)
+    apply(committed, "insert", 5, 7)
+    replay(committed, "delete", 5, None, seen_delete)
+    replay(committed, "knows", 5, 1, seen_edge)
+    replay(committed, "set_age", 5, 100, seen_update)
+    assert committed.persons[5]["age"] == 7
+    assert not committed.knows[(5, 1, 0)]
+    replay(committed, "delete", 5, None, seen_by(committed, "delete", 5, None))
+    assert 5 not in committed.persons
+
+
+def test_inserting_a_key_the_transaction_inserted_and_deleted_is_gated() -> None:
+    view, own = small_model(), Writes()
+    record(own, "insert", 5, 1, view)
+    apply(view, "insert", 5, 1)
+    record(own, "delete", 5, None, view)
+    apply(view, "delete", 5, None)
+    assert conflict("insert", 5, 1, view, own, Others()) == GATED_REINSERT
+    assert conflict("insert", 6, 1, view, own, Others()) is None
+
+
+def test_a_key_committed_since_the_snapshot_is_gated_once_the_transaction_has_new_rows() -> None:
+    view, own = small_model(), Writes()
+    others = Others(committed=[Writes(inserted={7})])
+    assert conflict("set_age", 7, 1, view, own, others) is None
+    record(own, "insert", 6, 1, view)
+    for kind, a, b in (("set_age", 7, 1), ("delete", 7, None), ("knows", 7, 1), ("knows", 1, 7)):
+        assert conflict(kind, a, b, view, own, others) == GATED_HIDDEN
+    assert conflict("set_age", 1, 1, view, own, others) is None
+
+
+def test_a_key_replaced_since_the_snapshot_is_gated_once_the_transaction_has_new_rows() -> None:
+    view, own = small_model(), Writes()
+    record(own, "insert", 6, 1, view)
+    replaced = Others(committed=[Writes(deleted={1}), Writes(inserted={1})])
+    assert conflict("set_age", 1, 1, view, own, replaced) == GATED_HIDDEN
+    assert conflict("delete", 1, None, view, own, replaced) == GATED_HIDDEN
+    assert conflict("set_age", 1, 1, view, Writes(), replaced) is None
+    deleted_only = Others(committed=[Writes(deleted={1})])
+    assert conflict("set_age", 1, 1, view, own, deleted_only) is None
+
+
+def test_the_read_battery_waits_for_a_key_inserted_since_the_snapshot() -> None:
+    session = SimpleNamespace(
+        options=Options(skipped={GATED_HIDDEN}), commit_log=[(1, Writes(inserted={7}))]
+    )
+    new_rows = Txn("write", small_model(), writes=Writes(staged={PERSON}))
+    assert not SessionRules.lookups_safe(session, new_rows)
+    assert SessionRules.lookups_safe(session, Txn("write", small_model()))
+    later = Txn("write", small_model(), start=1, writes=new_rows.writes)
+    assert SessionRules.lookups_safe(session, later)
+
+
+def test_a_snapshot_of_a_dropped_table_holds_back_checkpoints() -> None:
+    model = small_model()
+    snapshot = model.fork()
+    snapshot.tables[0] = []
+    session = SimpleNamespace(
+        options=Options(skipped={"snapshot_dropped_table"}),
+        model=model,
+        txns={2: Txn("read", snapshot)},
+        config={"checkpoint_threshold": 0},
+    )
+    assert not Session.checkpoint_keeps_snapshots(session)
+    assert not Session.drop_table_safe(session, 0)
+    assert Session.drop_table_safe(session, 1)
+    session.config = {"checkpoint_threshold": -1}
+    assert Session.drop_table_safe(session, 0)
+    model.tables[0] = []
+    assert Session.checkpoint_keeps_snapshots(session)

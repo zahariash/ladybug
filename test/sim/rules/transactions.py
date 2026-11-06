@@ -50,7 +50,14 @@ op = st.one_of(
 )
 PERSON_OPS = {"insert", "set_age", "delete", "knows", "duplicate"}
 DDL_OPS = {"create_table", "create_macro", "add_column", "drop_column", "drop_table", "drop_macro"}
-gated("txn_column_gap", "rollback_add", "txn_prepared_ddl")
+gated(
+    "txn_column_gap",
+    "rollback_add",
+    "txn_prepared_ddl",
+    "serial_rollback",
+    "table_recreate",
+    "snapshot_dropped_table",
+)
 
 
 def statement(model: Model, kind: str, a, b) -> tuple[str, dict, str | None] | None:
@@ -106,6 +113,7 @@ def apply(model: Model, kind: str, a, b) -> None:
     model.wrote |= kind not in DDL_OPS
     if kind == "insert":
         model.add_persons({a: model.new_person(age=b)})
+        model.generation[a] += 1
     elif kind == "set_age":
         model.update(a, "age", b)
     elif kind == "delete":
@@ -127,6 +135,7 @@ def apply(model: Model, kind: str, a, b) -> None:
         model.tables[a].append(b)
     elif kind == "create_macro":
         model.macros[a] = b
+        model.created_macro = True
     elif kind == "add_column":
         model.add_column(a, b)
         model.added_in_txn = True
@@ -136,6 +145,45 @@ def apply(model: Model, kind: str, a, b) -> None:
         del model.tables[a]
     elif kind == "drop_macro":
         del model.macros[a]
+
+
+def seen_by(view: Model, kind: str, a, b) -> dict | int | None:
+    """What an op acted on in `view`: another transaction's commits since its snapshot are not in
+    it, so a DELETE of edges removes exactly these, not everything between a and b, an update or
+    delete reaches only the row it matched, and an edge needs the endpoints it matched."""
+    if kind in ("set_age", "delete"):
+        return view.generation[a] if a in view.persons else None
+    if kind == "knows":
+        return a in view.persons and b in view.persons
+    if kind == "unck":
+        return view.ck[(a, b)]
+    if kind == "unck2":
+        return {key: n for key, n in view.ck2.items() if key[:2] == (a, b)}
+    return None
+
+
+def replay(model: Model, kind: str, a, b, seen) -> None:
+    """Applies a committing transaction's op to the committed model, which may hold commits made
+    since that transaction's snapshot; `seen` is what seen_by returned for it."""
+    if kind in ("set_age", "delete"):
+        if model.generation[a] == seen:
+            apply(model, kind, a, b)
+    elif kind == "knows":
+        if seen:
+            apply(model, kind, a, b)
+    elif kind == "unck":
+        model.ck[(a, b)] -= seen
+        if model.ck[(a, b)] <= 0:
+            del model.ck[(a, b)]
+    elif kind == "unck2":
+        for key, n in seen.items():
+            model.ck2[key] -= n
+            if model.ck2[key] <= 0:
+                del model.ck2[key]
+    else:
+        apply(model, kind, a, b)
+    # Those flags describe what an open transaction ran; this model is the committed state.
+    model.wrote = model.added_in_txn = False
 
 
 class TransactionRules(Session):
@@ -168,6 +216,14 @@ class TransactionRules(Session):
         if kind == "insert" and model.added_in_txn and "txn_prepared_ddl" in skipped:
             return False
         if not self.snapshot_write_safe(kind, a):
+            return False
+        if kind == "drop_macro" and model.rolled_back_macro and "rollback_macro" in skipped:
+            return False
+        if kind == "insert_t" and model.serial_rewound and "serial_rollback" in skipped:
+            return False
+        if kind == "create_table" and not self.recreate_safe(a):
+            return False
+        if kind == "drop_table" and not self.drop_table_safe(a):
             return False
         if kind != "add_column":
             return True

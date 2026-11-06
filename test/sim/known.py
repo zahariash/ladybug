@@ -52,6 +52,11 @@ KNOWN_BUGS = [
         "with a node past the rel table's last node group, until COMMIT (not filed)",
     ),
     Known(
+        "hop_mixed",
+        "a two-hop over a multi-label relationship with a primary-key filter returns no rows, "
+        "when the same filter written as IN finds them (not filed)",
+    ),
+    Known(
         "race_edges",
         "#1332: a query segfaults while another connection commits rels: commits edit the CSR "
         "index in place under readers (fix: PR #1333)",
@@ -169,6 +174,64 @@ KNOWN_BUGS = [
         "checksums",
         "#1357: opening a database with the other enable_checksums setting drops its WAL "
         "(fix: PR #1358)",
+    ),
+    Known(
+        "rollback_macro",
+        "a DROP MACRO committed after a transaction that created a macro rolled back, with no "
+        "checkpoint between, makes the WAL unreplayable: reopen after a crash fails 'Cannot find "
+        "macro catalog entry'; after overlapping creates commit out of order, recovery drops "
+        "another macro (not filed)",
+    ),
+    Known(
+        "snapshot_rel_scan",
+        "a later query of a read-only transaction sees relationships committed after it began, "
+        "around an automatic checkpoint (not filed)",
+    ),
+    Known(
+        "concurrent_insert",
+        "the second of two overlapping inserts of one new primary key is not refused: both "
+        "commit when it inserts after the first committed, and the database then refuses to open "
+        "(not filed)",
+    ),
+    Known(
+        "serial_rollback",
+        "a rolled-back insert rewinds the table's SERIAL over ids an overlapping transaction took: "
+        "later inserts repeat those ids, and that transaction's COMMIT fails on the primary-key "
+        "index with its row visible; a crash with such an insert open does the same to the next "
+        "insert (not filed)",
+    ),
+    Known(
+        "copy_rollback",
+        "a node COPY that rolls back on a table with rows, because a row failed, on ROLLBACK, or "
+        "after timing out beside an open writer, leaves its rows: the next insert shows the "
+        "COPY's row, and a later CHECKPOINT can corrupt the heap (not filed)",
+    ),
+    Known(
+        "table_recreate",
+        "a query of an open snapshot on a table that was dropped and created again under the same "
+        "name fails 'Cannot find table catalog entry' and ends the transaction (not filed)",
+    ),
+    Known(
+        "reinsert_beside_commit",
+        "a transaction that inserts a key, deletes it and inserts it again, with another "
+        "connection committing beside it, leaves a database whose reopen after a crash fails "
+        "with a duplicated primary key (not filed)",
+    ),
+    Known(
+        "hidden_key_lookup",
+        "in a transaction with new rows, a key inserted since its snapshot resolves to its own "
+        "new row: a read returns that row, and a SET, DELETE or new edge changes it; also a key "
+        "it sees that was checkpointed and then replaced (not filed)",
+    ),
+    Known(
+        "snapshot_dropped_table",
+        "a read-only snapshot that still sees a dropped table fails on it after a CHECKPOINT "
+        "(not filed)",
+    ),
+    Known(
+        "concurrent_detach",
+        "an edge added to a node another overlapping transaction deletes stays as a dangling "
+        "edge: both commit, and the relationship count disagrees with the join (not filed)",
     ),
 ]
 

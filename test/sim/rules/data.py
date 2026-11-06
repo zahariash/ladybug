@@ -183,6 +183,47 @@ class DataRules(Session):
             self.ok(query)
         self.model.add_persons(added)
 
+    @enabled("copy_rollback")
+    @precondition(lambda self: self.copy_can_roll_back())
+    @rule(rows=st.lists(st.tuples(csv_names, st.integers(-1000, 1000)), min_size=1, max_size=20))
+    def failed_copy(self, rows):
+        """A COPY that fails on a row already in the table leaves nothing of the rows before it,
+        and the next insert gets its own row."""
+        csv, added = self.write_bulk_csv(rows)
+        values = [csv_field(v) for v in next(iter(added.values())).values()]
+        with open(csv, "a") as f:
+            f.write(",".join([str(min(self.model.persons)), *values]) + "\n")
+        self.fails(copy_query(csv, rows), None, DUPLICATE_KEY)
+        self.model.persons_ever = True
+        self.insert_after_copy()
+
+    @enabled("copy_rollback")
+    @precondition(lambda self: self.copy_can_roll_back())
+    @rule(rows=st.lists(st.tuples(csv_names, st.integers(-1000, 1000)), min_size=1, max_size=20))
+    def rolled_back_copy(self, rows):
+        """A COPY in a transaction that rolls back leaves nothing, and the next insert gets its
+        own row."""
+        csv, _ = self.write_bulk_csv(rows)
+        self.ok("BEGIN TRANSACTION")
+        self.ok(copy_query(csv, rows))
+        self.ok("ROLLBACK")
+        self.model.persons_ever = True
+        self.insert_after_copy()
+
+    def copy_can_roll_back(self) -> bool:
+        """Whether the table has rows and an index for a COPY to leave a mark on."""
+        return (
+            bool(self.model.persons)
+            and self.model.pk_index is not None
+            and self.checkpoint_keeps_snapshots()
+            and self.copy_person_safe()
+        )
+
+    def insert_after_copy(self) -> None:
+        key = self.model.take_bulk_ids(1).start
+        self.ok("CREATE (:Person {id: $id, age: $age})", dict(id=key, age=1))
+        self.model.add_persons({key: self.model.new_person(age=1)})
+
     @enabled("partitions")
     @rule(id=small_ids, cluster=clusters)
     def insert_partitioned(self, id, cluster):

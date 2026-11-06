@@ -113,6 +113,20 @@ Session rules (`--sim-focus sessions`) interleave transactions on three more con
 step per rule: read-only snapshots, a write transaction, writes that must fail beside it, and
 the query battery against what each connection should see.
 
+Each workload runs in single-writer or multi-writer mode (`--sim-writers single`, `multi`, or
+`both`, the default, where each workload draws one). In multi-writer mode write transactions
+overlap: a transaction works on its snapshot, `writesets.py` says when its next write must conflict
+with what overlapping transactions wrote, and its commit replays its ops on the committed state.
+`--sim-focus writers` spends the run there: `overlapping_writers` opens two or three transactions on
+a few hot rows and catalog entries and interleaves writes, reads and auto-commit writes beside them,
+`race_writers` commits concurrently against readers, each of which must see a prefix of every
+writer's commits, and one state for its whole transaction unless automatic checkpoints are on
+(`snapshot_rel_scan` in `known.py`), and `crash_writers` kills the engine during concurrent commits, after which every
+commit that returned must be there and each writer's survivors must be a prefix of its commits.
+`CHECKPOINT`, a `COPY` and a commit past the checkpoint threshold wait 5 s for an open writer, so a
+workload pays for only a few of them, then raises its checkpoint threshold. The `clash:` entries in
+the run's rule counts say how often writers actually collided, and on which conflict.
+
 Recovery rules (`--sim-focus recovery`) make commits and checkpoints fail or stop halfway, then
 crash or reopen, and check that every write that succeeded survives and every one that failed
 does not. `pinned_checkpoint` writes around a `CHECKPOINT` taken while a read-only transaction is

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import os
 import shutil
 from collections import Counter
 
@@ -86,6 +87,98 @@ def bulk_ck_writes(kind: str, start: int, count: int, step: int) -> list[tuple[s
         return [(f"COPY CK FROM ({rows})", {})]
     query = "MATCH (a:C {id: $a}), (b:C {id: $b}) CREATE (a)-[:CK]->(b)"
     return [(query, dict(a=src, b=dst)) for src, dst in bulk_edges(start, count, step)]
+
+
+gated("snapshot_rel_scan")
+# A CK edge per statement, so that each is a commit of its own.
+WRITER_EDGE = "MATCH (a:C {id: $a}), (b:C {id: $b}) CREATE (a)-[:CK]->(b)"
+
+
+def writer_edges(model: Model, writers: int, edges: int, start: int) -> list[tuple[int, list[int]]]:
+    """For each writer a source node of its own and the distinct targets of its edges, in order;
+    none is an edge the model holds already."""
+    plans = []
+    for w in range(writers):
+        src = (start + 1009 * w) % CSR_ROWS
+        targets = {(start + 3 * i + 1 + w) % CSR_ROWS for i in range(edges)}
+        targets = sorted(d for d in targets if model.big.exists(d) and (src, d) not in model.ck)
+        if model.big.exists(src) and targets:
+            plans.append((src, targets))
+    return plans
+
+
+def writer_statements(plans: list) -> list[list]:
+    return [[(WRITER_EDGE, dict(a=src, b=d)) for d in targets] for src, targets in plans]
+
+
+def edge_fingerprint(src: int, dst: int) -> int:
+    """An edge's share of the last CK_STATE_QUERIES fingerprint."""
+    return src * 200003 + dst
+
+
+def writer_states(base: tuple[int, int], plans: list) -> set[tuple[int, int]]:
+    """The (edges, fingerprint) states concurrent writers can pass through: each writer's commits
+    are in order, so a state holds a prefix of each writer's edges."""
+    states = {base}
+    for src, targets in plans:
+        reached = set()
+        for edges, fingerprint in states:
+            reached.add((edges, fingerprint))
+            for dst in targets:
+                edges += 1
+                fingerprint += edge_fingerprint(src, dst)
+                reached.add((edges, fingerprint))
+        states = reached
+    return states
+
+
+def check_writer_reads(
+    observations: list, base: tuple, plans: list, final: tuple, one_snapshot: bool = True
+) -> None:
+    """Each read saw one state of writer_states and CK2 unchanged, no reader went back, and the
+    last read, after all commits, saw the final state. `one_snapshot`: all queries of a read-only
+    transaction saw the same state; otherwise, with automatic checkpoints on while snapshot_rel_scan
+    is gated, each is checked on its own."""
+    start = (base[0][0][0], base[4][0][1] or 0)
+    states = writer_states(start, plans)
+    for reader in observations:
+        last = -1
+        for seen in reader:
+            edges = seen[4][0][0]
+            fingerprint = seen[4][0][1] or 0
+            consistent = not one_snapshot or edges == seen[0][0][0] == seen[2][0][0]
+            valid = seen[3] == base[3] and seen[5] == base[5] and (edges, fingerprint) in states
+            assert consistent and valid, (
+                f"a reader saw {seen}, which no prefix of the writers' commits gives"
+            )
+            assert edges >= last, f"a reader went back from {last} edges to {seen}"
+            last = edges
+        assert reader[-1] == final, (reader[-1], final)
+
+
+def read_acks(lines: list[str]) -> tuple[Counter, list[str]]:
+    """How many commits returned for each writer, and the errors they hit, from what
+    engine.start_writers wrote; a kill can leave the last line unfinished."""
+    acked, errors = Counter(), []
+    for line in lines:
+        writer, _, error = line.partition(" ")
+        if not line.endswith("\n"):
+            continue
+        if error:
+            errors.append(line.strip())
+        else:
+            acked[int(writer)] += 1
+    return acked, errors
+
+
+def check_survivors(writer: int, targets: list[int], kept: Counter, acked: int) -> int:
+    """How many of a writer's commits survived a crash: at least all that returned, and a prefix."""
+    count = sum(kept.values())
+    assert count >= acked, f"writer {writer}: {acked} commits returned, but only {count} survived"
+    assert kept == Counter(targets[:count]), (
+        f"writer {writer}: the {count} edges that survived are not its first ones: {kept}"
+    )
+    return count
 
 
 class DurabilityRules(Session):
@@ -209,6 +302,81 @@ class DurabilityRules(Session):
         query, after = self.plan_crash(op, size)
         self.crash_at_syscall_point(query, syscall, n)
         self.check_crash(op, after)
+
+    @enabled("race_writers")
+    @precondition(
+        lambda self: self.multi_writes and self.has_csr() and self.checkpoint_keeps_snapshots()
+    )
+    @rule(
+        writers=st.integers(2, 3),
+        edges=st.integers(1, 20),
+        start=st.integers(0, CSR_ROWS - 1),
+        num_readers=st.integers(1, 3),
+    )
+    def race_writers(self, writers, edges, start, num_readers):
+        """Writers commit CK edges concurrently while readers read: every read must be one state
+        that some prefix of each writer's commits gives, and all must be there at the end."""
+        plans = writer_edges(self.model, writers, edges, start)
+        if len(plans) < 2:
+            return
+        threshold = self.config["checkpoint_threshold"]
+        if "snapshot_rel_scan" in self.options.skipped and threshold == -1:
+            # Empties the WAL, so that the writes cannot reach the default threshold mid-race.
+            self.ok("CHECKPOINT")
+            self.model.checkpointed()
+        writes = writer_statements(plans)
+        base = ck_state(self.model)
+        op = dict(op="race_writers", writers=writes, queries=CK_STATE_QUERIES, readers=num_readers)
+        observations, errors = self.traced(
+            op, lambda: self.engine.race_writers(writes, CK_STATE_QUERIES, num_readers)
+        )
+        op["errors"] = errors
+        assert not errors, errors
+        for src, targets in plans:
+            for dst in targets:
+                self.model.ck[(src, dst)] += 1
+        one_snapshot = (
+            "snapshot_rel_scan" not in self.options.skipped
+            or self.config["checkpoint_threshold"] == -1
+        )
+        check_writer_reads(observations, base, plans, ck_state(self.model), one_snapshot)
+
+    @enabled("crash_writers")
+    @precondition(
+        lambda self: self.multi_writes and self.has_csr() and self.checkpoint_keeps_snapshots()
+    )
+    @rule(
+        writers=st.integers(2, 4),
+        edges=st.integers(5, 60),
+        start=st.integers(0, CSR_ROWS - 1),
+        delay=st.floats(0.0, 0.1),
+    )
+    def crash_writers(self, writers, edges, start, delay):
+        """Kills the engine while writers commit concurrently. Recovery must keep every commit
+        that returned, and of each writer's commits a prefix: nothing after a lost one."""
+        plans = writer_edges(self.model, writers, edges, start)
+        if not plans:
+            return
+        acks = os.path.join(self.files, f"acks-{len(self.trace)}")
+        self.crash_during_writers(writer_statements(plans), acks, delay)
+        if self.started_over:
+            return
+        lines = []
+        if os.path.exists(acks):
+            with open(acks) as f:
+                lines = f.readlines()
+        acked, errors = read_acks(lines)
+        assert not errors, errors
+        for w, (src, targets) in enumerate(plans):
+            rows = self.rows("MATCH (a:C {id: $a})-[:CK]->(b:C) RETURN b.id", dict(a=src))
+            before = Counter({d: n for (s, d), n in self.model.ck.items() if s == src})
+            count = check_survivors(w, targets, Counter(row[0] for row in rows) - before, acked[w])
+            # How many survive depends on timing, and rules draw from the model: removing them
+            # keeps the workload replayable.
+            if count:
+                query = "MATCH (a:C {id: $a})-[k:CK]->(b:C) WHERE b.id IN $ids DELETE k"
+                self.ok(query, dict(a=src, ids=targets[:count]))
+        self.check_recovered(self.model)
 
     @enabled("race")
     @precondition(

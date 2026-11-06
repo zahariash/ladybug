@@ -22,6 +22,7 @@ from hypothesis.stateful import precondition
 from model import Model, canonical, cs_key_query, text_query
 from strategies import C_GROUPS, CS_ROWS, CSR_ROWS
 from triage import probe_of, signature
+from writesets import PERSON
 
 # Every name rules are gated on, so --sim-skip can reject names that match nothing. Rules add
 # theirs when their module is imported.
@@ -87,6 +88,7 @@ class Options:
     debug: bool = False  # run workers under gdb, so that crashes report native stacks
     traces: str = ""  # where the current workload's trace and files are written
     scratch: str = ""  # where the databases are created
+    writers: str = "both"  # "single", "multi", or "both": the workload draws the mode
 
     @property
     def loaded(self) -> set[str]:
@@ -101,7 +103,8 @@ def gated(*names: str) -> None:
 
 def enabled(name: str, writes: bool = True):
     """Runs the rule unless --sim-skip, --sim-focus or known.py turn `name` off. A rule that
-    writes waits until no session holds a write transaction, since only one can be open."""
+    writes waits until no session holds a write transaction: in single-writer mode only one can
+    be open, and in multi-writer mode the rules in rules/sessions.py write beside them."""
     gated(name)
     return precondition(
         lambda self: (
@@ -181,15 +184,55 @@ class Session:
     kept: dict  # names of the prepared statements the current worker keeps
     # Open transactions on the session connections (rules/sessions.py), by connection.
     txns: dict
+    # (commit number, Writes) of the commits an open write transaction overlaps.
+    commit_log: list
+    commit_number: int = 0
+    # How many more statements may wait out the 5 s for an open writer (see overlap_allowed).
+    slow_waits: int = 0
+
+    def rolled_back(self, txn) -> None:
+        """`txn` ended without committing, by a rollback or a crash: the SERIAL of each table it
+        inserted into goes back, over the ids overlapping writers took since."""
+        self.model.discarded(txn.view)
+        others = [t.writes for t in self.txns.values() if t.kind == "write" and t is not txn]
+        others += [w for n, w in self.commit_log if n > txn.start]
+        tables = txn.writes.staged - {PERSON}
+        self.model.serial_rewound |= any(tables & w.staged for w in others)
+
+    def recreate_safe(self, table: int) -> bool:
+        """Whether creating table `table` leaves open snapshots able to read it: one that still
+        sees a dropped table of that name then fails on it (table_recreate)."""
+        if "table_recreate" not in self.options.skipped:
+            return True
+        return not any(table in txn.view.tables for txn in self.txns.values())
 
     def session_writer(self) -> int | None:
-        """The session connection holding the write transaction, if any."""
+        """The first session connection holding a write transaction, if any."""
         return next((conn for conn, txn in self.txns.items() if txn.kind == "write"), None)
+
+    @property
+    def multi_writes(self) -> bool:
+        """Whether write transactions may overlap."""
+        return self.config.get("enable_multi_writes", False)
 
     def checkpoint_keeps_snapshots(self) -> bool:
         """Whether a CHECKPOINT now leaves the sessions' snapshots alone: a checkpoint breaks
-        open read-only transactions (#1184), also the one COPY and CREATE INDEX force."""
-        return "snapshot_checkpoint" not in self.options.skipped or not self.txns
+        open read-only transactions (#1184), also the one COPY and CREATE INDEX force, and removes
+        a dropped table that a snapshot still reads (snapshot_dropped_table)."""
+        if "snapshot_checkpoint" in self.options.skipped and self.txns:
+            return False
+        if "snapshot_dropped_table" not in self.options.skipped:
+            return True
+        return all(set(txn.view.tables) <= set(self.model.tables) for txn in self.txns.values())
+
+    def drop_table_safe(self, table: int) -> bool:
+        """Whether dropping `table` keeps open snapshots readable: with automatic checkpoints on,
+        the next commit may run one (snapshot_dropped_table)."""
+        if "snapshot_dropped_table" not in self.options.skipped:
+            return True
+        if self.config["checkpoint_threshold"] == -1:
+            return True
+        return not any(table in txn.view.tables for txn in self.txns.values())
 
     def snapshot_write_safe(self, kind: str, id) -> bool:
         """Whether a committed update or delete of Person `id` stays clear of two bugs that an
@@ -327,8 +370,9 @@ class Session:
         self.kept = {}
         # A new worker has new connections, without transactions.
         for txn in getattr(self, "txns", {}).values():
-            self.model.discarded(txn.view)
+            self.rolled_back(txn)
         self.txns = {}
+        self.commit_log = []
         # Closing checkpoints, so a clean reopen starts from a checkpoint; recovery after a crash
         # replays the WAL but leaves the column-ID gaps it found.
         if getattr(self, "model", None) is not None and not crashed:
@@ -459,6 +503,21 @@ class Session:
             self.open_engine(crashed=True)
 
         self.traced(dict(op="crash_during", query=query, delay=delay), call)
+
+    def crash_during_writers(self, writers: list, acks: str, delay: float) -> None:
+        """Starts `writers`, one thread and connection each, kills the engine `delay` seconds
+        later and opens it again; see engine.start_writers for `acks`."""
+
+        self.started_over = False
+
+        def call():
+            self.engine.start_writers(writers, acks)
+            time.sleep(delay)
+            self.engine.kill()
+            self.open_engine(crashed=True)
+
+        op = dict(op="crash_writers", writers=writers, acks=acks, delay=delay)
+        self.traced(op, call)
 
     def crash_at_syscall_point(self, query: str, syscall: str, n: int) -> None:
         """Reopens the engine under strace, which kills it at the n-th call of `syscall`, runs

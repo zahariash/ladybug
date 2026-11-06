@@ -296,11 +296,20 @@ class Model:
     updated_since_checkpoint: bool = False
     # A transaction that added a column was rolled back since the last checkpoint.
     rolled_back_add: bool = False
+    # A transaction that created a macro ended without committing since the last checkpoint.
+    rolled_back_macro: bool = False
     # In a transaction's view: it already ran a statement that prepared statements may reuse.
     wrote: bool = False
     # In a transaction's view: it added a Person column, which a Person insert prepared before it
     # (the driver caches prepared statements across steps) does not see.
     added_in_txn: bool = False
+    # In a transaction's view: it created a macro.
+    created_macro: bool = False
+    # How many times an insert op added each person id: a row deleted and inserted again is
+    # another row, which updates made through the old one do not reach.
+    generation: Counter = field(default_factory=Counter)
+    # A rollback rewound a SERIAL over ids an overlapping transaction took (serial_rollback).
+    serial_rewound: bool = False
 
     def drop_column(self, column: str) -> None:
         self.middle_dropped |= column != list(self.columns)[-1]
@@ -319,13 +328,14 @@ class Model:
     def checkpointed(self) -> None:
         self.indexed |= self.keyed_tables()
         self.dropped_since_checkpoint = self.added_after_drop = self.middle_dropped = False
-        self.rolled_back_add = self.updated_since_checkpoint = False
+        self.rolled_back_add = self.updated_since_checkpoint = self.rolled_back_macro = False
 
     def discarded(self, view: Model) -> None:
         """A transaction that saw `view` ended without committing: its inserts may still count
         as rows until compaction (see bulk_copy), and the columns it added leave data behind."""
         self.persons_ever |= view.persons_ever
         self.rolled_back_add |= bool(set(view.columns) - set(self.columns))
+        self.rolled_back_macro |= view.created_macro
 
     docs: dict = field(default_factory=dict)  # id -> Doc
     doc_indexes: dict = field(default_factory=dict)  # "doc_fts"/"doc_vec" -> stemmer/metric
@@ -387,6 +397,8 @@ class Model:
             keys=self.keys.copy(),
             dropped_columns=set(self.dropped_columns),
             wrote=False,
+            created_macro=False,
+            generation=Counter(self.generation),
             graph=None if self.graph is None else dict(self.graph),
             blobs=dict(self.blobs),
             indexed=set(self.indexed),

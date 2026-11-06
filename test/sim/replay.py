@@ -135,6 +135,16 @@ class Replayer:
             _, errors = self.engine.race(op["writes"], op["queries"], op["readers"])
             if errors:
                 raise RaceError(errors)
+        elif kind == "race_writers":
+            _, errors = self.engine.race_writers(op["writers"], op["queries"], op["readers"])
+            if errors:
+                raise RaceError(errors)
+        elif kind == "crash_writers":
+            acks = os.path.join(self.dir, "acks")
+            self.engine.start_writers(op["writers"], acks)
+            time.sleep(op["delay"])
+            self.engine.kill()
+            self.open()
         # "failure" records what the simulator saw; it is not an engine interaction.
 
     def run(self) -> tuple[str, str, int, str] | None:
@@ -506,6 +516,10 @@ def describe(op: dict) -> str:
         detail = f"with {op['config']}"
     elif op["op"] == "race":
         detail = f"{len(op['writes'])} writes, {op['readers']} readers"
+    elif op["op"] == "race_writers":
+        detail = f"{len(op['writers'])} writers, {op['readers']} readers"
+    elif op["op"] == "crash_writers":
+        detail = f"{len(op['writers'])} writers, killed after {op['delay']} s"
     return f"{op['op']:12} {detail[:110]}"
 
 

@@ -7,7 +7,7 @@ from hypothesis.stateful import precondition, rule
 from session import Session, enabled, gated
 from strategies import EXTRA_COLUMNS, extra_columns, macro_ids, table_ids
 
-gated("readd_column")
+gated("readd_column", "rollback_macro")
 
 
 class CatalogRules(Session):
@@ -27,6 +27,8 @@ class CatalogRules(Session):
         if i not in self.model.macros:
             self.fails(f"DROP MACRO m{i}", None, "does not exist")
             return
+        if self.model.rolled_back_macro and "rollback_macro" in self.options.skipped:
+            return
         self.ok(f"DROP MACRO m{i}")
         del self.model.macros[i]
 
@@ -37,11 +39,18 @@ class CatalogRules(Session):
         if i in self.model.tables:
             self.fails(query, None, "already exists")
             return
+        if not self.recreate_safe(i):
+            return
         self.ok(query)
         self.model.tables[i] = []
 
     @enabled("tables")
-    @precondition(lambda self: self.model.tables)
+    @precondition(
+        lambda self: (
+            self.model.tables
+            and not (self.model.serial_rewound and "serial_rollback" in self.options.skipped)
+        )
+    )
     @rule(data=st.data(), values=st.lists(st.integers(-1000, 1000), min_size=1, max_size=5))
     def insert_into_table(self, data, values):
         i = data.draw(st.sampled_from(sorted(self.model.tables)))
@@ -53,6 +62,8 @@ class CatalogRules(Session):
     def drop_table(self, i):
         if i not in self.model.tables:
             self.fails(f"DROP TABLE T{i}", None, "does not exist")
+            return
+        if not self.drop_table_safe(i):
             return
         self.ok(f"DROP TABLE T{i}")
         del self.model.tables[i]
