@@ -127,15 +127,18 @@ class LadybugSim(
             self.engine.kill()
         if self.dir and not self.options.keep:
             shutil.rmtree(self.dir, ignore_errors=True)
+            shutil.rmtree(self.crash_image(), ignore_errors=True)
 
     def keep_failure(self, record: dict) -> None:
-        """Copies the failing workload's trace and files to failed/<signature>/, which a smaller
-        example of the same failure replaces while Hypothesis shrinks."""
+        """Copies the failing workload's trace and files, and the database's WAL and crash image, to
+        failed/<signature>/, which a smaller example of the same failure replaces while Hypothesis
+        shrinks."""
         slug = record["signature"]["slug"]
         kept = os.path.join(self.options.traces or self.dir, "failed", slug)
         copy = f"{kept}.{os.getpid()}"
         shutil.rmtree(copy, ignore_errors=True)
         shutil.copytree(self.files, copy)
+        self.keep_database_files(copy)
         shutil.rmtree(kept, ignore_errors=True)
         os.replace(copy, kept)
         failure = (record["kind"], slug, kept, record.get("probe"), record.get("rows"))

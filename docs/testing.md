@@ -104,6 +104,11 @@ printing each failure's directory and the command that starts its triage. Hypoth
 failing examples per set of enabled rules and replays them first when a run with the same
 options starts again.
 
+A kept failure also holds the database's WAL files as they were at the failure, and
+`crash-image/`, the database's files as the last crash left them. `test/sim/reopen_image.py
+<crash-image>` opens a fresh copy of the image as often as needed: recovery starts from those
+files, so a recovery failure that a replay misses should fail there every time.
+
 Session rules (`--sim-focus sessions`) interleave transactions on three more connections, one
 step per rule: read-only snapshots, a write transaction, writes that must fail beside it, and
 the query battery against what each connection should see.

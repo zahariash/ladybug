@@ -7,8 +7,10 @@ trace without the model and minimizes it.
 
 from __future__ import annotations
 
+import glob
 import json
 import os
+import shutil
 import signal
 import sys
 import time
@@ -38,6 +40,10 @@ ONE_THREAD = "CALL threads=1"
 GRAPH = "g"
 GRAPH_SCHEMA = "CREATE NODE TABLE GN(id INT64 PRIMARY KEY, v INT64)"
 BLOB_SCHEMA = "CREATE NODE TABLE Blob(id INT64 PRIMARY KEY, s STRING)"
+# A kept failure's copy of the database's files as the last crash left them, and the file in it
+# that says how the simulator opened them (see reopen_image.py).
+CRASH_IMAGE = "crash-image"
+IMAGE_OPEN = "open.json"
 
 
 def copy_c(start: int, count: int) -> str:
@@ -328,6 +334,8 @@ class Session:
         if getattr(self, "model", None) is not None and not crashed:
             self.model.checkpointed()
         config = {**self.config, **(overrides or {})}
+        if crashed:
+            self.save_crash_image(config)
         if inject:
             # With one worker thread, the caller and the worker take turns, so the n-th call
             # of a syscall is the same call in every run.
@@ -345,8 +353,35 @@ class Session:
         """Goes on with a fresh database after a known recovery failure: discarding the workload
         would make Hypothesis see a timing-dependent outcome as flaky data generation."""
         RECOVERY_SKIPS[gate] += 1
+        shutil.rmtree(self.crash_image(), ignore_errors=True)
         self.started_over = True
         self.new_database(fresh=True)
+
+    def crash_image(self) -> str:
+        return f"{self.dir}-image"
+
+    def save_crash_image(self, config: dict) -> None:
+        """Copies the database's files as a crash left them, with how to open them, since recovery
+        changes them. Evidence is optional: without room for it the workload goes on."""
+        image = self.crash_image()
+        shutil.rmtree(image, ignore_errors=True)
+        try:
+            shutil.copytree(self.dir, image)
+            with open(os.path.join(image, IMAGE_OPEN), "w") as f:
+                json.dump(dict(config=config, loads=self.loads()), f)
+        except OSError as e:
+            shutil.rmtree(image, ignore_errors=True)
+            print(f"no crash image: {e}", file=sys.stderr)
+
+    def keep_database_files(self, kept: str) -> None:
+        """Adds the WAL files as they are now and the last crash image to a kept failure."""
+        try:
+            for wal in glob.glob(f"{self.path}.wal*"):
+                shutil.copy2(wal, kept)
+            if os.path.isdir(self.crash_image()):
+                shutil.copytree(self.crash_image(), os.path.join(kept, CRASH_IMAGE))
+        except OSError as e:
+            print(f"database files not kept: {e}", file=sys.stderr)
 
     def reopen_engine(self, overrides: dict | None = None, clean: bool = True) -> None:
         """Closes the database and opens it again; `clean` is false when the checkpoint that
