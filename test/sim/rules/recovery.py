@@ -371,10 +371,16 @@ class RecoveryRules(Session):
             else:
                 self.limit_files(None)
             if self.checkpoint_keeps_snapshots():
-                self.ok("CHECKPOINT")
-                self.model.checkpointed()
-                if cap != "db_size":
-                    state.doubt.clear()
+                # An automatic checkpoint that fails after its record poisons the WAL and only
+                # warns on stderr, so the first the rule sees of it is this refusal.
+                refused = self.attempt(lambda: self.ok("CHECKPOINT"))
+                if refused is None:
+                    self.model.checkpointed()
+                    if cap != "db_size":
+                        state.doubt.clear()
+                else:
+                    assert POISONED in refused, refused
+                    self.crash_engine()
         elif end == "crash":
             self.crash_engine()
         else:
