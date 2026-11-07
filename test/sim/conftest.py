@@ -198,7 +198,7 @@ def pytest_addoption(parser) -> None:
         '"LOAD EXTENSION fts;LOAD EXTENSION vector"; adds the Doc table and its index rules',
     )
     group.addoption(
-        "--sim-keep", action="store_true", help="keep every database directory after the run"
+        "--sim-keep", action="store_true", help="keep every database directory and crash image after the run"
     )
     group.addoption(
         "--sim-gdb",

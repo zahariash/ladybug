@@ -125,7 +125,8 @@ class Replayer:
                 if "died" not in str(e):
                     raise
             except EngineError:
-                pass
+                if self.engine:
+                    self.engine.kill()
             self.open()
         elif kind == "hold":
             self.engine.hold(op["conn"])

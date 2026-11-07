@@ -1,9 +1,9 @@
 """Opens a crash image again, each time from a fresh copy.
 
 A kept failure's crash image (<trace dir>/failed/<signature>/crash-image, see
-Session.save_crash_image) holds the database's files as the last crash left them and how the
-simulator opened them. Recovery starts from those files, whenever the crash happened, so a recovery
-failure that replay.py hits once in twenty runs should fail here every time. The exit status is 0
+Session.save_crash_image) holds the files the last recovery started from and how the simulator
+opened them, so a failure that depends only on those files repeats without replaying the trace. One
+that depends on thread scheduling during recovery can still pass some opens. The exit status is 0
 if every open ended the same way.
 
     PYTHONPATH=tools/python_api/build uv run --no-project --with hypothesis \\
@@ -13,8 +13,10 @@ if every open ended the same way.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -23,14 +25,15 @@ from collections import Counter
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from engine import Engine, EngineError, scratch_root  # noqa: E402
 from session import IMAGE_OPEN, failure_kind  # noqa: E402
-from triage import signature  # noqa: E402
 
 
 def describe(error: BaseException) -> str:
-    """How an open failed: the same failure gets the same text in every run."""
-    kind, message = failure_kind(error), str(error)
-    key = signature(kind, dict(op="open"), message)["key"]
-    return f"{kind} {key}: {message.splitlines()[0][:160]}"
+    """How an open failed. Its key covers the whole message, stacks included, apart from addresses
+    and numbers, since two crashes can share a first line and have no engine frames."""
+    message = str(error)
+    shape = re.sub(r"0x[0-9a-fA-F]+|\b\d+\b", "?", message)
+    key = hashlib.sha1(shape.encode()).hexdigest()[:10]
+    return f"{failure_kind(error)} {key}: {message.splitlines()[0][:160]}"
 
 
 def reopen(image: str, scratch: str, debug: bool) -> str:

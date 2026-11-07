@@ -105,9 +105,10 @@ failing examples per set of enabled rules and replays them first when a run with
 options starts again.
 
 A kept failure also holds the database's WAL files as they were at the failure, and
-`crash-image/`, the database's files as the last crash left them. `test/sim/reopen_image.py
-<crash-image>` opens a fresh copy of the image as often as needed: recovery starts from those
-files, so a recovery failure that a replay misses should fail there every time.
+`crash-image/`, the files the last recovery started from with the settings it opened with.
+`test/sim/reopen_image.py <crash-image>` opens a fresh copy of the image as often as needed, so a
+failure that depends only on those files repeats without replaying the trace. One that depends on
+thread scheduling during recovery can still pass some opens.
 
 Session rules (`--sim-focus sessions`) interleave transactions on three more connections, one
 step per rule: read-only snapshots, a write transaction, writes that must fail beside it, and

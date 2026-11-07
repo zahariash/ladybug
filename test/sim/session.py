@@ -41,8 +41,8 @@ ONE_THREAD = "CALL threads=1"
 GRAPH = "g"
 GRAPH_SCHEMA = "CREATE NODE TABLE GN(id INT64 PRIMARY KEY, v INT64)"
 BLOB_SCHEMA = "CREATE NODE TABLE Blob(id INT64 PRIMARY KEY, s STRING)"
-# A kept failure's copy of the database's files as the last crash left them, and the file in it
-# that says how the simulator opened them (see reopen_image.py).
+# A kept failure's copy of the files the last recovery started from, and the file in it that says
+# how the simulator opened them (see reopen_image.py).
 CRASH_IMAGE = "crash-image"
 IMAGE_OPEN = "open.json"
 
@@ -399,13 +399,16 @@ class Session:
         RECOVERY_SKIPS[gate] += 1
         shutil.rmtree(self.crash_image(), ignore_errors=True)
         self.started_over = True
+        old = self.dir
         self.new_database(fresh=True)
+        if not self.options.keep:
+            shutil.rmtree(old, ignore_errors=True)
 
     def crash_image(self) -> str:
         return f"{self.dir}-image"
 
     def save_crash_image(self, config: dict) -> None:
-        """Copies the database's files as a crash left them, with how to open them, since recovery
+        """Copies the files recovery is about to start from, with how to open them, since recovery
         changes them. Evidence is optional: without room for it the workload goes on."""
         image = self.crash_image()
         shutil.rmtree(image, ignore_errors=True)
@@ -418,13 +421,17 @@ class Session:
             print(f"no crash image: {e}", file=sys.stderr)
 
     def keep_database_files(self, kept: str) -> None:
-        """Adds the WAL files as they are now and the last crash image to a kept failure."""
+        """Adds the WAL files as they are now and the last crash image to a kept failure. An image
+        appears only once it is whole, since reopen_image.py opens whatever it finds."""
+        partial = os.path.join(kept, f"{CRASH_IMAGE}.partial")
         try:
             for wal in glob.glob(f"{self.path}.wal*"):
                 shutil.copy2(wal, kept)
             if os.path.isdir(self.crash_image()):
-                shutil.copytree(self.crash_image(), os.path.join(kept, CRASH_IMAGE))
+                shutil.copytree(self.crash_image(), partial)
+                os.replace(partial, os.path.join(kept, CRASH_IMAGE))
         except OSError as e:
+            shutil.rmtree(partial, ignore_errors=True)
             print(f"database files not kept: {e}", file=sys.stderr)
 
     def reopen_engine(self, overrides: dict | None = None, clean: bool = True) -> None:
@@ -535,7 +542,10 @@ class Session:
                 if "died" not in str(e):
                     raise
             except EngineError:
-                pass  # a statement killed during open fails, which is the crash being tested
+                # A statement killed during open fails, which is the crash being tested. One that
+                # fails by itself leaves its worker running, which must not share the files.
+                if self.engine:
+                    self.engine.kill()
             self.open_engine(crashed=True)
 
         self.traced(dict(op="crash_at", query=query, syscall=syscall, n=n), call)

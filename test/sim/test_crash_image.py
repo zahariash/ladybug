@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 
 import pytest
 import reopen_image
@@ -38,8 +39,77 @@ def test_an_image_keeps_the_files_as_the_crash_left_them(session) -> None:
     write(f"{session.path}.wal", "")
     image = session.crash_image()
     assert read(os.path.join(image, "db.wal")) == "torn"
+    assert read(os.path.join(image, "db")) == "pages"
     with open(os.path.join(image, IMAGE_OPEN)) as f:
         assert json.load(f) == {"config": {"enable_checksums": True}, "loads": ["CALL threads=1"]}
+
+
+def test_an_open_after_a_crash_copies_the_files_before_recovery_changes_them(
+    session, monkeypatch
+) -> None:
+    class Recovers:
+        def __init__(self, path, *_) -> None:
+            write(f"{path}.wal", "")
+
+    monkeypatch.setattr("session.Engine", Recovers)
+    session.config = {"enable_checksums": False}
+    session.open_engine(crashed=True, overrides={"enable_checksums": True})
+    assert read(f"{session.path}.wal") == ""
+    image = session.crash_image()
+    assert read(os.path.join(image, "db.wal")) == "torn"
+    with open(os.path.join(image, IMAGE_OPEN)) as f:
+        assert json.load(f)["config"] == {"enable_checksums": True}
+
+
+def test_a_clean_open_copies_nothing(session, monkeypatch) -> None:
+    monkeypatch.setattr("session.Engine", lambda *_: None)
+    session.config = {}
+    session.open_engine()
+    assert not os.path.exists(session.crash_image())
+
+
+def test_a_syscall_crash_stops_a_worker_whose_statement_failed(session, monkeypatch) -> None:
+    class Worker:
+        killed = False
+
+        def execute(self, *_) -> None:
+            raise EngineError("Binder exception")
+
+        def close(self) -> None:
+            pass
+
+        def kill(self) -> None:
+            self.killed = True
+
+    worker = Worker()
+    alive_at_recovery = []
+
+    def open_engine(inject=None, crashed=False, overrides=None) -> None:
+        if crashed:
+            alive_at_recovery.append(not worker.killed)
+        else:
+            session.engine = worker
+
+    session.engine, session.trace = worker, []
+    session.open_engine = open_engine
+    session.crash_at_syscall_point("RETURN 1", "pwrite64", 1)
+    assert alive_at_recovery == [False]
+
+
+def test_a_syscall_crash_during_open_has_no_worker_to_stop(session) -> None:
+    class Closed:
+        def close(self) -> None:
+            pass
+
+    def open_engine(inject=None, crashed=False, overrides=None) -> None:
+        session.engine = None
+        if inject:
+            raise EngineError("killed during open")
+
+    session.engine, session.trace = Closed(), []
+    session.open_engine = open_engine
+    session.crash_at_syscall_point("RETURN 1", "pwrite64", 1)
+    assert session.trace[-1]["outcome"] == "ok"
 
 
 def test_a_later_crash_replaces_the_image(session) -> None:
@@ -69,6 +139,24 @@ def test_a_kept_failure_gets_the_wal_files_and_the_image(session, tmp_path) -> N
     assert read(kept / "db.wal") == "after recovery"
     assert read(kept / "db.wal.checkpoint") == "frozen"
     assert read(kept / CRASH_IMAGE / "db.wal") == "torn"
+
+
+def test_an_image_that_cannot_be_kept_leaves_nothing_to_open(
+    session, tmp_path, monkeypatch, capsys
+) -> None:
+    session.save_crash_image({})
+    kept = tmp_path / "kept"
+    kept.mkdir()
+    real = shutil.copytree
+
+    def fails_midway(source, destination, **kwargs):
+        real(source, destination, **kwargs)
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr("shutil.copytree", fails_midway)
+    session.keep_database_files(str(kept))
+    assert sorted(os.listdir(kept)) == ["db.wal"]
+    assert "not kept" in capsys.readouterr().err
 
 
 def test_a_failure_without_a_crash_keeps_only_the_wal_files(session, tmp_path) -> None:
@@ -122,3 +210,17 @@ def test_a_failed_open_is_described_the_same_way_each_time(
     assert first.startswith(f"{kind} ")
     assert str(error).splitlines()[0] in first
     assert reopen_image.reopen(image, str(tmp_path), False) == first
+
+
+def test_crashes_that_share_a_first_line_are_told_apart() -> None:
+    died = "engine process died with exit code -11 on open\n"
+    a = reopen_image.describe(AssertionError(died + "signal 11 address (nil)\n#0 free"))
+    b = reopen_image.describe(AssertionError(died + "signal 11 address (nil)\n#0 memcpy"))
+    assert a != b
+
+
+def test_addresses_do_not_split_one_crash() -> None:
+    died = "engine process died with exit code -11 on open\nsignal 11 address "
+    a = reopen_image.describe(AssertionError(died + "0x7f001234"))
+    b = reopen_image.describe(AssertionError(died + "0x7f00abcd"))
+    assert a == b
