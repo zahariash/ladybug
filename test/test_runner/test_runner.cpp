@@ -3,6 +3,7 @@
 #include <fstream>
 
 #include "common/assert.h"
+#include "common/enums/statement_type.h"
 #include "common/exception/test.h"
 #include "common/json_utils.h"
 #include "common/md5.h"
@@ -140,6 +141,35 @@ static std::string getParentPath(const std::string& dbPath) {
     return std::filesystem::path(dbPath).parent_path().string();
 }
 
+// Executes a read-only query twice through one prepared statement, so the checked result
+// comes from the cached-physical-plan path.
+static std::unique_ptr<QueryResult> executeQuery(Connection& conn, const std::string& query) {
+    if (!TestHelper::REEXECUTE_READS) {
+        return conn.query(query);
+    }
+    auto preparedStatement = conn.prepare(query);
+    if (!preparedStatement->isSuccess()) {
+        // A failed prepare already rolled back any active transaction, so running the query
+        // again would see different state. Only multi-statement strings need query().
+        if (preparedStatement->getErrorMessage().find("prepare multiple statements") !=
+            std::string::npos) {
+            return conn.query(query);
+        }
+        return conn.execute(preparedStatement.get());
+    }
+    if (!preparedStatement->isReadOnly() ||
+        preparedStatement->getStatementType() != common::StatementType::QUERY) {
+        return conn.query(query);
+    }
+    // A failed first execution may roll back the active transaction, so the state a second
+    // execution would see differs from the one the test expects.
+    auto result = conn.execute(preparedStatement.get());
+    if (!result->isSuccess()) {
+        return result;
+    }
+    return conn.execute(preparedStatement.get());
+}
+
 void TestRunner::testStatement(TestStatement& statement, Connection& conn,
     const std::string& databasePath) {
     if (statement.type == TestStatementType::LOG) {
@@ -161,7 +191,7 @@ void TestRunner::testStatement(TestStatement& statement, Connection& conn,
     replaceEnv(statement.query, "POSTGRES_CONNECTION_STRING");
     replaceEnv(statement.query, "PG_CLIENT_CONNECTION_STRING");
     replaceEnv(statement.query, "RUN_ID");
-    const auto actualResult = conn.query(statement.query);
+    const auto actualResult = executeQuery(conn, statement.query);
     QueryResult* currentQueryResult = actualResult.get();
     idx_t resultIdx = 0u;
     do {

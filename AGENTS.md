@@ -99,7 +99,7 @@ make clangd-diagnostics  # Get clangd diagnostics
 
 - `docs/build_tips.md` - Build tips and configuration options
 - `docs/cpp_style.md` - C++ style guidelines
-- `docs/testing.md` - Testing patterns and guidelines
+- `docs/testing.md` - Testing patterns and guidelines; triaging a workload simulator failure ("Triaging a failure")
 - `docs/python.md` - Python development guide
 - `docs/shell.md` - Shell development guide
 - `docs/extensions.md` - Working with extensions

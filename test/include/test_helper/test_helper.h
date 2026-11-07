@@ -29,6 +29,7 @@ public:
     inline static std::string E2E_TEST_FILES_DIRECTORY = "test/test_files";
     inline static std::string E2E_OVERRIDE_IMPORT_DIR;
     inline static bool REWRITE_TESTS = false;
+    inline static bool REEXECUTE_READS = false;
     static constexpr char SCHEMA_FILE_NAME[] = "schema.cypher";
     static constexpr char COPY_FILE_NAME[] = "copy.cypher";
     static constexpr char TEST_ANSWERS_PATH[] = "test/answers";
@@ -52,6 +53,8 @@ public:
     }
 
     static void setRewriteTests(const bool rewrite_tests) { REWRITE_TESTS = rewrite_tests; }
+
+    static void setReexecuteReads(const bool reexecute) { REEXECUTE_READS = reexecute; }
 
     static std::vector<std::string> convertResultToString(main::QueryResult& queryResult,
         bool checkOutputOrder = false);
