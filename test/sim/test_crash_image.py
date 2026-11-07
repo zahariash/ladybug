@@ -9,7 +9,8 @@ import shutil
 import pytest
 import reopen_image
 from engine import EngineError
-from session import CRASH_IMAGE, IMAGE_OPEN, Session
+from rules.sessions import Txn
+from session import CRASH_IMAGE, IMAGE_OPEN, Options, Session
 
 
 def write(path, text: str) -> None:
@@ -52,9 +53,10 @@ def test_an_open_after_a_crash_copies_the_files_before_recovery_changes_them(
             write(f"{path}.wal", "")
 
     monkeypatch.setattr("session.Engine", Recovers)
-    session.config = {"enable_checksums": False}
+    session.config, session.trace = {"enable_checksums": False}, [{}]
     session.open_engine(crashed=True, overrides={"enable_checksums": True})
     assert read(f"{session.path}.wal") == ""
+    assert "wal" in session.trace[-1]["wal"]
     image = session.crash_image()
     assert read(os.path.join(image, "db.wal")) == "torn"
     with open(os.path.join(image, IMAGE_OPEN)) as f:
@@ -110,6 +112,19 @@ def test_a_syscall_crash_during_open_has_no_worker_to_stop(session) -> None:
     session.open_engine = open_engine
     session.crash_at_syscall_point("RETURN 1", "pwrite64", 1)
     assert session.trace[-1]["outcome"] == "ok"
+
+
+def test_a_column_drop_waits_for_read_only_snapshots_only_while_gated(session) -> None:
+    gated = Options(skipped=frozenset({"snapshot_column_drop"}))
+    session.options = gated
+    session.txns = {}
+    assert session.column_drop_safe()
+    session.txns = {3: Txn("write", None)}
+    assert session.column_drop_safe()
+    session.txns = {3: Txn("read", None)}
+    assert not session.column_drop_safe()
+    session.options = Options()
+    assert session.column_drop_safe()
 
 
 def test_a_later_crash_replaces_the_image(session) -> None:
@@ -210,6 +225,16 @@ def test_a_failed_open_is_described_the_same_way_each_time(
     assert first.startswith(f"{kind} ")
     assert str(error).splitlines()[0] in first
     assert reopen_image.reopen(image, str(tmp_path), False) == first
+
+
+def test_one_failure_gets_one_text_whatever_the_copy_is_called() -> None:
+    a = reopen_image.describe(
+        EngineError("Cannot read /tmp/image-abc/copy/db.wal: gone"), "/tmp/image-abc"
+    )
+    b = reopen_image.describe(
+        EngineError("Cannot read /tmp/image-xyz/copy/db.wal: gone"), "/tmp/image-xyz"
+    )
+    assert a.split(":")[0] == b.split(":")[0]
 
 
 def test_crashes_that_share_a_first_line_are_told_apart() -> None:

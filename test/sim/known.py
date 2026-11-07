@@ -171,6 +171,11 @@ KNOWN_BUGS = [
         "applied after a crash (fix: PR #1380)",
     ),
     Known(
+        "snapshot_column_drop",
+        "a read-only snapshot reads a column dropped and checkpointed after it began: a segfault "
+        "for the last column, another column's values for a middle one (not filed)",
+    ),
+    Known(
         "checksums",
         "#1357: opening a database with the other enable_checksums setting drops its WAL "
         "(fix: PR #1358)",

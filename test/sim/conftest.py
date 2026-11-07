@@ -25,6 +25,7 @@ DEFAULT_TRACES = os.path.abspath(os.path.join(".hypothesis", "traces"))
 FOCUS = {
     # C, CK and CK2 past their size boundaries, with sessions, checkpoints, crashes and races.
     "heavy": {
+        "wal_tear",
         "persons",
         "knows",
         "bulk_copy",
@@ -46,6 +47,7 @@ FOCUS = {
         "repeated_aggregate",
     },
     "extensions": {
+        "wal_tear",
         "persons",
         "bulk_copy",
         "bulk_rows",
@@ -66,6 +68,7 @@ FOCUS = {
     },
     # Writes racing readers, over persons, Knows and CK, with checkpoints, reopens and crashes.
     "races": {
+        "wal_tear",
         "atomic_statement",
         "bulk_copy",
         "columns",
@@ -112,6 +115,7 @@ FOCUS = {
     },
     # Overlapping write transactions, and concurrent commits against readers and crashes.
     "writers": {
+        "wal_tear",
         "atomic_statement",
         "big_appends",
         "big_ddl",
@@ -146,6 +150,7 @@ FOCUS = {
     },
     # Transactions on several connections over person and Knows writes and column DDL.
     "sessions": {
+        "wal_tear",
         "bulk_copy",
         "partitions",
         "macros",
@@ -198,7 +203,9 @@ def pytest_addoption(parser) -> None:
         '"LOAD EXTENSION fts;LOAD EXTENSION vector"; adds the Doc table and its index rules',
     )
     group.addoption(
-        "--sim-keep", action="store_true", help="keep every database directory and crash image after the run"
+        "--sim-keep",
+        action="store_true",
+        help="keep every database directory and its last crash image after the run",
     )
     group.addoption(
         "--sim-gdb",

@@ -84,6 +84,7 @@ class CatalogRules(Session):
         self.model.add_column(column, default)
 
     @enabled("columns")
+    @precondition(lambda self: self.column_drop_safe())
     @rule(column=extra_columns)
     def drop_column(self, column):
         query = f"ALTER TABLE Person DROP {column}"
@@ -159,6 +160,7 @@ class CatalogRules(Session):
         self.model.knows_w = default
 
     @enabled("rel_columns")
+    @precondition(lambda self: self.column_drop_safe())
     @rule()
     def drop_knows_property(self):
         if self.model.knows_w is None:

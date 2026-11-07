@@ -43,6 +43,7 @@ import triage  # noqa: E402
 from engine import Engine, EngineError, scratch_root  # noqa: E402
 from reduction import ddmin, reduce_statements  # noqa: E402
 from shrinking import ALSO_INTERESTING, compact, expand, run_shrinkray  # noqa: E402
+from wal_map import state_difference, wal_state  # noqa: E402
 
 
 def original_failure(trace: list) -> tuple[str, str] | None:
@@ -66,9 +67,32 @@ class Replayer:
         self.config, self.loads = trace[0]["config"], trace[0]["loads"]
         self.reopen_loads = trace[0].get("reopen_loads", self.loads)
         self.engine = None
+        self.current: dict = {}
+        self.wal_difference = None
+        self.wal_compared = 0
+
+    def compare_wal(self) -> None:
+        """Notes the first crash that leaves another WAL than the original run's crash did."""
+        original = self.current.get("wal")
+        if original is None:
+            return
+        self.wal_compared += 1
+        if self.wal_difference:
+            return
+        if note := state_difference(original, wal_state(self.path)):
+            self.wal_difference = f"after {describe(self.current).rstrip()}: {note}"
+
+    def wal_report(self) -> str:
+        """How this replay's WALs compare with the original run's, as far as it got."""
+        if self.wal_difference:
+            return self.wal_difference
+        crashes = sum("wal" in op for op in self.trace)
+        return f"{self.wal_compared} of {crashes} crashes compared, with records of the same types and lengths"
 
     def open(self, inject=None, loads=None, overrides=None) -> None:
         self.engine = None
+        if not inject:
+            self.compare_wal()
         config = {**self.config, **(overrides or {})}
         if inject:
             config["max_num_threads"] = 1
@@ -99,6 +123,8 @@ class Replayer:
             self.open()
         elif kind == "limit":
             self.engine.limit(op["size"])
+        elif kind == "set_config":
+            self.config = {**self.config, **op["config"]}
         elif kind == "kill_at":
             self.engine.kill_at(op["syscall"], op["n"])
             try:
@@ -128,6 +154,12 @@ class Replayer:
                 if self.engine:
                     self.engine.kill()
             self.open()
+        elif kind == "tear":
+            self.engine.kill()
+            wal = f"{self.path}.wal"
+            if os.path.exists(wal):
+                os.truncate(wal, min(op["offset"], os.path.getsize(wal)))
+            self.open()
         elif kind == "hold":
             self.engine.hold(op["conn"])
         elif kind == "release":
@@ -152,6 +184,7 @@ class Replayer:
         """Replays the trace; returns the first failure as (kind, detail, step, message)."""
         try:
             for i, op in enumerate(self.trace):
+                self.current = op
                 try:
                     self.step(op)
                 except EngineError as e:
@@ -173,12 +206,21 @@ class RaceError(Exception):
     pass
 
 
-def reproduces(trace: list, target: tuple[str, str] | None, runs: int, debug: bool):
-    """The first failure in up to `runs` replays that matches `target` (any failure if None)."""
-    for _ in range(runs):
-        failure = Replayer(trace, debug).run()
+def reproduces(
+    trace: list, target: tuple[str, str] | None, runs: int, debug: bool, report: bool = False
+):
+    """The first failure in up to `runs` replays that matches `target` (any failure if None).
+    With `report`, says how the WAL of each replay that misses it differs from the original's."""
+    compares = report and any("wal" in op for op in trace)
+    for run in range(runs):
+        replayer = Replayer(trace, debug)
+        failure = replayer.run()
         if failure and (target is None or failure[:2] == target):
             return failure
+        if compares:
+            print(f"Replay {run + 1}: {replayer.wal_report()}.")
+        if report and failure:
+            print(f"Replay {run + 1} failed otherwise: {failure[0]} at step {failure[2]}.")
     return None
 
 
@@ -274,6 +316,8 @@ def simplifications(op: dict) -> list[list[dict]]:
     options = []
     if op["op"] == "crash":
         options.append([dict(op="reopen")])
+    elif op["op"] == "tear":
+        options.append([dict(op="crash")])
     elif op["op"] in ("crash_during", "crash_at", "kill_at"):
         statement = dict(op="execute", conn=0, query=op["query"], params={})
         options += [[statement, dict(op="reopen")], [statement, dict(op="crash")]]
@@ -513,6 +557,8 @@ def describe(op: dict) -> str:
         detail = f"{op['syscall']} #{op['n']} in {detail}"
     elif op["op"] == "limit":
         detail = f"files to {op['size']} bytes"
+    elif op["op"] == "tear":
+        detail = f"WAL to {op['offset']} bytes"
     elif op.get("config"):
         detail = f"with {op['config']}"
     elif op["op"] == "race":
@@ -589,7 +635,7 @@ def main() -> None:
     target = original_failure(trace)
     if target is None:
         print("The original run failed a model check; replay reports engine failures only.")
-    failure = reproduces(trace, target, args.runs, args.gdb)
+    failure = reproduces(trace, target, args.runs, args.gdb, report=True)
     if not failure:
         print(f"No failure in {args.runs} replay(s).")
         return

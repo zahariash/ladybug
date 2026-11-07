@@ -18,7 +18,16 @@ import re
 FRAME = re.compile(r"^#(\d+) (lbug::\S+)")
 PAD = "UNWIND range(1, n) AS i RETURN 'pad-' + CAST(i AS STRING)"
 # Steps that end the worker process; what follows runs in a new one.
-LIFETIME_ENDS = ("crash", "reopen", "crash_during", "crash_at", "kill_at", "open_again")
+LIFETIME_ENDS = (
+    "crash",
+    "reopen",
+    "crash_during",
+    "crash_at",
+    "kill_at",
+    "open_again",
+    "tear",
+    "crash_writers",
+)
 
 
 def top_frames(message: str, count: int = 3) -> list[str]:
@@ -123,7 +132,9 @@ def after_last_fresh(trace: list) -> list:
     fresh = [i for i, op in enumerate(trace) if op["op"] == "fresh"]
     if not fresh:
         return trace
-    return [{**trace[0], "loads": trace[fresh[-1]]["loads"]}] + trace[fresh[-1] + 1 :]
+    last = trace[fresh[-1]]
+    head = {**trace[0], "loads": last["loads"], "config": last.get("config", trace[0]["config"])}
+    return [head] + trace[fresh[-1] + 1 :]
 
 
 def cypher(trace: list, failing: int, failure: str, config: dict) -> str:
@@ -153,6 +164,10 @@ def cypher(trace: list, failing: int, failure: str, config: dict) -> str:
             text = f"// execute {op['name']} with {op['params']}"
         elif kind == "crash":
             text = "// kill the process (SIGKILL), then open the database again"
+        elif kind == "set_config":
+            text = f"// later opens use {op['config']}"
+        elif kind == "tear":
+            text = f"// kill the process (SIGKILL), cut the WAL to {op['offset']} bytes, open again"
         elif kind == "reopen":
             text = "// close the database and open it again"
         elif kind == "open_again":
@@ -196,12 +211,15 @@ def stages(trace: list, failing: int) -> list[dict]:
     """The steps up to the failing one, split into worker lifetimes. Each stage ends in one of
     LIFETIME_ENDS or "last"; the step that ends a stage is its "end". A stage opens with the
     settings the step before it gives ("config"), and may be expected not to open."""
-    result, steps, opening = [], [], {}
+    result, steps, opening, lasting = [], [], {}, {}
     for op in trace[1 : failing + 1]:
-        if op["op"] in LIFETIME_ENDS:
+        if op["op"] == "set_config":
+            lasting = {**lasting, **op["config"]}
+        elif op["op"] in LIFETIME_ENDS:
             result.append(dict(steps=steps, end=op, **opening))
             steps = []
-            opening = dict(config=op.get("config") or {}, open_fails=bool(op.get("expected")))
+            config = {**lasting, **(op.get("config") or {})}
+            opening = dict(config=config, open_fails=bool(op.get("expected")))
         elif op["op"] != "failure":
             steps.append(op)
     result.append(dict(steps=steps, end=dict(op="last"), **opening))
@@ -294,7 +312,7 @@ def run_stage(path, index):
                 hard = resource.getrlimit(resource.RLIMIT_FSIZE)[1]
                 size = hard if op["size"] is None else op["size"]
                 resource.setrlimit(resource.RLIMIT_FSIZE, (size, hard))
-            elif op["op"] == "race":
+            elif op["op"] in ("race", "race_writers"):
                 print("a race step: replay the trace with replay.py instead", flush=True)
                 os._exit(4)
         except RuntimeError as e:
@@ -302,7 +320,15 @@ def run_stage(path, index):
                 print(f"stage {{index}} step {{n}}: {{str(e).splitlines()[0]}}", flush=True)
                 os._exit(3)
     end = stage["end"]
+    if end["op"] == "crash_writers":
+        print("concurrent writers: replay the trace with replay.py instead", flush=True)
+        os._exit(4)
     if end["op"] == "crash":
+        os._exit(0)
+    if end["op"] == "tear":
+        wal = path + ".wal"
+        if os.path.exists(wal):
+            os.truncate(wal, min(end["offset"], os.path.getsize(wal)))
         os._exit(0)
     if end["op"] == "crash_during":
         threading.Thread(target=lambda: conn(0).execute(end["query"]), daemon=True).start()

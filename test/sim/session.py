@@ -22,6 +22,7 @@ from hypothesis.stateful import precondition
 from model import Model, canonical, cs_key_query, text_query
 from strategies import C_GROUPS, CS_ROWS, CSR_ROWS
 from triage import probe_of, signature
+from wal_map import save_wal_notes, wal_state
 from writesets import PERSON
 
 # Every name rules are gated on, so --sim-skip can reject names that match nothing. Rules add
@@ -234,6 +235,13 @@ class Session:
             return True
         return not any(table in txn.view.tables for txn in self.txns.values())
 
+    def column_drop_safe(self) -> bool:
+        """A checkpoint after a column is dropped renumbers columns under the read-only snapshots
+        open at the drop, which then crash or read another column (snapshot_column_drop)."""
+        return "snapshot_column_drop" not in self.options.skipped or not any(
+            txn.kind == "read" for txn in self.txns.values()
+        )
+
     def snapshot_write_safe(self, kind: str, id) -> bool:
         """Whether a committed update or delete of Person `id` stays clear of two bugs that an
         open read-only snapshot hits at the next checkpoint: the updated value lands on another
@@ -380,6 +388,7 @@ class Session:
         config = {**self.config, **(overrides or {})}
         if crashed:
             self.save_crash_image(config)
+            self.trace[-1]["wal"] = wal_state(self.path)
         if inject:
             # With one worker thread, the caller and the worker take turns, so the n-th call
             # of a syscall is the same call in every run.
@@ -397,12 +406,12 @@ class Session:
         """Goes on with a fresh database after a known recovery failure: discarding the workload
         would make Hypothesis see a timing-dependent outcome as flaky data generation."""
         RECOVERY_SKIPS[gate] += 1
-        shutil.rmtree(self.crash_image(), ignore_errors=True)
         self.started_over = True
-        old = self.dir
+        old, image = self.dir, self.crash_image()
         self.new_database(fresh=True)
         if not self.options.keep:
             shutil.rmtree(old, ignore_errors=True)
+            shutil.rmtree(image, ignore_errors=True)
 
     def crash_image(self) -> str:
         return f"{self.dir}-image"
@@ -430,6 +439,8 @@ class Session:
             if os.path.isdir(self.crash_image()):
                 shutil.copytree(self.crash_image(), partial)
                 os.replace(partial, os.path.join(kept, CRASH_IMAGE))
+                save_wal_notes(os.path.join(kept, CRASH_IMAGE))
+            save_wal_notes(kept)
         except OSError as e:
             shutil.rmtree(partial, ignore_errors=True)
             print(f"database files not kept: {e}", file=sys.stderr)
@@ -450,6 +461,18 @@ class Session:
         self.traced(
             op, lambda: (self.engine.kill(), self.open_engine(crashed=True, overrides=overrides))
         )
+
+    def tear_wal_at(self, offset: int) -> None:
+        """Kills the engine, cuts the WAL to `offset` bytes, as a short write or a lost page does,
+        and opens the engine again."""
+        self.started_over = False
+
+        def call():
+            self.engine.kill()
+            os.truncate(f"{self.path}.wal", offset)
+            self.open_engine(crashed=True)
+
+        self.traced(dict(op="tear", offset=offset), call)
 
     def open_again(self) -> None:
         """Opens the database with the workload's settings after an open that failed."""

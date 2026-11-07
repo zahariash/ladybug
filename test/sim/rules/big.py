@@ -146,6 +146,7 @@ class BigRules(Session):
 
     @enabled("big_ddl")
     @precondition(lambda self: self.has_csr() and self.model.big.columns)
+    @precondition(lambda self: self.column_drop_safe())
     @rule(data=st.data())
     def drop_c_column(self, data):
         column = data.draw(st.sampled_from(list(self.model.big.columns)))

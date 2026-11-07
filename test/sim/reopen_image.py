@@ -27,10 +27,11 @@ from engine import Engine, EngineError, scratch_root  # noqa: E402
 from session import IMAGE_OPEN, failure_kind  # noqa: E402
 
 
-def describe(error: BaseException) -> str:
-    """How an open failed. Its key covers the whole message, stacks included, apart from addresses
-    and numbers, since two crashes can share a first line and have no engine frames."""
-    message = str(error)
+def describe(error: BaseException, copy: str = "") -> str:
+    """How an open failed. Its key covers the whole message, stacks included, apart from addresses,
+    numbers and the copy's path, since two crashes can share a first line and have no engine
+    frames."""
+    message = str(error).replace(copy, "<copy>") if copy else str(error)
     shape = re.sub(r"0x[0-9a-fA-F]+|\b\d+\b", "?", message)
     key = hashlib.sha1(shape.encode()).hexdigest()[:10]
     return f"{failure_kind(error)} {key}: {message.splitlines()[0][:160]}"
@@ -47,7 +48,7 @@ def reopen(image: str, scratch: str, debug: bool) -> str:
         Engine(os.path.join(copy, "db"), how["config"], how["loads"], None, debug).kill()
         return "opened"
     except (EngineError, AssertionError) as e:
-        return describe(e)
+        return describe(e, directory)
     finally:
         shutil.rmtree(directory, ignore_errors=True)
 

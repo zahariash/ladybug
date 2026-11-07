@@ -196,6 +196,8 @@ class TransactionRules(Session):
             if not (kind in DDL_OPS and "txn_ddl" in skipped)
             and not (kind == "duplicate" and "txn_error" in skipped)
             and not (kind == "drop_column" and "txn_column_gap" in skipped)
+            # It commits later, past any check made now, and snapshots may open meanwhile.
+            and not (kind == "drop_column" and "snapshot_column_drop" in skipped)
             and not (kind in ("create_macro", "drop_macro") and "macros" in skipped)
             and not (kind == "drop_macro" and "drop_macro" in skipped)
             and not (kind in PERSON_OPS and "persons" in skipped)

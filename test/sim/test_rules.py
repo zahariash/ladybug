@@ -143,6 +143,43 @@ def test_transaction_ddl_ops_change_the_catalog_and_flag_conflicts() -> None:
     assert statement(model, "drop_table", 4, None) == ("DROP TABLE T4", {}, None)
 
 
+def test_every_rule_that_drops_a_column_waits_for_read_only_snapshots() -> None:
+    from machine import LadybugSim
+
+    for name in ("drop_column", "drop_c_column", "drop_knows_property"):
+        preconditions = getattr(LadybugSim, name).hypothesis_stateful_rule.preconditions
+        assert any("column_drop_safe" in p.__code__.co_names for p in preconditions), name
+
+
+def test_a_planned_write_does_not_repeat_a_rewound_serial_while_that_is_gated(monkeypatch) -> None:
+    from rules.recovery import RecoveryRules
+
+    class Rules(RecoveryRules):
+        allowed_ops = lambda self: ["insert_t"]  # noqa: E731
+        snapshot_write_safe = lambda self, kind, id: True  # noqa: E731
+
+        def __init__(self, skipped: set, model) -> None:
+            self.options, self.model = Options(skipped=frozenset(skipped)), model
+
+    model = small_model()
+    model.tables[0] = [1]
+    assert Rules({"serial_rollback"}, model).plan_write("insert_t", 0, 1) is not None
+    model.serial_rewound = True
+    assert Rules({"serial_rollback"}, model).plan_write("insert_t", 0, 1) is None
+    assert Rules(set(), model).plan_write("insert_t", 0, 1) is not None
+
+
+def test_transactions_do_not_drop_columns_while_that_is_gated() -> None:
+    from rules.transactions import TransactionRules
+
+    class Rules(TransactionRules):
+        def __init__(self, skipped: set) -> None:
+            self.options = Options(skipped=frozenset(skipped))
+
+    assert "drop_column" in Rules(set()).allowed_ops()
+    assert "drop_column" not in Rules({"snapshot_column_drop"}).allowed_ops()
+
+
 def test_session_rules_are_rules_of_the_machine() -> None:
     """A helper of the same name in an earlier mixin would shadow a rule."""
     from machine import LadybugSim

@@ -110,6 +110,7 @@ gated(
     "snapshot_prepared",
     "snapshot_update",
     "snapshot_insert_delete",
+    "snapshot_column_drop",
 )
 
 
@@ -348,6 +349,8 @@ class SessionRules(Session):
         if not self.overlap_allowed():
             self.ok(f"CALL checkpoint_threshold={NO_AUTOMATIC_CHECKPOINT}")
             self.config = {**self.config, "checkpoint_threshold": -1}
+            # A reopen uses this threshold from here on, so a replay has to as well.
+            self.traced(dict(op="set_config", config={"checkpoint_threshold": -1}), lambda: None)
 
     def overlap_round(self, writers, writes, first_ends, first_commits, end) -> None:
         for conn in sorted(self.txns)[: max(0, writers - len(self.free_sessions()))]:

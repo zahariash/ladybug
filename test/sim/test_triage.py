@@ -91,6 +91,56 @@ def test_reduce_config_keeps_only_needed_settings() -> None:
     assert needed == dict(compression=False) == trace[0]["config"]
 
 
+def test_scripts_stop_a_stage_at_a_tear_as_replay_does() -> None:
+    statement = {"op": "execute", "conn": 0, "query": "RETURN 1", "params": {}}
+    trace = [TRACE[0], {"op": "tear", "offset": 40}, statement]
+    assert [stage["end"]["op"] for stage in triage.stages(trace, 2)] == ["tear", "last"]
+    assert "cut the WAL to 40 bytes" in triage.cypher(trace, 2, "died", {})
+    source = triage.script(trace, 2, "died", STACKS, {}, "trace.min.py")
+    ast.parse(source)
+    assert 'min(end["offset"], os.path.getsize(wal))' in source and "os.path.exists(wal)" in source
+
+
+def test_a_set_config_step_opens_later_stages_with_it() -> None:
+    statement = {"op": "execute", "conn": 0, "query": "RETURN 1", "params": {}}
+    change = {"op": "set_config", "config": {"checkpoint_threshold": -1}}
+    trace = [TRACE[0], change, {"op": "crash"}, statement, {"op": "crash"}, statement]
+    stages = triage.stages(trace, 5)
+    assert [stage.get("config") for stage in stages] == [
+        None,
+        {"checkpoint_threshold": -1},
+        {"checkpoint_threshold": -1},
+    ]
+    assert all(step["op"] != "set_config" for stage in stages for step in stage["steps"])
+
+
+def test_a_fresh_database_keeps_the_config_at_that_point() -> None:
+    fresh = {"op": "fresh", "loads": ["L"], "config": {"checkpoint_threshold": -1}}
+    statement = {"op": "execute", "conn": 0, "query": "RETURN 1", "params": {}}
+    head = {"op": "open", "config": {"checkpoint_threshold": 0}, "loads": []}
+    after = triage.after_last_fresh([head, statement, fresh, statement])
+    assert after[0]["config"] == {"checkpoint_threshold": -1} and after[0]["loads"] == ["L"]
+    assert after[1:] == [statement]
+    old = {"op": "fresh", "loads": ["L"]}
+    assert triage.after_last_fresh([head, old, statement])[0]["config"] == head["config"]
+
+
+def test_a_listing_notes_a_set_config_step() -> None:
+    change = {"op": "set_config", "config": {"checkpoint_threshold": -1}}
+    statement = {"op": "execute", "conn": 0, "query": "RETURN 1", "params": {}}
+    text = triage.cypher([TRACE[0], change, statement], 2, "died", {})
+    assert "later opens use {'checkpoint_threshold': -1}" in text
+
+
+def test_a_writers_crash_ends_a_stage_and_scripts_refuse_it() -> None:
+    statement = {"op": "execute", "conn": 0, "query": "RETURN 1", "params": {}}
+    trace = [TRACE[0], {"op": "crash_writers", "writers": [], "delay": 0.1}, statement]
+    assert [stage["end"]["op"] for stage in triage.stages(trace, 2)] == ["crash_writers", "last"]
+    source = triage.script(trace, 2, "died", STACKS, {}, "trace.min.py")
+    ast.parse(source)
+    assert "concurrent writers: replay the trace" in source
+
+
 def test_scripts_load_steps_with_nan_and_infinity() -> None:
     trace = [TRACE[0], dict(op="execute", conn=0, query="RETURN $x", params=dict(x=float("nan")))]
     trace[1]["params"]["y"] = float("-inf")

@@ -109,6 +109,10 @@ A kept failure also holds the database's WAL files as they were at the failure, 
 `test/sim/reopen_image.py <crash-image>` opens a fresh copy of the image as often as needed, so a
 failure that depends only on those files repeats without replaying the trace. One that depends on
 thread scheduling during recovery can still pass some opens.
+Next to each WAL, `wal-map.txt` lists its frames as `test/sim/wal_map.py` reads them, without the
+engine's reader, and with `SIM_WAL_DUMP` set to a `wal_dump` binary built from the engine under
+test, `wal.txt` holds what the tool reads. Every trace step that ends in recovery records the WAL it
+left, and a replay that misses the failure says how its WAL differed.
 
 Session rules (`--sim-focus sessions`) interleave transactions on three more connections, one
 step per rule: read-only snapshots, a write transaction, writes that must fail beside it, and

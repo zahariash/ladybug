@@ -7,6 +7,8 @@ and commit_pressure_crash commits while the buffer pool is full. Each ends in a 
 reopen, after which every write that succeeded must be there and every one that failed must not,
 whatever the engine had applied before failing. reopen_checksums opens a crashed database with
 the other checksum setting, which must refuse a WAL written with the first rather than drop it.
+wal_tear cuts a WAL at a point inside or between its records, and exactly the commits that end at
+or before the cut must survive.
 graph_write writes GN, the named graph's table, which the data and crash checks read with the
 rest.
 """
@@ -27,6 +29,8 @@ from rules.sessions import COMMITTED_BUT, POOL_FULL, Txn
 from rules.transactions import apply, op, statement
 from session import ONE_THREAD, Session, diff, enabled, gated
 from strategies import small_ids
+from wal_map import CHECKPOINT as CHECKPOINT_RECORD
+from wal_map import READ_BUFFER_SIZE, TEAR_PLACES, cut_point, last_commit_end, read_wal
 
 gated(
     "limit_files",
@@ -73,6 +77,13 @@ limited_op = st.one_of(
     st.tuples(st.just("blob"), st.integers(1, 500), st.integers(10, 4000)),
     st.tuples(st.just("checkpoint"), st.none(), st.none()),
     st.tuples(st.just("copy"), st.integers(1, 3000), st.none()),
+)
+# wal_tear's commits: writes, rows that take the WAL past a read-buffer boundary, and long strings.
+TEAR_LONG_VALUE = 3000
+tear_op = st.one_of(
+    write_op,
+    st.tuples(st.just("bulk"), st.integers(1, 60), st.none()),
+    st.tuples(st.just("blob"), st.integers(1, 8), st.integers(10, 1000)),
 )
 
 
@@ -189,6 +200,12 @@ class RecoveryRules(Session):
         if kind not in AUTO_KINDS or kind not in self.allowed_ops():
             return None
         if not self.snapshot_write_safe(kind, a):
+            return None
+        if (
+            kind == "insert_t"
+            and self.model.serial_rewound
+            and "serial_rollback" in self.options.skipped
+        ):
             return None
         step = statement(self.model, kind, a, b)
         if step is None:
@@ -544,6 +561,67 @@ class RecoveryRules(Session):
         else:
             self.reopen_engine(clean=False)
         self.check_recovered(recovered)
+
+    @enabled("wal_tear")
+    @precondition(lambda self: not self.txns)
+    @rule(
+        ops=st.lists(tear_op, min_size=1, max_size=5),
+        place=st.sampled_from(TEAR_PLACES),
+        position=st.integers(0, 2**32),
+    )
+    def wal_tear(self, ops, place, position):
+        """Commits writes into a WAL that holds nothing else, kills the engine and cuts the WAL.
+        Recovery must keep exactly the commits that end at or before the cut."""
+        self.ok("CHECKPOINT")
+        self.model.checkpointed()
+        self.ok("CALL auto_checkpoint=false")
+        base = self.wal_size()
+        models, sizes = {base: self.model.fork()}, [base]
+
+        def commit(kind: str, a, b) -> None:
+            self.tear_write(kind, a, b)
+            sizes.append(self.wal_size())
+            models[sizes[-1]] = self.model.fork()
+
+        for kind, a, b in ops:
+            commit(kind, a, b)
+        if place == "past_boundary":
+            # A long value that crosses the next read-buffer boundary, for the cut to land in.
+            while self.wal_size() % READ_BUFFER_SIZE < READ_BUFFER_SIZE - TEAR_LONG_VALUE // 2:
+                commit("bulk", 10, None)
+            commit("long", TEAR_LONG_VALUE, None)
+        wal = read_wal(f"{self.path}.wal")
+        # A statement that checkpoints moves the WAL's records out from under the sizes.
+        if not wal.frames or sizes != sorted(sizes) or wal.has(CHECKPOINT_RECORD):
+            self.crash_engine()
+            self.check_recovered()
+            return
+        # From fixed draws, since what a WAL holds can differ between runs of one example and
+        # Hypothesis needs the same draws.
+        cut = cut_point(wal, place, position)
+        self.tear_wal_at(cut)
+        end = last_commit_end(wal, cut)
+        kept = models.get(end or base)
+        assert kept is not None, f"a commit ends at {end} in the WAL, where no statement ended"
+        latest = self.model
+        self.check_recovered(kept)
+        if not getattr(self, "started_over", False):
+            self.model.discarded(latest)
+
+    def tear_write(self, kind: str, a, b) -> None:
+        if kind == "bulk":
+            ids = self.model.take_bulk_ids(a)
+            self.ok(
+                f"UNWIND range({ids.start}, {ids.stop - 1}) AS i "
+                "CREATE (:Person {id: i, age: i % 1000})"
+            )
+            self.model.add_persons({id: self.model.new_person(age=id % 1000) for id in ids})
+        elif kind == "long":
+            id, name = self.model.take_bulk_ids(1).start, "x" * a
+            self.ok("CREATE (:Person {id: $id, name: $name})", dict(id=id, name=name))
+            self.model.add_persons({id: self.model.new_person(name=name)})
+        elif kind != "blob" or self.has_blobs():
+            self.write(kind, a, b)
 
     @enabled("checksums")
     @rule()

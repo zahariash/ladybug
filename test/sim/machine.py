@@ -89,7 +89,7 @@ class LadybugSim(
         self.path = os.path.join(self.dir, "db")
         self.model = Model()
         if fresh:
-            self.traced(dict(op="fresh", loads=self.loads()), self.open_engine)
+            self.traced(dict(op="fresh", loads=self.loads(), config=self.config), self.open_engine)
         else:
             self.start_trace()
         if self.has_csr():
