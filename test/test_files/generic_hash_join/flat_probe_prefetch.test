@@ -1,0 +1,46 @@
+-DATASET CSV empty
+
+--
+
+-CASE FlatProbePrefetch
+
+# The OPTIONAL MATCH probes its hash table one node ID at a time from a FLATTEN; with 50k build
+# rows the table exceeds HashJoinProbe::PREFETCH_MIN_TABLE_BYTES, so these probes take the
+# prefetching path. The WHERE leaves a filtered selection for the FLATTEN to walk, the UNWIND
+# feeds keys found by primary-key lookups, and the second OPTIONAL MATCH probes NULL keys.
+-STATEMENT CREATE NODE TABLE N(id INT64 PRIMARY KEY)
+---- ok
+-STATEMENT CREATE REL TABLE E(FROM N TO N)
+---- ok
+-STATEMENT UNWIND range(0, 99999) AS i CREATE (:N {id: i})
+---- ok
+-STATEMENT COPY E FROM (UNWIND range(0, 49999) AS i RETURN 2 * i, (14 * i + 3) % 100000)
+---- ok
+-STATEMENT CALL threads=1
+---- ok
+-STATEMENT MATCH (a:N) OPTIONAL MATCH (a)-[:E]->(b:N) RETURN count(*), count(b), sum(b.id)
+---- 1
+100000|50000|2500000000
+-STATEMENT MATCH (a:N) WHERE a.id % 3 <> 0 OPTIONAL MATCH (a)-[:E]->(b:N) RETURN count(*), count(b), sum(b.id), min(b.id), max(b.id)
+---- 1
+66666|33333|1666833337|1|99999
+-STATEMENT UNWIND range(0, 99999) AS i MATCH (a:N {id: i}) OPTIONAL MATCH (a)-[:E]->(b:N) RETURN count(*), count(b), sum(b.id)
+---- 1
+100000|50000|2500000000
+-STATEMENT MATCH (a:N) OPTIONAL MATCH (a)-[:E]->(b:N) OPTIONAL MATCH (b)-[:E]->(c:N) RETURN count(*), count(b), count(c)
+---- 1
+100000|50000|0
+-STATEMENT CALL threads=4
+---- ok
+-STATEMENT MATCH (a:N) OPTIONAL MATCH (a)-[:E]->(b:N) RETURN count(*), count(b), sum(b.id)
+---- 1
+100000|50000|2500000000
+-STATEMENT MATCH (a:N) WHERE a.id % 3 <> 0 OPTIONAL MATCH (a)-[:E]->(b:N) RETURN count(*), count(b), sum(b.id), min(b.id), max(b.id)
+---- 1
+66666|33333|1666833337|1|99999
+-STATEMENT UNWIND range(0, 99999) AS i MATCH (a:N {id: i}) OPTIONAL MATCH (a)-[:E]->(b:N) RETURN count(*), count(b), sum(b.id)
+---- 1
+100000|50000|2500000000
+-STATEMENT MATCH (a:N) OPTIONAL MATCH (a)-[:E]->(b:N) OPTIONAL MATCH (b)-[:E]->(c:N) RETURN count(*), count(b), count(c)
+---- 1
+100000|50000|0

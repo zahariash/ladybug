@@ -9,6 +9,17 @@ namespace processor {
 struct FlattenLocalState {
     uint64_t currentIdx = 0;
     uint64_t sizeToFlatten = 0;
+    // Counts the batches pulled from the child.
+    uint64_t batchSeq = 0;
+};
+
+// The batch a Flatten walks, for an operator above it that looks ahead (HashJoinProbe's prefetch).
+// The batch's positions are selVector[0, size); the last one handed out is selVector[nextIdx - 1].
+struct FlattenBatchView {
+    const common::SelectionVector* selVector;
+    uint64_t size;
+    uint64_t nextIdx;
+    uint64_t seq;
 };
 
 class Flatten final : public PhysicalOperator, SelVectorOverWriter {
@@ -27,6 +38,12 @@ public:
     std::unique_ptr<PhysicalOperator> copy() override {
         return make_unique<Flatten>(dataChunkToFlattenPos, children[0]->copy(), id,
             printInfo->copy());
+    }
+
+    data_chunk_pos_t getDataChunkToFlattenPos() const { return dataChunkToFlattenPos; }
+    FlattenBatchView getBatchView() const {
+        return {prevSelVector.get(), localState->sizeToFlatten, localState->currentIdx,
+            localState->batchSeq};
     }
 
 private:

@@ -64,11 +64,17 @@ public:
     void setPrevTupleValue(uint8_t* tuple, uint8_t* prev) const {
         memcpy(tuple + prevPtrColOffset, &prev, sizeof(uint8_t*));
     }
-    uint8_t* getTupleForHash(common::hash_t hash) {
+    uint8_t* getTupleForHash(common::hash_t hash) const { return *getSlotForHash(hash); }
+    uint8_t** getSlotForHash(common::hash_t hash) const {
         auto slotIdx = getSlotIdxForHash(hash);
         DASSERT(slotIdx < maxNumHashSlots);
-        return ((uint8_t**)(hashSlotsBlocks[slotIdx >> numSlotsPerBlockLog2]
-                                ->getData()))[slotIdx & slotIdxInBlockMask];
+        return (uint8_t**)(hashSlotsBlocks[slotIdx >> numSlotsPerBlockLog2]->getData()) +
+               (slotIdx & slotIdxInBlockMask);
+    }
+    // Bytes of hash slots and fixed-size tuples, the part a probe touches at random.
+    uint64_t getProbedBytes() const {
+        return maxNumHashSlots * sizeof(uint8_t*) +
+               getNumEntries() * getTableSchema()->getNumBytesPerTuple();
     }
 
 private:

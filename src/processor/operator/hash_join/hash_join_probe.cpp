@@ -1,8 +1,14 @@
 #include "processor/operator/hash_join/hash_join_probe.h"
 
 #include "binder/expression/expression_util.h"
+#include "function/hash/hash_functions.h"
 #include "processor/execution_context.h"
+#include "processor/operator/flatten.h"
 #include "storage/buffer_manager/memory_manager.h"
+
+#if !defined(__GNUC__) && (defined(_M_X64) || defined(_M_IX86))
+#include <xmmintrin.h>
+#endif
 
 using namespace lbug::common;
 
@@ -13,6 +19,16 @@ std::string HashJoinProbePrintInfo::toString() const {
     std::string result = "Keys: ";
     result += binder::ExpressionUtil::toString(keys);
     return result;
+}
+
+static void prefetchForRead(const void* address) {
+#if defined(__GNUC__)
+    __builtin_prefetch(address);
+#elif defined(_M_X64) || defined(_M_IX86)
+    _mm_prefetch(static_cast<const char*>(address), _MM_HINT_T0);
+#else
+    (void)address;
+#endif
 }
 
 void HashJoinProbe::initLocalStateInternal(ResultSet* resultSet, ExecutionContext* context) {
@@ -43,6 +59,84 @@ void HashJoinProbe::initLocalStateInternal(ResultSet* resultSet, ExecutionContex
     if (keyVectors.size() > 1) {
         tmpHashVector = std::make_unique<ValueVector>(LogicalType::HASH(), mm);
     }
+    keyFlatten = nullptr;
+    prefetchSizeChecked = false;
+    prefetchBatchSeq = 0;
+    numSampledProbes = 0;
+    numShortBatchProbes = 0;
+    // Only a Flatten right below the probe: anything in between could rewrite the key after the
+    // batch was hashed.
+    auto child = children[0].get();
+    if (flatProbe && keyVectors.size() == 1 &&
+        keyVectors[0]->dataType.getPhysicalType() == PhysicalTypeID::INTERNAL_ID &&
+        child->getOperatorType() == PhysicalOperatorType::FLATTEN &&
+        child->constCast<Flatten>().getDataChunkToFlattenPos() ==
+            probeDataInfo.keysDataPos[0].dataChunkPos) {
+        keyFlatten = &child->constCast<Flatten>();
+    }
+}
+
+bool HashJoinProbe::probeFlatKeyWithPrefetch() {
+    auto& hashTable = *sharedState->getHashTable();
+    if (!prefetchSizeChecked) {
+        prefetchSizeChecked = true;
+        if (hashTable.getNumEntries() == 0 || hashTable.getCapacity() == 0 ||
+            hashTable.getProbedBytes() <= PREFETCH_MIN_TABLE_BYTES) {
+            keyFlatten = nullptr;
+            return false;
+        }
+        // Kept across batches, so resize does not allocate again.
+        prefetchHashes.reserve(DEFAULT_VECTOR_CAPACITY);
+    }
+    const auto batch = keyFlatten->getBatchView();
+    auto& keyVector = *keyVectors[0];
+    // A batch this short has no key far enough ahead to prefetch. Stop checking if most of the
+    // first probes come from such batches.
+    const auto shortBatch = batch.size <= PREFETCH_DISTANCE;
+    if (numSampledProbes < PREFETCH_SAMPLE_PROBES) {
+        numSampledProbes++;
+        numShortBatchProbes += shortBatch;
+        if (numSampledProbes == PREFETCH_SAMPLE_PROBES &&
+            2 * numShortBatchProbes > PREFETCH_SAMPLE_PROBES) {
+            keyFlatten = nullptr;
+        }
+    }
+    if (shortBatch || batch.nextIdx == 0 || batch.nextIdx > batch.size ||
+        keyVector.state->getSelVector()[0] != (*batch.selVector)[batch.nextIdx - 1]) {
+        return false;
+    }
+    if (batch.seq != prefetchBatchSeq) {
+        prefetchBatchSeq = batch.seq;
+        prefetchHashes.resize(batch.size);
+        for (auto i = 0u; i < batch.size; i++) {
+            const auto pos = (*batch.selVector)[i];
+            prefetchHashes[i] = 0;
+            if (!keyVector.isNull(pos)) {
+                function::Hash::operation(keyVector.getValue<internalID_t>(pos), prefetchHashes[i]);
+            }
+        }
+    }
+    const auto idx = batch.nextIdx - 1;
+    if (idx + 2 * PREFETCH_DISTANCE < batch.size) {
+        prefetchForRead(reinterpret_cast<const char*>(
+            hashTable.getSlotForHash(prefetchHashes[idx + 2 * PREFETCH_DISTANCE])));
+    }
+    if (idx + PREFETCH_DISTANCE < batch.size) {
+        if (auto chainHead = hashTable.getTupleForHash(prefetchHashes[idx + PREFETCH_DISTANCE])) {
+            prefetchForRead(chainHead);
+        }
+    }
+    // The probe itself reads the key's current value; the batch hashes only steer prefetches.
+    const auto pos = keyVector.state->getSelVector()[0];
+    if (keyVector.isNull(pos)) {
+        probeState->probedTuples[0] = nullptr;
+    } else {
+        // The INTERNAL_ID hash that VectorHashFunction computes in JoinHashTable::probe.
+        hash_t hash = 0;
+        function::Hash::operation(keyVector.getValue<internalID_t>(pos), hash);
+        probeState->probedTuples[0] = hashTable.getTupleForHash(hash);
+    }
+    return true;
 }
 
 bool HashJoinProbe::getMatchedTuplesForFlatKey(ExecutionContext* context) {
@@ -54,8 +148,10 @@ bool HashJoinProbe::getMatchedTuplesForFlatKey(ExecutionContext* context) {
         if (!children[0]->getNextTuple(context)) {
             return false;
         }
-        sharedState->getHashTable()->probe(keyVectors, *hashVector, hashSelVec, tmpHashVector.get(),
-            probeState->probedTuples.get());
+        if (keyFlatten == nullptr || !probeFlatKeyWithPrefetch()) {
+            sharedState->getHashTable()->probe(keyVectors, *hashVector, hashSelVec,
+                tmpHashVector.get(), probeState->probedTuples.get());
+        }
     }
     auto numMatchedTuples = sharedState->getHashTable()->matchFlatKeys(keyVectors,
         probeState->probedTuples.get(), probeState->matchedTuples.get());
