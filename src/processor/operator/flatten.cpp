@@ -22,6 +22,7 @@ bool Flatten::getNextTuplesInternal(ExecutionContext* context) {
         }
         localState->currentIdx = 0;
         localState->sizeToFlatten = dataChunkState->getSelVector().getSelSize();
+        localState->batchSeq++;
         saveSelVector(*dataChunkState);
         dataChunkState->setToFlat();
     }

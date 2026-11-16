@@ -9,6 +9,8 @@
 namespace lbug {
 namespace processor {
 
+class Flatten;
+
 struct ProbeState {
     explicit ProbeState()
         : matchedSelVector{common::DEFAULT_VECTOR_CAPACITY}, nextMatchedTupleIdx{0} {
@@ -93,6 +95,8 @@ private:
                            getMatchedTuplesForUnFlatKey(context);
     }
     bool getMatchedTuplesForFlatKey(ExecutionContext* context);
+    // Probes the current flat key; false if the caller must probe it the generic way.
+    bool probeFlatKeyWithPrefetch();
     // We can probe a batch of input tuples if we know they have at most one match.
     bool getMatchedTuplesForUnFlatKey(ExecutionContext* context);
 
@@ -121,6 +125,22 @@ private:
     std::unique_ptr<common::ValueVector> hashVector;
     std::unique_ptr<common::ValueVector> tmpHashVector;
     common::SelectionVector hashSelVec;
+
+    // A flat probe of one node-ID key looks ahead in the batch walked by the Flatten that is its
+    // direct child and prefetches the hash slots and chain heads of later keys, if the table is
+    // larger than about an L2 cache. The threshold and distance come from LDBC SF1 runs, where the
+    // joins that gained probe tables of many MB.
+    static constexpr uint64_t PREFETCH_MIN_TABLE_BYTES = 1 << 20;
+    // Chain heads are prefetched this many keys ahead, slots twice as far.
+    static constexpr uint64_t PREFETCH_DISTANCE = 8;
+    // Probes sampled to decide whether the batches are long enough to look ahead in.
+    static constexpr uint64_t PREFETCH_SAMPLE_PROBES = common::DEFAULT_VECTOR_CAPACITY;
+    const Flatten* keyFlatten = nullptr;
+    bool prefetchSizeChecked = false;
+    uint64_t numSampledProbes = 0;
+    uint64_t numShortBatchProbes = 0;
+    uint64_t prefetchBatchSeq = 0;
+    std::vector<common::hash_t> prefetchHashes;
 };
 
 } // namespace processor
